@@ -170,11 +170,15 @@ def make_pim_config(pim_type: PIMType,
                     num_attacc=8,
                     num_hbm=5,
                     bw_scale=None,
-                    power_constraint=False):
+                    power_constraint=False,
+                    yaml_target="hbm3-pim",
+                    channel_count=16):
     config = {}
     config["PIM_TYPE"] = pim_type
     config["POWER_CONSTRAINT"] = power_constraint
     config["ENERGY_TABLE"] = ENERGY_TABLE['PIM'][pim_type]
+    config["YAML_TARGET"] = yaml_target
+    config["CHANNEL_COUNT"] = channel_count
 
     internal_bandwidth_scale =  BW_SCALE[power_constraint][pim_type] \
                                 if bw_scale is None else bw_scale
@@ -186,6 +190,29 @@ def make_pim_config(pim_type: PIMType,
     config["FLOPS_PER_HBM"] = config["MEM_BW_PER_HBM"] * opb
     config["SOFTMAX_MEM_BW"] = 670.4 * 1000 * 1000 * 1000 * num_hbm
     config["SOFTMAX_FLOPS"] = config["SOFTMAX_MEM_BW"]
+
+    # Ramulator backend profile (used by src/ramulator_wrapper.py)
+    if yaml_target == "lpddr5-pim":
+        config["DRAM_IMPL"] = "LPDDR5-PIM"
+        config["DRAM_ORG_PRESET"] = "LPDDR5_2Gb_x16"
+        config["DRAM_TIMING_PRESET"] = "LPDDR5_6400"
+        config["CONTROLLER_IMPL"] = "HBM3-PIM"  
+        config["REFRESH_MANAGER_IMPL"] = "AllBank"
+        config["ADDR_MAPPER_IMPL"] = "ChRaBaRoCo"
+        config["TRACE_RECORDER_IMPL"] = "TraceRecorder"
+        config["TRACE_GEN_PREFIX"] = "gen_trace_attacc_lpddr5_"
+        config["TCK_NS"] = 1.25
+    else:
+        config["DRAM_IMPL"] = "HBM3-PIM"
+        config["DRAM_ORG_PRESET"] = "HBM3_8Gb_2R"
+        config["DRAM_TIMING_PRESET"] = "HBM3_5.2Gbps_NPC" if not power_constraint else "HBM3_5.2Gbps"
+        config["CONTROLLER_IMPL"] = "HBM3-PIM"
+        config["REFRESH_MANAGER_IMPL"] = "AllBankHBM3"
+        config["ADDR_MAPPER_IMPL"] = "HBM3-PIM"
+        config["TRACE_RECORDER_IMPL"] = "HBM3TraceRecorder"
+        config["TRACE_GEN_PREFIX"] = "gen_trace_attacc_"
+        # 5200 MT/s HBM3 in this codebase uses QDR pins => 0.769 ns
+        config["TCK_NS"] = 0.769231
 
     if interface_type == InterfaceType.NVLINK3:
         config["INTERFACE_BW"] = 600 * 1000 * 1000 * 1000
@@ -214,6 +241,8 @@ def make_model_config(name, dtype):
     model_table['MT-530B'] = [105, 20480, 128, 160, 4, 1]
     model_table['MT-1008B'] = [128, 25600, 160, 160, 4, 1]
     model_table['OPT-66B'] = [64, 9216, 72, 128, 4, 1]
+    # PI0 paligemma-only approximation (gemma_2b)
+    model_table['PI0'] = [18, 2048, 8, 256, 8, 1]
 
     ndec, hdim, nheads, dhead, ff_scale, gqa_size = model_table[name]
     config = {

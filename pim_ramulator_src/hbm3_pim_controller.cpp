@@ -383,25 +383,47 @@ class HBM3PIMController final : public IDRAMController, public Implementation {
 
     // Row command: 0,  Col command: 1
     int get_command_type(int command) {
-      if      (command == m_dram->m_commands("ACT"))   return 0; // Row command
-      else if (command == m_dram->m_commands("PRE"))   return 0; // Row command
-      else if (command == m_dram->m_commands("PREA"))  return 0; // Row command
-      else if (command == m_dram->m_commands("RD"))    return 1; // Col command
-      else if (command == m_dram->m_commands("WR"))    return 1; // Col command
-      else if (command == m_dram->m_commands("REFab")) return 0; // Row command
-      else if (command == m_dram->m_commands("REFsb")) return 0; // Row command
-      else if (command == m_dram->m_commands("ACTAB")) return 0; // Row command
-      else if (command == m_dram->m_commands("ACTSB")) return 0; // Row command
-      else if (command == m_dram->m_commands("ACTPB")) return 0; // Row command
-      else if (command == m_dram->m_commands("MACAB")) return 1; // Col command
-      else if (command == m_dram->m_commands("MACSB")) return 1; // Col command
-      else if (command == m_dram->m_commands("MACPB")) return 1; // Col command
-      else if (command == m_dram->m_commands("WRGB"))  return 1; // Col command
-      else if (command == m_dram->m_commands("MVSB"))  return 1; // Col command
-      else if (command == m_dram->m_commands("MVGB"))  return 1; // Col command
-      else if (command == m_dram->m_commands("SFM"))   return 1; // Col command
-      else if (command == m_dram->m_commands("SETM"))  return 1; // Col command
-      else if (command == m_dram->m_commands("SETH"))  return 1; // Col command
+      auto cmd_eq = [this, command](std::string_view cmd_name) -> bool {
+        return m_dram->m_commands.contains(cmd_name) && (command == m_dram->m_commands(cmd_name));
+      };
+
+      // Row commands
+      if      (cmd_eq("ACT"))    return 0;
+      else if (cmd_eq("ACT-1"))  return 0;
+      else if (cmd_eq("ACT-2"))  return 0;
+      else if (cmd_eq("PRE"))    return 0;
+      else if (cmd_eq("PREA"))   return 0;
+      else if (cmd_eq("PRESB"))  return 0;
+      else if (cmd_eq("PREPB"))  return 0;
+      else if (cmd_eq("REFab"))  return 0;
+      else if (cmd_eq("REFsb"))  return 0;
+      else if (cmd_eq("REFpb"))  return 0;
+      else if (cmd_eq("RFMab"))  return 0;
+      else if (cmd_eq("RFMsb"))  return 0;
+      else if (cmd_eq("RFMpb"))  return 0;
+      else if (cmd_eq("ACTAB"))  return 0;
+      else if (cmd_eq("ACTSB"))  return 0;
+      else if (cmd_eq("ACTPB"))  return 0;
+      // Column / data-path commands
+      else if (cmd_eq("RD"))     return 1;
+      else if (cmd_eq("WR"))     return 1;
+      else if (cmd_eq("RDA"))    return 1;
+      else if (cmd_eq("WRA"))    return 1;
+      else if (cmd_eq("CASRD"))  return 1;
+      else if (cmd_eq("CASWR"))  return 1;
+      else if (cmd_eq("RD16"))   return 1;
+      else if (cmd_eq("WR16"))   return 1;
+      else if (cmd_eq("RD16A"))  return 1;
+      else if (cmd_eq("WR16A"))  return 1;
+      else if (cmd_eq("MACAB"))  return 1;
+      else if (cmd_eq("MACSB"))  return 1;
+      else if (cmd_eq("MACPB"))  return 1;
+      else if (cmd_eq("WRGB"))   return 1;
+      else if (cmd_eq("MVSB"))   return 1;
+      else if (cmd_eq("MVGB"))   return 1;
+      else if (cmd_eq("SFM"))    return 1;
+      else if (cmd_eq("SETM"))   return 1;
+      else if (cmd_eq("SETH"))   return 1;
       else return -1;
     }
 

@@ -100,6 +100,11 @@ def main():
     parser.add_argument("--powerlimit",
                         action='store_true',
                         help="power constraint for PIM ")
+    parser.add_argument("--yaml-target",
+                        type=str,
+                        default="hbm3-pim",
+                        choices=["hbm3-pim", "lpddr5-pim"],
+                        help="Ramulator DRAM target profile for PIM runs")
     parser.add_argument("--ffopt",
                         action='store_true',
                         help="apply feedforward parallel optimization")
@@ -112,7 +117,7 @@ def main():
         "--model",
         type=str,
         default='GPT-175B',
-        help="model list: GPT-175B, LLAMA-65B, MT-530B, OPT-66B")
+        help="model list: GPT-175B, LLAMA-65B, MT-530B, OPT-66B, PI0")
     parser.add_argument("--word",
                         type=int,
                         default='2',
@@ -147,8 +152,8 @@ def main():
         assert 0
 
     if args.system == 'dgx-attacc':
-        print("{}: ({} x {}), PIM:{}, [Lin, Lout, batch]: {}".format(
-            args.system, args.gpu, args.ngpu, args.pim,
+        print("{}: ({} x {}), PIM:{}, target:{}, [Lin, Lout, batch]: {}".format(
+            args.system, args.gpu, args.ngpu, args.pim, args.yaml_target,
             [args.lin, args.lout, args.batch]))
     else:
         print("{}: ({} x {}), [Lin, Lout, batch]: {}".format(
@@ -174,7 +179,8 @@ def main():
             pim_type = PIMType.BA
         pim_config = make_pim_config(pim_type,
                                      InterfaceType.NVLINK3,
-                                     power_constraint=args.powerlimit)
+                                     power_constraint=args.powerlimit,
+                                     yaml_target=args.yaml_target)
         system.set_accelerator(modelinfos, DeviceType.PIM, pim_config)
 
     elif args.system in ['dgx-cpu']:

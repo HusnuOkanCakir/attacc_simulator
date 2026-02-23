@@ -42,7 +42,10 @@ class System:
     def set_accelerator(self, modelinfos, name: DeviceType, config):
         self.hetero_name = name
         if self.hetero_name == DeviceType.PIM:
-            ramulator = Ramulator(modelinfos, "ramulator2", "ramulator.out")
+            ramulator = Ramulator(modelinfos,
+                                  "ramulator2",
+                                  "ramulator.out",
+                                  pim_config=config)
             self.devices['Acc'] = PIM(config,
                                       self.scaling_factor,
                                       ramulator)
@@ -468,4 +471,3 @@ class System:
         kv_memory = ndec * 2 * l * (hdim) * a_byte
 
         return weight_memory, kv_memory * batch_size, temp_memory * batch_size
-

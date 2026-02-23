@@ -344,7 +344,6 @@ class PIM:
 
                 energies = [dram_energy, 0, 0, 0, cal_energy, 0]
                 energies = [i * self.num_attacc for i in energies]
-
                 return time, energies
             else:
                 return 0, [0, 0, 0, 0, 0, 0]

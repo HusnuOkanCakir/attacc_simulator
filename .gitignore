@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments / local editor config
+.venv/
+venv/
+env/
+.env
+.vscode/
+
+# OS / crash artifacts
+.DS_Store
+core
+core.*
+
+# Local profiling / experiment outputs (root repo)
+cluster_outputs/
+reference_docs/
+masks/
+*.npy
+ram_out*.txt
+out_ramu*.txt
+output*.csv
+ramulator.out
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+ncu_roofline*.csv
+
+# Common logs
+*.log
+
+# Notes:
+# - `ramulator2/` is a git submodule. Ignore rules for generated files inside it
+#   should be added in the submodule repo (`ramulator2/.gitignore`) separately.
