@@ -1,0 +1,748 @@
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import asdict, dataclass, field
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import pandas as pd
+
+from src.azure_trace import AzureTraceRequest
+from src.scheduler_policy import QueueAwareFinishTimePolicy, RouteCandidate
+
+
+@dataclass
+class RouteServicePoint:
+    route: str
+    lin: int
+    lout: int
+    bs: int
+    prefill_e2e_ms: float
+    prefill_gpu_ms: float
+    prefill_pim_ms: float
+    decode_e2e_ms: float
+    decode_gpu_ms: float
+    decode_pim_ms: float
+    source_file: str
+
+    @property
+    def uses_pim(self) -> bool:
+        return self.prefill_pim_ms > 0 or self.decode_pim_ms > 0
+
+
+@dataclass
+class LookupResult:
+    point: RouteServicePoint
+    requested_lin: int
+    requested_lout: int
+    mapped_lin: int
+    mapped_lout: int
+    requested_bs: int
+    mapped_bs: int
+    clipped_lin: bool
+    clipped_lout: bool
+
+
+@dataclass
+class RequestServiceEstimate:
+    route: str
+    uses_pim: bool
+    lin: int
+    lout: int
+    generated_tokens: int
+    decode_tokens: int
+    prefill_e2e_ms: float
+    prefill_gpu_ms: float
+    prefill_pim_ms: float
+    decode_e2e_ms: float
+    decode_gpu_ms: float
+    decode_pim_ms: float
+    mapping: LookupResult
+
+
+@dataclass
+class ReplayRequest:
+    request_id: int
+    arrival_ms: float
+    context_tokens: int
+    generated_tokens: int
+    route: Optional[str] = None
+    route_decision_reason: str = ""
+    state: str = "new"  # new, waiting_prefill, waiting_decode, done, dropped
+    ready_ms: float = 0.0
+    remaining_decode_tokens: int = 0
+    deadline_ms: Optional[float] = None
+
+    # Service estimate chosen at admission.
+    svc: Optional[RequestServiceEstimate] = None
+
+    # Timing stats
+    prefill_start_ms: Optional[float] = None
+    prefill_end_ms: Optional[float] = None
+    first_token_time_ms: Optional[float] = None
+    completion_time_ms: Optional[float] = None
+    last_token_completion_ms: Optional[float] = None
+    tbt_intervals_ms: List[float] = field(default_factory=list)
+
+    # Diagnostics
+    dropped_reason: str = ""
+
+
+@dataclass
+class ReplayConfig:
+    unsupported_policy: str = "nearest"  # nearest, clip, drop
+    lin_bucket: int = 1
+    lout_bucket: int = 1
+    batch_size: int = 1
+    prompt_priority: bool = True
+    slo_e2e_ms: Optional[float] = None
+    slo_ttft_ms: Optional[float] = None
+
+
+class OutputCsvCostModel:
+    """Cost model built from one or more `main.py` output CSV files.
+
+    Each row provides:
+    - `s_time`: prefill (sum stage) end-to-end latency in ms
+    - `g_time (ms)`: per-token decode latency in ms (averaged over `lout-1`)
+
+    For hybrid routes, GPU/PIM occupancy split is approximated using the stage
+    breakdown fields in the CSV. This is sufficient for queue-aware routing.
+    """
+
+    REQUIRED_COLUMNS = {
+        "Lin",
+        "Lout",
+        "bs",
+        "s_time",
+        "g_time (ms)",
+        "g_matmul",
+        "g_fc",
+        "g_comm",
+        "g_etc",
+        "g_softmax",
+        "g2g_comm",
+        "c2g_comm",
+        "s_matmul",
+        "s_fc",
+        "s_comm",
+        "s_softmax",
+        "s_act",
+        "s_lnorm",
+    }
+
+    def __init__(self,
+                 route_points: Dict[str, List[RouteServicePoint]],
+                 sum_offload_to_pim: bool = False):
+        self.route_points = route_points
+        self.sum_offload_to_pim = sum_offload_to_pim
+
+    @classmethod
+    def from_route_csvs(cls,
+                        route_to_csv: Dict[str, str],
+                        sum_offload_to_pim: bool = False) -> "OutputCsvCostModel":
+        route_points: Dict[str, List[RouteServicePoint]] = {}
+        for route, csv_path in route_to_csv.items():
+            df = pd.read_csv(csv_path)
+            missing = cls.REQUIRED_COLUMNS - set(df.columns)
+            if missing:
+                raise ValueError(f"{csv_path}: missing columns {sorted(missing)}")
+
+            points: List[RouteServicePoint] = []
+            for _, row in df.iterrows():
+                points.append(cls._row_to_point(route, row, csv_path, sum_offload_to_pim))
+            if not points:
+                raise ValueError(f"{csv_path}: no rows found")
+            route_points[route] = points
+        return cls(route_points, sum_offload_to_pim=sum_offload_to_pim)
+
+    @staticmethod
+    def _safe_float(row, key: str) -> float:
+        v = row.get(key, 0.0)
+        try:
+            if pd.isna(v):
+                return 0.0
+        except Exception:
+            pass
+        return float(v)
+
+    @classmethod
+    def _row_to_point(cls, route: str, row, csv_path: str,
+                      sum_offload_to_pim: bool) -> RouteServicePoint:
+        lin = int(row["Lin"])
+        lout = int(row["Lout"])
+        bs = int(row["bs"])
+
+        s_time = cls._safe_float(row, "s_time")
+        g_time = cls._safe_float(row, "g_time (ms)")
+
+        # Prefill split.
+        if route == "gpu_only":
+            prefill_gpu = s_time
+            prefill_pim = 0.0
+        elif sum_offload_to_pim:
+            # Optional hook for future experiments where sum stage is also offloaded.
+            prefill_pim = cls._safe_float(row, "s_matmul") + cls._safe_float(row, "s_softmax")
+            prefill_gpu = (cls._safe_float(row, "s_fc") + cls._safe_float(row, "s_comm") +
+                           cls._safe_float(row, "s_act") + cls._safe_float(row, "s_lnorm"))
+        else:
+            # Current default in this repo: sum stage runs on GPU.
+            prefill_gpu = s_time
+            prefill_pim = 0.0
+
+        # Decode split.
+        if route == "gpu_only":
+            decode_gpu = g_time
+            decode_pim = 0.0
+        else:
+            # Approximate occupancy split using stage-level timing breakdown.
+            decode_gpu = (cls._safe_float(row, "g_fc") + cls._safe_float(row, "g_etc") +
+                          cls._safe_float(row, "g2g_comm"))
+            decode_pim = (cls._safe_float(row, "g_matmul") + cls._safe_float(row, "g_softmax") +
+                          cls._safe_float(row, "c2g_comm"))
+
+            # If a row lacks detailed splits, fail safe to end-to-end on GPU side.
+            if decode_gpu <= 0 and decode_pim <= 0:
+                decode_gpu = g_time
+                decode_pim = 0.0
+
+        prefill_e2e = max(s_time, prefill_gpu, prefill_pim)
+        decode_e2e = max(g_time, decode_gpu, decode_pim)
+
+        return RouteServicePoint(route=route,
+                                 lin=lin,
+                                 lout=lout,
+                                 bs=bs,
+                                 prefill_e2e_ms=prefill_e2e,
+                                 prefill_gpu_ms=prefill_gpu,
+                                 prefill_pim_ms=prefill_pim,
+                                 decode_e2e_ms=decode_e2e,
+                                 decode_gpu_ms=decode_gpu,
+                                 decode_pim_ms=decode_pim,
+                                 source_file=csv_path)
+
+    def routes(self) -> List[str]:
+        return sorted(self.route_points.keys())
+
+    def _bucket(self, value: int, bucket: int) -> int:
+        if bucket <= 1:
+            return int(value)
+        return max(1, int(round(value / bucket) * bucket))
+
+    def lookup(self,
+               route: str,
+               lin: int,
+               lout: int,
+               bs: int,
+               unsupported_policy: str = "nearest",
+               lin_bucket: int = 1,
+               lout_bucket: int = 1) -> Optional[LookupResult]:
+        if route not in self.route_points:
+            return None
+        points = self.route_points[route]
+        if not points:
+            return None
+
+        target_lin = self._bucket(int(lin), lin_bucket)
+        target_lout = self._bucket(int(lout), lout_bucket)
+        target_bs = int(bs)
+
+        route_lins = [p.lin for p in points]
+        route_louts = [p.lout for p in points]
+        clipped_lin = False
+        clipped_lout = False
+
+        if unsupported_policy == "clip":
+            min_lin, max_lin = min(route_lins), max(route_lins)
+            min_lout, max_lout = min(route_louts), max(route_louts)
+            new_lin = min(max(target_lin, min_lin), max_lin)
+            new_lout = min(max(target_lout, min_lout), max_lout)
+            clipped_lin = new_lin != target_lin
+            clipped_lout = new_lout != target_lout
+            target_lin, target_lout = new_lin, new_lout
+        elif unsupported_policy not in ("nearest", "drop"):
+            raise ValueError(f"Unsupported policy: {unsupported_policy}")
+
+        exact = [
+            p for p in points
+            if p.lin == target_lin and p.lout == target_lout and p.bs == target_bs
+        ]
+        if exact:
+            point = exact[0]
+            return LookupResult(point=point,
+                                requested_lin=int(lin),
+                                requested_lout=int(lout),
+                                mapped_lin=point.lin,
+                                mapped_lout=point.lout,
+                                requested_bs=target_bs,
+                                mapped_bs=point.bs,
+                                clipped_lin=clipped_lin,
+                                clipped_lout=clipped_lout)
+
+        if unsupported_policy == "drop":
+            return None
+
+        def _dist(p: RouteServicePoint) -> Tuple[int, int, int]:
+            return (abs(p.lin - target_lin) + abs(p.lout - target_lout),
+                    abs(p.bs - target_bs), p.lin + p.lout)
+
+        point = min(points, key=_dist)
+        return LookupResult(point=point,
+                            requested_lin=int(lin),
+                            requested_lout=int(lout),
+                            mapped_lin=point.lin,
+                            mapped_lout=point.lout,
+                            requested_bs=target_bs,
+                            mapped_bs=point.bs,
+                            clipped_lin=clipped_lin or (point.lin != target_lin),
+                            clipped_lout=clipped_lout or (point.lout != target_lout))
+
+    def estimate_request(self,
+                         route: str,
+                         context_tokens: int,
+                         generated_tokens: int,
+                         bs: int,
+                         unsupported_policy: str,
+                         lin_bucket: int,
+                         lout_bucket: int) -> Optional[RequestServiceEstimate]:
+        lin = int(context_tokens)
+        lout = int(generated_tokens)
+        if lout <= 0:
+            return None
+
+        lookup = self.lookup(route,
+                             lin=lin,
+                             lout=lout,
+                             bs=bs,
+                             unsupported_policy=unsupported_policy,
+                             lin_bucket=lin_bucket,
+                             lout_bucket=lout_bucket)
+        if lookup is None:
+            return None
+
+        p = lookup.point
+        decode_tokens = max(0, int(generated_tokens) - 1)
+        return RequestServiceEstimate(route=route,
+                                      uses_pim=p.uses_pim,
+                                      lin=lin,
+                                      lout=lout,
+                                      generated_tokens=int(generated_tokens),
+                                      decode_tokens=decode_tokens,
+                                      prefill_e2e_ms=p.prefill_e2e_ms,
+                                      prefill_gpu_ms=p.prefill_gpu_ms,
+                                      prefill_pim_ms=p.prefill_pim_ms,
+                                      decode_e2e_ms=p.decode_e2e_ms,
+                                      decode_gpu_ms=p.decode_gpu_ms,
+                                      decode_pim_ms=p.decode_pim_ms,
+                                      mapping=lookup)
+
+
+@dataclass
+class _TaskCandidate:
+    req: ReplayRequest
+    phase: str  # prefill or decode
+    ready_ms: float
+    gpu_ms: float
+    pim_ms: float
+    e2e_ms: float
+    earliest_start_ms: float
+    predicted_finish_ms: float
+
+
+@dataclass
+class ReplaySummary:
+    total_requests: int
+    admitted_requests: int
+    completed_requests: int
+    dropped_requests: int
+    makespan_ms: float
+    throughput_rps: float
+    throughput_tokps: float
+    gpu_util: float
+    pim_util: float
+    route_counts: Dict[str, int]
+    route_fallback_count: int
+    mapping_clipped_lin_count: int
+    mapping_clipped_lout_count: int
+    ttft_ms: Dict[str, float]
+    e2e_ms: Dict[str, float]
+    tbt_ms: Dict[str, float]
+    slo_ttft_miss_rate: Optional[float]
+    slo_e2e_miss_rate: Optional[float]
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2, sort_keys=True)
+
+
+def _percentiles(values: Iterable[float]) -> Dict[str, float]:
+    vals = list(values)
+    if not vals:
+        return {"mean": math.nan, "p50": math.nan, "p95": math.nan, "p99": math.nan}
+    s = pd.Series(vals, dtype=float)
+    return {
+        "mean": float(s.mean()),
+        "p50": float(s.quantile(0.50)),
+        "p95": float(s.quantile(0.95)),
+        "p99": float(s.quantile(0.99)),
+    }
+
+
+class TraceReplaySimulator:
+    def __init__(self,
+                 arrivals: List[AzureTraceRequest],
+                 cost_model: OutputCsvCostModel,
+                 policy: QueueAwareFinishTimePolicy,
+                 config: ReplayConfig,
+                 route_order: Optional[List[str]] = None):
+        self.arrivals = sorted(arrivals, key=lambda r: (r.arrival_ms, r.request_id))
+        self.cost_model = cost_model
+        self.policy = policy
+        self.config = config
+        self.route_order = route_order or cost_model.routes()
+
+        self.gpu_free_ms = 0.0
+        self.pim_free_ms = 0.0
+        self.gpu_busy_ms = 0.0
+        self.pim_busy_ms = 0.0
+        self.now_ms = 0.0
+
+        self.requests: List[ReplayRequest] = []
+        self._arrival_idx = 0
+
+        self.route_counts: Dict[str, int] = {}
+        self.route_fallback_count = 0
+        self.mapping_clipped_lin_count = 0
+        self.mapping_clipped_lout_count = 0
+
+    def _resource_ready(self, gpu_ms: float, pim_ms: float) -> float:
+        t = self.now_ms
+        if gpu_ms > 0:
+            t = max(t, self.gpu_free_ms)
+        if pim_ms > 0:
+            t = max(t, self.pim_free_ms)
+        return t
+
+    def _predict_stage_start(self, ready_ms: float, gpu_ms: float,
+                             pim_ms: float, gpu_free_ms: float,
+                             pim_free_ms: float) -> float:
+        t = ready_ms
+        if gpu_ms > 0:
+            t = max(t, gpu_free_ms)
+        if pim_ms > 0:
+            t = max(t, pim_free_ms)
+        return t
+
+    def _predict_route_candidate(self, req: AzureTraceRequest, route: str) -> Tuple[RouteCandidate, Optional[RequestServiceEstimate]]:
+        est = self.cost_model.estimate_request(route,
+                                               context_tokens=req.context_tokens,
+                                               generated_tokens=req.generated_tokens,
+                                               bs=self.config.batch_size,
+                                               unsupported_policy=self.config.unsupported_policy,
+                                               lin_bucket=self.config.lin_bucket,
+                                               lout_bucket=self.config.lout_bucket)
+        if est is None:
+            return (RouteCandidate(route=route,
+                                   eligible=False,
+                                   uses_pim=("pim" in route),
+                                   predicted_finish_ms=math.inf,
+                                   predicted_gpu_wait_ms=math.inf,
+                                   predicted_pim_wait_ms=math.inf,
+                                   reason="unsupported_length"), None)
+
+        # Aggregate admission time prediction (simple, no batching)
+        prefill_start = self._predict_stage_start(req.arrival_ms, est.prefill_gpu_ms,
+                                                  est.prefill_pim_ms, self.gpu_free_ms,
+                                                  self.pim_free_ms)
+        prefill_end = prefill_start + est.prefill_e2e_ms
+
+        gpu_free_after_prefill = self.gpu_free_ms
+        pim_free_after_prefill = self.pim_free_ms
+        if est.prefill_gpu_ms > 0:
+            gpu_free_after_prefill = max(gpu_free_after_prefill, prefill_start + est.prefill_gpu_ms)
+        if est.prefill_pim_ms > 0:
+            pim_free_after_prefill = max(pim_free_after_prefill, prefill_start + est.prefill_pim_ms)
+
+        decode_gpu_total = est.decode_gpu_ms * est.decode_tokens
+        decode_pim_total = est.decode_pim_ms * est.decode_tokens
+        decode_e2e_total = est.decode_e2e_ms * est.decode_tokens
+        decode_start = self._predict_stage_start(prefill_end, decode_gpu_total,
+                                                 decode_pim_total, gpu_free_after_prefill,
+                                                 pim_free_after_prefill)
+        finish = decode_start + decode_e2e_total
+
+        pred_gpu_wait = max(0.0, prefill_start - req.arrival_ms)
+        pred_pim_wait = 0.0
+        if est.uses_pim and est.decode_tokens > 0 and est.decode_pim_ms > 0:
+            pred_pim_wait = max(0.0, pim_free_after_prefill - prefill_end)
+
+        cand = RouteCandidate(route=route,
+                              eligible=True,
+                              uses_pim=est.uses_pim,
+                              predicted_finish_ms=finish,
+                              predicted_gpu_wait_ms=pred_gpu_wait,
+                              predicted_pim_wait_ms=pred_pim_wait)
+        return cand, est
+
+    def _admit_arrivals_up_to_now(self):
+        while self._arrival_idx < len(self.arrivals) and self.arrivals[self._arrival_idx].arrival_ms <= self.now_ms:
+            src_req = self.arrivals[self._arrival_idx]
+            self._arrival_idx += 1
+
+            rr = ReplayRequest(request_id=src_req.request_id,
+                               arrival_ms=src_req.arrival_ms,
+                               context_tokens=src_req.context_tokens,
+                               generated_tokens=src_req.generated_tokens,
+                               ready_ms=src_req.arrival_ms)
+            if self.config.slo_e2e_ms is not None:
+                rr.deadline_ms = rr.arrival_ms + self.config.slo_e2e_ms
+
+            candidates: List[RouteCandidate] = []
+            est_by_route: Dict[str, RequestServiceEstimate] = {}
+            for route in self.route_order:
+                cand, est = self._predict_route_candidate(src_req, route)
+                candidates.append(cand)
+                if est is not None:
+                    est_by_route[route] = est
+
+            decision = self.policy.choose_route(candidates,
+                                               now_ms=self.now_ms,
+                                               deadline_ms=rr.deadline_ms)
+            if decision.dropped or decision.route is None or decision.route not in est_by_route:
+                rr.state = "dropped"
+                rr.dropped_reason = decision.reason
+                rr.route_decision_reason = decision.reason
+                self.requests.append(rr)
+                continue
+
+            rr.route = decision.route
+            rr.route_decision_reason = decision.reason
+            if "fallback_gpu" in decision.reason:
+                self.route_fallback_count += 1
+            rr.svc = est_by_route[decision.route]
+            rr.remaining_decode_tokens = rr.svc.decode_tokens
+            rr.state = "waiting_prefill"
+            rr.ready_ms = rr.arrival_ms
+
+            if rr.svc.mapping.clipped_lin:
+                self.mapping_clipped_lin_count += 1
+            if rr.svc.mapping.clipped_lout:
+                self.mapping_clipped_lout_count += 1
+
+            self.route_counts[rr.route] = self.route_counts.get(rr.route, 0) + 1
+            self.requests.append(rr)
+
+    def _task_for_request(self, rr: ReplayRequest) -> Optional[_TaskCandidate]:
+        if rr.state not in ("waiting_prefill", "waiting_decode"):
+            return None
+        if rr.svc is None:
+            return None
+
+        if rr.state == "waiting_prefill":
+            gpu_ms = rr.svc.prefill_gpu_ms
+            pim_ms = rr.svc.prefill_pim_ms
+            e2e_ms = rr.svc.prefill_e2e_ms
+            phase = "prefill"
+        else:
+            if rr.remaining_decode_tokens <= 0:
+                return None
+            gpu_ms = rr.svc.decode_gpu_ms
+            pim_ms = rr.svc.decode_pim_ms
+            e2e_ms = rr.svc.decode_e2e_ms
+            phase = "decode"
+
+        earliest_start = self._predict_stage_start(rr.ready_ms, gpu_ms, pim_ms,
+                                                   self.gpu_free_ms, self.pim_free_ms)
+        return _TaskCandidate(req=rr,
+                              phase=phase,
+                              ready_ms=rr.ready_ms,
+                              gpu_ms=gpu_ms,
+                              pim_ms=pim_ms,
+                              e2e_ms=e2e_ms,
+                              earliest_start_ms=earliest_start,
+                              predicted_finish_ms=earliest_start + e2e_ms)
+
+    def _choose_next_task(self) -> Optional[_TaskCandidate]:
+        cands = []
+        for rr in self.requests:
+            tc = self._task_for_request(rr)
+            if tc is not None:
+                cands.append(tc)
+        if not cands:
+            return None
+
+        def _key(tc: _TaskCandidate):
+            phase_prio = 0
+            if self.config.prompt_priority:
+                phase_prio = 0 if tc.phase == "prefill" else 1
+            return (tc.earliest_start_ms, phase_prio, tc.ready_ms, tc.req.request_id)
+
+        return min(cands, key=_key)
+
+    def _reserve_resources(self, start_ms: float, gpu_ms: float, pim_ms: float):
+        if gpu_ms > 0:
+            self.gpu_free_ms = max(self.gpu_free_ms, start_ms) + gpu_ms
+            self.gpu_busy_ms += gpu_ms
+        if pim_ms > 0:
+            self.pim_free_ms = max(self.pim_free_ms, start_ms) + pim_ms
+            self.pim_busy_ms += pim_ms
+
+    def _complete_task(self, tc: _TaskCandidate):
+        rr = tc.req
+        finish_ms = tc.earliest_start_ms + tc.e2e_ms
+
+        if tc.phase == "prefill":
+            rr.prefill_start_ms = tc.earliest_start_ms
+            rr.prefill_end_ms = finish_ms
+            rr.first_token_time_ms = finish_ms
+            rr.last_token_completion_ms = finish_ms
+            if rr.remaining_decode_tokens > 0:
+                rr.state = "waiting_decode"
+                rr.ready_ms = finish_ms
+            else:
+                rr.state = "done"
+                rr.completion_time_ms = finish_ms
+        else:
+            if rr.last_token_completion_ms is not None:
+                rr.tbt_intervals_ms.append(finish_ms - rr.last_token_completion_ms)
+            rr.last_token_completion_ms = finish_ms
+            rr.remaining_decode_tokens -= 1
+            if rr.remaining_decode_tokens <= 0:
+                rr.state = "done"
+                rr.completion_time_ms = finish_ms
+            else:
+                rr.state = "waiting_decode"
+                rr.ready_ms = finish_ms
+
+    def run(self) -> ReplaySummary:
+        self.now_ms = 0.0
+        if self.arrivals:
+            self.now_ms = min(0.0, self.arrivals[0].arrival_ms)
+
+        while True:
+            self._admit_arrivals_up_to_now()
+
+            task = self._choose_next_task()
+            next_arrival_ms = None
+            if self._arrival_idx < len(self.arrivals):
+                next_arrival_ms = self.arrivals[self._arrival_idx].arrival_ms
+
+            if task is None:
+                if next_arrival_ms is None:
+                    break
+                self.now_ms = max(self.now_ms, next_arrival_ms)
+                continue
+
+            # Let earlier arrivals enter before scheduling a later-start task.
+            if next_arrival_ms is not None and next_arrival_ms < task.earliest_start_ms:
+                self.now_ms = max(self.now_ms, next_arrival_ms)
+                continue
+
+            self.now_ms = max(self.now_ms, task.earliest_start_ms)
+            self._reserve_resources(task.earliest_start_ms, task.gpu_ms, task.pim_ms)
+            self._complete_task(task)
+
+        makespan_ms = 0.0
+        if self.requests:
+            makespan_ms = max([
+                0.0,
+                max((r.completion_time_ms or r.arrival_ms) for r in self.requests),
+                max((r.arrival_ms for r in self.requests), default=0.0),
+            ])
+
+        completed = [r for r in self.requests if r.state == "done"]
+        dropped = [r for r in self.requests if r.state == "dropped"]
+        admitted = [r for r in self.requests if r.state != "dropped"]
+
+        ttft_vals = [
+            (r.first_token_time_ms - r.arrival_ms)
+            for r in completed
+            if r.first_token_time_ms is not None
+        ]
+        e2e_vals = [
+            (r.completion_time_ms - r.arrival_ms)
+            for r in completed
+            if r.completion_time_ms is not None
+        ]
+        tbt_vals: List[float] = []
+        for r in completed:
+            tbt_vals.extend(r.tbt_intervals_ms)
+
+        ttft_miss = None
+        if self.config.slo_ttft_ms is not None and completed:
+            misses = 0
+            total = 0
+            for r in completed:
+                if r.first_token_time_ms is None:
+                    continue
+                total += 1
+                if (r.first_token_time_ms - r.arrival_ms) > self.config.slo_ttft_ms:
+                    misses += 1
+            ttft_miss = (misses / total) if total > 0 else math.nan
+
+        e2e_miss = None
+        if self.config.slo_e2e_ms is not None and completed:
+            misses = 0
+            total = 0
+            for r in completed:
+                if r.completion_time_ms is None:
+                    continue
+                total += 1
+                if (r.completion_time_ms - r.arrival_ms) > self.config.slo_e2e_ms:
+                    misses += 1
+            e2e_miss = (misses / total) if total > 0 else math.nan
+
+        makespan_s = makespan_ms / 1000.0 if makespan_ms > 0 else math.nan
+        total_out_tokens = sum(r.generated_tokens for r in completed)
+
+        return ReplaySummary(
+            total_requests=len(self.requests),
+            admitted_requests=len(admitted),
+            completed_requests=len(completed),
+            dropped_requests=len(dropped),
+            makespan_ms=makespan_ms,
+            throughput_rps=(len(completed) / makespan_s) if makespan_ms > 0 else math.nan,
+            throughput_tokps=(total_out_tokens / makespan_s) if makespan_ms > 0 else math.nan,
+            gpu_util=(self.gpu_busy_ms / makespan_ms) if makespan_ms > 0 else math.nan,
+            pim_util=(self.pim_busy_ms / makespan_ms) if makespan_ms > 0 else math.nan,
+            route_counts=dict(sorted(self.route_counts.items())),
+            route_fallback_count=self.route_fallback_count,
+            mapping_clipped_lin_count=self.mapping_clipped_lin_count,
+            mapping_clipped_lout_count=self.mapping_clipped_lout_count,
+            ttft_ms=_percentiles(ttft_vals),
+            e2e_ms=_percentiles(e2e_vals),
+            tbt_ms=_percentiles(tbt_vals),
+            slo_ttft_miss_rate=ttft_miss,
+            slo_e2e_miss_rate=e2e_miss,
+        )
+
+    def requests_dataframe(self) -> pd.DataFrame:
+        rows = []
+        for r in self.requests:
+            ttft = None
+            if r.first_token_time_ms is not None:
+                ttft = r.first_token_time_ms - r.arrival_ms
+            e2e = None
+            if r.completion_time_ms is not None:
+                e2e = r.completion_time_ms - r.arrival_ms
+            rows.append({
+                "request_id": r.request_id,
+                "arrival_ms": r.arrival_ms,
+                "context_tokens": r.context_tokens,
+                "generated_tokens": r.generated_tokens,
+                "route": r.route,
+                "state": r.state,
+                "route_decision_reason": r.route_decision_reason,
+                "dropped_reason": r.dropped_reason,
+                "ttft_ms": ttft,
+                "e2e_ms": e2e,
+                "decode_tokens": (r.svc.decode_tokens if r.svc else None),
+                "mean_tbt_ms": (sum(r.tbt_intervals_ms) / len(r.tbt_intervals_ms)
+                                if r.tbt_intervals_ms else None),
+                "tbt_count": len(r.tbt_intervals_ms),
+                "mapped_lin": (r.svc.mapping.mapped_lin if r.svc else None),
+                "mapped_lout": (r.svc.mapping.mapped_lout if r.svc else None),
+                "clipped_lin": (r.svc.mapping.clipped_lin if r.svc else None),
+                "clipped_lout": (r.svc.mapping.clipped_lout if r.svc else None),
+                "deadline_ms": r.deadline_ms,
+            })
+        return pd.DataFrame(rows)
