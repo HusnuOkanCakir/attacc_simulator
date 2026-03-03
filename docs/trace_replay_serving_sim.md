@@ -462,3 +462,373 @@ This separation keeps:
 - `src/trace_replay_sim.py`
 - `tools/run_trace_replay.py`
 
+---
+
+## Cost Table + ML Interpolation (v1.5)
+
+We added a denser cost-calibration and interpolation path on top of the replay simulator.
+
+### Files
+
+- `tools/gen_cost_table.py`
+- `tools/train_cost_model.py`
+- `tools/plot_cost_model_diagnostics.py`
+- `src/learned_cost_model.py`
+
+### Purpose
+
+The original replay path used only:
+
+- exact lookup
+- nearest lookup
+- clipping
+- drop
+
+This is workable for sparse calibration tables, but it is weak when many requests fall between calibrated points.
+
+The new flow supports a lightweight ML interpolation model:
+
+- per-route training data from `output.csv`-style cost tables
+- one model per route
+- one regressor per target
+- gradient-boosted trees (`HistGradientBoostingRegressor`)
+
+Targets predicted:
+
+- `prefill_e2e_ms`
+- `prefill_gpu_ms`
+- `prefill_pim_ms`
+- `decode_e2e_ms`
+- `decode_gpu_ms`
+- `decode_pim_ms`
+
+### Why this model
+
+This follows the same general direction as `throttLLeM`, which uses gradient-boosted trees for bounded tabular performance prediction.
+
+This is a good fit here because:
+
+- inputs are low-dimensional (`Lin`, `Lout`, `bs`)
+- cost surfaces are nonlinear
+- inference-time prediction must stay lightweight
+
+### Modes in replay
+
+`tools/run_trace_replay.py` now supports:
+
+- `--cost-model table`
+  - exact/nearest/clip/drop from CSV tables
+- `--cost-model ml`
+  - learned model only
+- `--route-policy min_finish`
+  - baseline route choice: smallest predicted finish time
+- `--route-policy slack_then_finish`
+  - SLO-aware route choice: prefer routes that meet the E2E deadline, otherwise choose least lateness
+
+Note:
+
+- `hybrid_pim_gpu` is still a valid execution route name in the replay scheduler.
+- The old `--cost-model hybrid` prediction mode was removed to avoid confusion.
+- Cost prediction is now either pure table lookup or pure learned-model prediction.
+
+Recommended mode:
+
+- `ml`
+
+This keeps cost prediction behavior simple: one learned model is used everywhere, with clipping only when a request is outside the trained bounds.
+
+For SLO-aware routing, use:
+
+- `--route-policy slack_then_finish`
+- `--slo-e2e-ms <deadline>`
+
+For `v2.1` queue-pressure-aware prediction, add one or more of:
+
+- `--gpu-queue-alpha`
+- `--pim-queue-alpha`
+- `--active-request-alpha`
+- `--decode-token-alpha`
+
+These terms inflate the admission-time predicted finish based on already queued
+work, making the predictor less myopic under bursty load.
+
+---
+
+## Dense PI0 Sweep Commands
+
+### Narrow PI0 sweep
+
+Use this first if you want a conservative PI0-focused table around the current operating region:
+
+```bash
+python tools/gen_cost_table.py \
+  --preset pi0-narrow \
+  --route gpu_only \
+  --route lpddr5_pim_bank \
+  --route hbm3_pim_bank \
+  --resume \
+  --sort
+```
+
+### Denser PI0 sweep
+
+Use this when you want enough points for ML interpolation:
+
+```bash
+python tools/gen_cost_table.py \
+  --preset pi0-dense \
+  --route gpu_only \
+  --route lpddr5_pim_bank \
+  --resume \
+  --sort
+```
+
+### Wide Azure-inspired sweep
+
+Use this when you want broad heterogeneous coverage for ML-based cost prediction:
+
+```bash
+python tools/gen_cost_table.py \
+  --preset azure-wide \
+  --route gpu_only \
+  --route lpddr5_pim_bank \
+  --resume \
+  --sort
+```
+
+Built-in presets:
+
+- `pi0-point`
+- `pi0-narrow`
+- `pi0-dense`
+- `azure-wide`
+
+Explicit `--lin-values`, `--lout-values`, and `--batch-values` always override the preset values.
+
+This produces per-route cost tables in:
+
+- `cluster_outputs/cost_tables/gpu_only.csv`
+- `cluster_outputs/cost_tables/lpddr5_pim_bank.csv`
+- `cluster_outputs/cost_tables/hbm3_pim_bank.csv`
+
+---
+
+## ML Training + Diagnostics Commands
+
+### Train route models
+
+```bash
+python tools/train_cost_model.py \
+  --profile gpu_only=cluster_outputs/cost_tables/gpu_only.csv \
+  --profile lpddr5_pim_bank=cluster_outputs/cost_tables/lpddr5_pim_bank.csv \
+  --profile hbm3_pim_bank=cluster_outputs/cost_tables/hbm3_pim_bank.csv \
+  --out-dir cluster_outputs/cost_models \
+  --summary-json cluster_outputs/cost_models/train_summary.json
+```
+
+### Plot interpolation diagnostics
+
+```bash
+python tools/plot_cost_model_diagnostics.py \
+  --profile gpu_only=cluster_outputs/cost_tables/gpu_only.csv \
+  --profile lpddr5_pim_bank=cluster_outputs/cost_tables/lpddr5_pim_bank.csv \
+  --profile hbm3_pim_bank=cluster_outputs/cost_tables/hbm3_pim_bank.csv \
+  --ml-profile gpu_only=cluster_outputs/cost_models/gpu_only.pkl \
+  --ml-profile lpddr5_pim_bank=cluster_outputs/cost_models/lpddr5_pim_bank.pkl \
+  --ml-profile hbm3_pim_bank=cluster_outputs/cost_models/hbm3_pim_bank.pkl \
+  --out-dir cluster_outputs/cost_model_plots \
+  --summary-json cluster_outputs/cost_model_plots/metrics_summary.json
+```
+
+This writes:
+
+- `<route>_pred_vs_actual.png`
+- `<route>_error_by_shape.png`
+- `<route>_metrics.json`
+
+### Replay with ML mode
+
+```bash
+python tools/run_trace_replay.py \
+  --cost-model ml \
+  --limit 2000 \
+  --arrival-time-scale 0.05 \
+  --ml-profile gpu_only=cluster_outputs/cost_models/gpu_only.pkl \
+  --ml-profile lpddr5_pim_bank=cluster_outputs/cost_models/lpddr5_pim_bank.pkl \
+  --routes gpu_only lpddr5_pim_bank \
+  --unsupported-policy clip \
+  --pim-wait-threshold-ms 1 \
+  --requests-csv cluster_outputs/replay_requests_ml.csv \
+  --summary-json cluster_outputs/replay_summary_ml.json
+```
+
+### Replay with ML mode and slack-aware routing
+
+```bash
+python tools/run_trace_replay.py \
+  --cost-model ml \
+  --route-policy slack_then_finish \
+  --limit 2000 \
+  --arrival-time-scale 0.05 \
+  --ml-profile gpu_only=cluster_outputs/cost_models/gpu_only.pkl \
+  --ml-profile lpddr5_pim_bank=cluster_outputs/cost_models/lpddr5_pim_bank.pkl \
+  --routes gpu_only lpddr5_pim_bank \
+  --unsupported-policy clip \
+  --pim-wait-threshold-ms 1 \
+  --slo-e2e-ms 500 \
+  --requests-csv cluster_outputs/replay_requests_ml_slack.csv \
+  --summary-json cluster_outputs/replay_summary_ml_slack.json
+```
+
+### Replay with ML mode, slack-aware routing, and queue-pressure prediction (`v2.1`)
+
+```bash
+python tools/run_trace_replay.py \
+  --cost-model ml \
+  --route-policy slack_then_finish \
+  --limit 2000 \
+  --arrival-time-scale 0.05 \
+  --ml-profile gpu_only=cluster_outputs/cost_models/gpu_only.pkl \
+  --ml-profile lpddr5_pim_bank=cluster_outputs/cost_models/lpddr5_pim_bank.pkl \
+  --routes gpu_only lpddr5_pim_bank \
+  --unsupported-policy clip \
+  --pim-wait-threshold-ms 1 \
+  --slo-e2e-ms 500 \
+  --gpu-queue-alpha 0.05 \
+  --pim-queue-alpha 0.05 \
+  --decode-token-alpha 0.001 \
+  --requests-csv cluster_outputs/replay_requests_ml_slack_qp.csv \
+  --summary-json cluster_outputs/replay_summary_ml_slack_qp.json
+```
+
+## Current v2 Observations
+
+Using:
+
+- `--cost-model ml`
+- `--route-policy slack_then_finish`
+- `--arrival-time-scale 0.05`
+- `--slo-e2e-ms 500`
+
+the replay plots and summaries show:
+
+- `lpddr5_pim_bank` still wins every admission decision
+  - route mix stays entirely on the LPDDR5-PIM route
+  - slack-aware routing does not yet create route diversity
+- the admission-time predictor is optimistic under load
+  - in `predicted_vs_actual`, most points sit well above the ideal `y=x` line
+  - predicted finish is much smaller than actual E2E latency
+- slack is mostly positive at admission, but actual deadline misses are still very high
+  - `slo_e2e_miss_rate = 0.9945`
+  - this means the slack policy is working on underestimated completion times
+- latency is queue-dominated
+  - `TTFT` is already multi-second
+  - `E2E` is tens of seconds
+  - the replay is dominated by queue buildup, not only per-request compute cost
+- arrival scatter plots show burst structure
+  - requests arriving in dense regions see much higher `TTFT` and `E2E`
+  - clipped requests contribute some distortion, but the main effect is queue growth
+
+Interpretation:
+
+- `v2` is implemented correctly, but the current workload and route pair do not create a strong routing tradeoff
+- the next limitation is not ML interpolation quality; it is admission-time latency prediction under future queue growth
+- the next useful improvement is a `v2.1` queue-pressure-aware predictor before or alongside continuous batching
+
+## v2.1 Queue-Pressure-Aware Prediction
+
+To address the optimism seen in `predicted_vs_actual`, the replay simulator now
+supports additive queue-pressure terms at admission time:
+
+- GPU backlog term: proportional to pending GPU work already in the system
+- PIM backlog term: proportional to pending PIM work already in the system
+- active-request term: additive penalty per queued request
+- pending-decode-token term: additive penalty based on queued decode tokens
+
+These penalties are route-sensitive:
+
+- GPU backlog is weighted by the route's GPU work share
+- PIM backlog is weighted by the route's PIM work share
+
+This is intended as a `v2.1` fix for the main weakness exposed by `v2`:
+
+- the original predictor only saw current free times (`gpu_free_ms`, `pim_free_ms`)
+- it did not account for already admitted waiting work
+- under bursty load, this caused systematically optimistic slack estimates
+
+Diagnostics added to the per-request CSV:
+
+- `chosen_queue_pressure_ms`
+- `chosen_predicted_finish_ms`
+- `chosen_slack_ms`
+
+## SLO Sweep Findings
+
+Sweeping:
+
+- `--route-policy slack_then_finish`
+- `--arrival-time-scale 0.05`
+- `--slo-e2e-ms` in `{500, 1000, 2000, 5000, 10000, 20000, 50000, 100000}`
+
+shows:
+
+- changing the SLO changes only the reported `slo_e2e_miss_rate`
+- throughput, p95 latencies, route counts, and utilization remain unchanged
+- all requests still route to `lpddr5_pim_bank`
+- `route_fallback_count` stays `0`
+
+Observed miss-rate trend:
+
+- `500` -> `0.9945`
+- `1000` -> `0.9940`
+- `2000` -> `0.9800`
+- `5000` -> `0.9685`
+- `10000` -> `0.9685`
+- `20000` -> `0.9685`
+- `50000` -> `0.8230`
+- `100000` -> `0.0630`
+
+Interpretation:
+
+- for the current route pair (`gpu_only`, `lpddr5_pim_bank`), slack-aware routing is not behaviorally distinct from `min_finish`
+- the SLO sweep is currently evaluation-only, not policy-active
+- the deadline threshold changes how many requests count as misses, but it does not change the chosen route or the underlying queue dynamics
+- this confirms that the next missing capability is a stronger queue-growth-aware prediction model, not another SLO sweep
+
+## v2.1 Queue-Pressure Sweep Findings
+
+Sweeping queue-pressure coefficients with:
+
+- `gpu_queue_alpha` in `{0.0, 0.02, 0.05, 0.1}`
+- `pim_queue_alpha` in `{0.0, 0.02, 0.05}`
+- `decode_token_alpha` in `{0.0, 0.0005, 0.001, 0.002}`
+
+shows:
+
+- `slo_e2e_miss_rate` stays essentially flat across the sweep
+- route selection still does not change
+  - all requests continue to route to `lpddr5_pim_bank`
+  - `route_fallback_count` remains `0`
+- the only visible behavioral change is throughput degradation in the corner where:
+  - `gpu_queue_alpha = 0.0`
+  - `pim_queue_alpha > 0`
+
+Examples from the sweep:
+
+- `g=0.0, p=0.02, d=0.0` -> `396.57 tok/s`
+- `g=0.0, p=0.05, d=0.0` -> `364.62 tok/s`
+- once `gpu_queue_alpha > 0`, throughput returns close to the baseline `402.83 tok/s`
+
+Interpretation:
+
+- the current additive queue-pressure correction is active, but it is not yet improving deadline outcomes
+- in this coefficient range, it mostly penalizes the PIM route when GPU pressure is not also modeled
+- adding a GPU-pressure term cancels that asymmetric penalty, but does not create a useful routing tradeoff
+- `v2.1` improves admission-time pessimism somewhat, but it is still not strong enough to change the system-level outcome
+
+Implication:
+
+- the next useful improvement is not more coefficient sweeping
+- the next useful improvement is either:
+  - a more structured queue-growth model with separate GPU/PIM phase backlog terms, or
+  - moving to `v3` continuous batching where queue dynamics become materially different

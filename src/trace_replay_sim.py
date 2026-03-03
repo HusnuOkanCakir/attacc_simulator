@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Protocol, Tuple
 
 import pandas as pd
 
@@ -72,6 +72,11 @@ class ReplayRequest:
     ready_ms: float = 0.0
     remaining_decode_tokens: int = 0
     deadline_ms: Optional[float] = None
+    chosen_predicted_finish_ms: Optional[float] = None
+    chosen_predicted_gpu_wait_ms: Optional[float] = None
+    chosen_predicted_pim_wait_ms: Optional[float] = None
+    chosen_queue_pressure_ms: Optional[float] = None
+    chosen_slack_ms: Optional[float] = None
 
     # Service estimate chosen at admission.
     svc: Optional[RequestServiceEstimate] = None
@@ -97,6 +102,33 @@ class ReplayConfig:
     prompt_priority: bool = True
     slo_e2e_ms: Optional[float] = None
     slo_ttft_ms: Optional[float] = None
+    gpu_queue_alpha: float = 0.0
+    pim_queue_alpha: float = 0.0
+    active_request_alpha: float = 0.0
+    decode_token_alpha: float = 0.0
+
+
+@dataclass
+class QueuePressureSnapshot:
+    active_requests: int = 0
+    pending_decode_tokens: int = 0
+    pending_gpu_work_ms: float = 0.0
+    pending_pim_work_ms: float = 0.0
+
+
+class CostModelProtocol(Protocol):
+    def routes(self) -> List[str]:
+        ...
+
+    def estimate_request(self,
+                         route: str,
+                         context_tokens: int,
+                         generated_tokens: int,
+                         bs: int,
+                         unsupported_policy: str,
+                         lin_bucket: int,
+                         lout_bucket: int) -> Optional["RequestServiceEstimate"]:
+        ...
 
 
 class OutputCsvCostModel:
@@ -320,12 +352,24 @@ class OutputCsvCostModel:
         if lookup is None:
             return None
 
+        return self._estimate_from_lookup(route=route,
+                                          lin=lin,
+                                          lout=lout,
+                                          generated_tokens=int(generated_tokens),
+                                          lookup=lookup)
+
+    def _estimate_from_lookup(self,
+                              route: str,
+                              lin: int,
+                              lout: int,
+                              generated_tokens: int,
+                              lookup: LookupResult) -> RequestServiceEstimate:
         p = lookup.point
         decode_tokens = max(0, int(generated_tokens) - 1)
         return RequestServiceEstimate(route=route,
                                       uses_pim=p.uses_pim,
-                                      lin=lin,
-                                      lout=lout,
+                                      lin=int(lin),
+                                      lout=int(lout),
                                       generated_tokens=int(generated_tokens),
                                       decode_tokens=decode_tokens,
                                       prefill_e2e_ms=p.prefill_e2e_ms,
@@ -390,7 +434,7 @@ def _percentiles(values: Iterable[float]) -> Dict[str, float]:
 class TraceReplaySimulator:
     def __init__(self,
                  arrivals: List[AzureTraceRequest],
-                 cost_model: OutputCsvCostModel,
+                 cost_model: CostModelProtocol,
                  policy: QueueAwareFinishTimePolicy,
                  config: ReplayConfig,
                  route_order: Optional[List[str]] = None):
@@ -432,7 +476,27 @@ class TraceReplaySimulator:
             t = max(t, pim_free_ms)
         return t
 
-    def _predict_route_candidate(self, req: AzureTraceRequest, route: str) -> Tuple[RouteCandidate, Optional[RequestServiceEstimate]]:
+    def _queue_pressure_snapshot(self) -> QueuePressureSnapshot:
+        snap = QueuePressureSnapshot()
+        for rr in self.requests:
+            if rr.state not in ("waiting_prefill", "waiting_decode"):
+                continue
+            if rr.svc is None:
+                continue
+            snap.active_requests += 1
+            if rr.state == "waiting_prefill":
+                snap.pending_gpu_work_ms += rr.svc.prefill_gpu_ms
+                snap.pending_pim_work_ms += rr.svc.prefill_pim_ms
+            if rr.remaining_decode_tokens > 0:
+                snap.pending_decode_tokens += rr.remaining_decode_tokens
+                snap.pending_gpu_work_ms += rr.remaining_decode_tokens * rr.svc.decode_gpu_ms
+                snap.pending_pim_work_ms += rr.remaining_decode_tokens * rr.svc.decode_pim_ms
+        return snap
+
+    def _predict_route_candidate(self,
+                                 req: AzureTraceRequest,
+                                 route: str,
+                                 deadline_ms: Optional[float] = None) -> Tuple[RouteCandidate, Optional[RequestServiceEstimate]]:
         est = self.cost_model.estimate_request(route,
                                                context_tokens=req.context_tokens,
                                                generated_tokens=req.generated_tokens,
@@ -446,7 +510,9 @@ class TraceReplaySimulator:
                                    uses_pim=("pim" in route),
                                    predicted_finish_ms=math.inf,
                                    predicted_gpu_wait_ms=math.inf,
-                                   predicted_pim_wait_ms=math.inf,
+                                    predicted_pim_wait_ms=math.inf,
+                                   deadline_ms=deadline_ms,
+                                   slack_ms=None,
                                    reason="unsupported_length"), None)
 
         # Aggregate admission time prediction (simple, no batching)
@@ -474,13 +540,33 @@ class TraceReplaySimulator:
         pred_pim_wait = 0.0
         if est.uses_pim and est.decode_tokens > 0 and est.decode_pim_ms > 0:
             pred_pim_wait = max(0.0, pim_free_after_prefill - prefill_end)
+        queue_pressure_ms = 0.0
+        if (self.config.gpu_queue_alpha > 0 or self.config.pim_queue_alpha > 0 or
+                self.config.active_request_alpha > 0 or self.config.decode_token_alpha > 0):
+            snap = self._queue_pressure_snapshot()
+            req_gpu_work_ms = est.prefill_gpu_ms + decode_gpu_total
+            req_pim_work_ms = est.prefill_pim_ms + decode_pim_total
+            req_total_ms = max(est.prefill_e2e_ms + decode_e2e_total, 1e-9)
+            gpu_share = req_gpu_work_ms / req_total_ms if req_gpu_work_ms > 0 else 0.0
+            pim_share = req_pim_work_ms / req_total_ms if req_pim_work_ms > 0 else 0.0
+            queue_pressure_ms += self.config.gpu_queue_alpha * snap.pending_gpu_work_ms * gpu_share
+            queue_pressure_ms += self.config.pim_queue_alpha * snap.pending_pim_work_ms * pim_share
+            queue_pressure_ms += self.config.active_request_alpha * snap.active_requests
+            queue_pressure_ms += (self.config.decode_token_alpha *
+                                  snap.pending_decode_tokens *
+                                  max(est.decode_e2e_ms, 0.0))
+            finish += queue_pressure_ms
+        slack_ms = None if deadline_ms is None else (deadline_ms - finish)
 
         cand = RouteCandidate(route=route,
                               eligible=True,
                               uses_pim=est.uses_pim,
                               predicted_finish_ms=finish,
                               predicted_gpu_wait_ms=pred_gpu_wait,
-                              predicted_pim_wait_ms=pred_pim_wait)
+                              predicted_pim_wait_ms=pred_pim_wait,
+                              queue_pressure_ms=queue_pressure_ms,
+                              deadline_ms=deadline_ms,
+                              slack_ms=slack_ms)
         return cand, est
 
     def _admit_arrivals_up_to_now(self):
@@ -498,9 +584,13 @@ class TraceReplaySimulator:
 
             candidates: List[RouteCandidate] = []
             est_by_route: Dict[str, RequestServiceEstimate] = {}
+            cand_by_route: Dict[str, RouteCandidate] = {}
             for route in self.route_order:
-                cand, est = self._predict_route_candidate(src_req, route)
+                cand, est = self._predict_route_candidate(src_req,
+                                                          route,
+                                                          deadline_ms=rr.deadline_ms)
                 candidates.append(cand)
+                cand_by_route[route] = cand
                 if est is not None:
                     est_by_route[route] = est
 
@@ -519,6 +609,13 @@ class TraceReplaySimulator:
             if "fallback_gpu" in decision.reason:
                 self.route_fallback_count += 1
             rr.svc = est_by_route[decision.route]
+            chosen_cand = cand_by_route.get(decision.route)
+            if chosen_cand is not None:
+                rr.chosen_predicted_finish_ms = chosen_cand.predicted_finish_ms
+                rr.chosen_predicted_gpu_wait_ms = chosen_cand.predicted_gpu_wait_ms
+                rr.chosen_predicted_pim_wait_ms = chosen_cand.predicted_pim_wait_ms
+                rr.chosen_queue_pressure_ms = chosen_cand.queue_pressure_ms
+                rr.chosen_slack_ms = chosen_cand.slack_ms
             rr.remaining_decode_tokens = rr.svc.decode_tokens
             rr.state = "waiting_prefill"
             rr.ready_ms = rr.arrival_ms
@@ -744,5 +841,10 @@ class TraceReplaySimulator:
                 "clipped_lin": (r.svc.mapping.clipped_lin if r.svc else None),
                 "clipped_lout": (r.svc.mapping.clipped_lout if r.svc else None),
                 "deadline_ms": r.deadline_ms,
+                "chosen_predicted_finish_ms": r.chosen_predicted_finish_ms,
+                "chosen_predicted_gpu_wait_ms": r.chosen_predicted_gpu_wait_ms,
+                "chosen_predicted_pim_wait_ms": r.chosen_predicted_pim_wait_ms,
+                "chosen_queue_pressure_ms": r.chosen_queue_pressure_ms,
+                "chosen_slack_ms": r.chosen_slack_ms,
             })
         return pd.DataFrame(rows)

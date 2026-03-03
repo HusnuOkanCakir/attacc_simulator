@@ -65,6 +65,36 @@ ROUTE_PRESETS: Dict[str, Dict[str, str]] = {
     },
 }
 
+SWEEP_PRESETS: Dict[str, Dict[str, str]] = {
+    # Current default single operating point.
+    "pi0-point": {
+        "lin_values": "867",
+        "lout_values": "50",
+        "batch_values": "1",
+        "description": "Single PI0 operating point around the currently measured setup.",
+    },
+    "pi0-narrow": {
+        "lin_values": "800:928:16",
+        "lout_values": "32,50,64",
+        "batch_values": "1",
+        "description": "Narrow PI0-focused sweep around the current operating region.",
+    },
+    "pi0-dense": {
+        "lin_values": "768:960:16",
+        "lout_values": "16:64:4",
+        "batch_values": "1,2,4",
+        "description": "Dense PI0 interpolation grid for ML training.",
+    },
+    "azure-wide": {
+        # Wide, non-uniform grid: dense in small/medium region, coarser in tails.
+        "lin_values": "1:1024:64,1152:4096:128,4352:8000:256",
+        # main.py normalizes decode metrics by (lout - 1), so lout must be >= 2.
+        "lout_values": "2:64:4,72:128:8,144:200:16",
+        "batch_values": "1,2,4,8",
+        "description": "Wide Azure-inspired sweep for heterogeneous request lengths.",
+    },
+}
+
 
 @dataclass(frozen=True)
 class SweepPoint:
@@ -248,33 +278,58 @@ def _parse_route_out(item: str) -> Tuple[str, Optional[Path]]:
     return item.strip(), None
 
 
+def _resolve_sweep_specs(args: argparse.Namespace) -> Tuple[str, str, str]:
+    preset = SWEEP_PRESETS.get(args.preset, {})
+    lin_spec = args.lin_values or preset.get("lin_values") or "867"
+    lout_spec = args.lout_values or preset.get("lout_values") or "50"
+    batch_spec = args.batch_values or preset.get("batch_values") or "1"
+    return lin_spec, lout_spec, batch_spec
+
+
+def _format_preset_help() -> str:
+    lines = []
+    for name in sorted(SWEEP_PRESETS.keys()):
+        cfg = SWEEP_PRESETS[name]
+        lines.append(
+            f"{name}: Lin={cfg['lin_values']} Lout={cfg['lout_values']} bs={cfg['batch_values']} "
+            f"({cfg['description']})")
+    return "\n".join(lines)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=("Sweep main.py over (Lin, Lout) points and build replay cost tables "
-                     "(output.csv-style) for one or more routes."))
+                     "(output.csv-style) for one or more routes."),
+        epilog="Available sweep presets:\n" + _format_preset_help(),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--route",
                    action="append",
                    required=True,
                    help=("Route preset or route=output.csv. Examples: gpu_only, "
                          "lpddr5_pim_bank=cluster_outputs/cost_tables/lpddr5_pi0.csv"))
+    p.add_argument("--preset",
+                   choices=sorted(SWEEP_PRESETS.keys()),
+                   default="pi0-point",
+                   help=("Named sweep preset. Explicit --lin-values/--lout-values/--batch-values "
+                         "override the preset."))
     p.add_argument("--out-dir",
                    type=Path,
-                   default=ROOT / "cost_tables",
+                   default=ROOT / "cluster_outputs" / "cost_tables",
                    help="Default output directory for per-route CSVs")
 
-    # PI0-focused defaults. Use explicit sweeps to broaden.
+    # PI0-focused defaults. Use --preset to broaden quickly.
     p.add_argument("--lin-values",
                    type=str,
-                   default="867",
+                   default=None,
                    help=("Comma/range spec for Lin values. Examples: '867' or "
                          "'768:960:32,1024'"))
     p.add_argument("--lout-values",
                    type=str,
-                   default="50",
+                   default=None,
                    help="Comma/range spec for Lout values. Example: '32,50,64'")
     p.add_argument("--batch-values",
                    type=str,
-                   default="1",
+                   default=None,
                    help="Comma/range spec for batch sizes. Usually '1' for PI0.")
 
     p.add_argument("--model", type=str, default="PI0")
@@ -310,9 +365,12 @@ def main() -> int:
     if not MAIN_PY.exists():
         raise FileNotFoundError(f"Cannot find {MAIN_PY}")
 
-    lin_values = _parse_int_set_spec(args.lin_values)
-    lout_values = _parse_int_set_spec(args.lout_values)
-    batch_values = _parse_int_set_spec(args.batch_values)
+    lin_spec, lout_spec, batch_spec = _resolve_sweep_specs(args)
+    lin_values = _parse_int_set_spec(lin_spec)
+    lout_values = _parse_int_set_spec(lout_spec)
+    batch_values = _parse_int_set_spec(batch_spec)
+    if any(lout < 2 for lout in lout_values):
+        raise ValueError("All Lout values must be >= 2 because main.py divides decode metrics by (lout - 1).")
 
     points = [
         SweepPoint(lin=lin, lout=lout, batch=bs)
@@ -346,6 +404,11 @@ def main() -> int:
 
     print("Cost table sweep plan")
     print(f"  routes: {list(route_to_out.keys())}")
+    print(f"  preset: {args.preset}")
+    print(f"  preset details: {SWEEP_PRESETS[args.preset]['description']}")
+    print(f"  lin spec: {lin_spec}")
+    print(f"  lout spec: {lout_spec}")
+    print(f"  batch spec: {batch_spec}")
     print(f"  Lin values: {lin_values}")
     print(f"  Lout values: {lout_values}")
     print(f"  batch values: {batch_values}")
