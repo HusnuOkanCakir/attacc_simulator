@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-OUT_DIR="cluster_outputs/v31_sweep"
+OUT_DIR="cluster_outputs/v32_sweep"
 mkdir -p "${OUT_DIR}"
 TRACE_CACHE_DIR="cluster_outputs/trace_cache"
 mkdir -p "${TRACE_CACHE_DIR}"
@@ -25,6 +25,7 @@ if [[ "${AZURE_TRACE}" =~ ^https?:// ]]; then
     python - <<'PY' "${AZURE_TRACE}" "${TRACE_CACHE_PATH}"
 import sys
 import urllib.request
+
 src, dst = sys.argv[1], sys.argv[2]
 with urllib.request.urlopen(src) as resp, open(dst, "wb") as out:
     out.write(resp.read())
@@ -38,12 +39,13 @@ run_case() {
   shift
   local summary_path="${OUT_DIR}/replay_summary_${label}.json"
   local requests_path="${OUT_DIR}/replay_requests_${label}.csv"
+
   if [[ -f "${summary_path}" ]]; then
-    echo "Skipping existing v3.1 sweep case: ${label}"
+    echo "Skipping existing v3.2 sweep case: ${label}"
     return
   fi
-  echo "Running v3.1 sweep case: ${label}"
 
+  echo "Running v3.2 sweep case: ${label}"
   python tools/run_trace_replay.py \
     --azure-trace "${AZURE_TRACE}" \
     --cost-model ml \
@@ -55,43 +57,39 @@ run_case() {
     --routes gpu_only lpddr5_pim_bank \
     --unsupported-policy "${UNSUPPORTED_POLICY}" \
     --pim-wait-threshold-ms "${PIM_WAIT_THRESHOLD_MS}" \
+    --enable-decode-batching \
+    --max-decode-batch-size 4 \
+    --prefill-guard-ms 100 \
+    --max-consecutive-decode-batches 2 \
+    --decode-batch-cap-with-prefill 1 \
     --requests-csv "${requests_path}" \
     --summary-json "${summary_path}" \
     "$@"
 }
 
-run_case nobatch
-run_case batch2 --enable-decode-batching --max-decode-batch-size 2
-run_case batch4 --enable-decode-batching --max-decode-batch-size 4
-run_case batch4_guard \
-  --enable-decode-batching --max-decode-batch-size 4 \
-  --prefill-guard-ms 100
-run_case batch4_guard_cap \
-  --enable-decode-batching --max-decode-batch-size 4 \
-  --prefill-guard-ms 100 \
-  --max-consecutive-decode-batches 2 \
-  --decode-batch-cap-with-prefill 2
-run_case batch4_guard_cap1 \
-  --enable-decode-batching --max-decode-batch-size 4 \
-  --prefill-guard-ms 100 \
-  --max-consecutive-decode-batches 2 \
-  --decode-batch-cap-with-prefill 1
+run_case v31_best
+run_case v32_prefill2 \
+  --enable-prefill-batching \
+  --max-prefill-batch-size 2
+run_case v32_prefill4 \
+  --enable-prefill-batching \
+  --max-prefill-batch-size 4
 
 python - <<'PY'
 import json
 from pathlib import Path
 
-labels = ("nobatch", "batch2", "batch4", "batch4_guard", "batch4_guard_cap", "batch4_guard_cap1")
-print("case,throughput_tokps,ttft_p95,prefill_wait_p95,e2e_p95,tbt_p95,gpu_util,pim_util,gpu_route_frac,mean_batch_size,max_batch_size,num_decode_steps,prefill_guard_triggers,decode_limit_triggers")
+labels = ("v31_best", "v32_prefill2", "v32_prefill4")
+print("case,throughput_tokps,ttft_p95,prefill_wait_p95,e2e_p95,tbt_p95,gpu_util,pim_util,gpu_route_frac,decode_mean_batch_size,prefill_mean_batch_size,decode_steps,prefill_steps")
 for label in labels:
-    path = Path("cluster_outputs/v31_sweep") / f"replay_summary_{label}.json"
+    path = Path("cluster_outputs/v32_sweep") / f"replay_summary_{label}.json"
     with path.open() as f:
         d = json.load(f)
-    batching = d.get("decode_batching", {})
-    local = d.get("local_scheduling", {})
     route_counts = d.get("route_counts", {})
     total_routed = sum(route_counts.values()) or 1
     gpu_route_frac = route_counts.get("gpu_only", 0) / total_routed
+    decode_batching = d.get("decode_batching", {})
+    prefill_batching = d.get("prefill_batching", {})
     print(
         f"{label},"
         f"{d['throughput_tokps']},"
@@ -102,10 +100,9 @@ for label in labels:
         f"{d['gpu_util']},"
         f"{d['pim_util']},"
         f"{gpu_route_frac},"
-        f"{batching.get('mean_batch_size')},"
-        f"{batching.get('max_batch_size')},"
-        f"{batching.get('num_decode_steps')},"
-        f"{local.get('prefill_guard_trigger_count')},"
-        f"{local.get('decode_limit_trigger_count')}"
+        f"{decode_batching.get('mean_batch_size')},"
+        f"{prefill_batching.get('mean_batch_size')},"
+        f"{decode_batching.get('num_decode_steps')},"
+        f"{prefill_batching.get('num_prefill_steps')}"
     )
 PY

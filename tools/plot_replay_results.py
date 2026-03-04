@@ -11,6 +11,16 @@ import numpy as np
 import pandas as pd
 
 
+def _format_bar_value(value: float) -> str:
+    if abs(value) >= 1000:
+        return f"{value:.0f}"
+    if abs(value) >= 100:
+        return f"{value:.1f}"
+    if abs(value) >= 10:
+        return f"{value:.2f}"
+    return f"{value:.3f}"
+
+
 def _ecdf(values: Iterable[float]) -> tuple[np.ndarray, np.ndarray]:
     arr = np.asarray(list(values), dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -105,15 +115,23 @@ def _plot_route_mix(df: pd.DataFrame, summary: Optional[dict], out_path: Path) -
     route_counts = df["route"].fillna("None").value_counts().sort_index()
     reason_counts = df["route_decision_reason"].fillna("None").value_counts()
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].bar(route_counts.index.astype(str), route_counts.values)
+    route_bars = axes[0].bar(route_counts.index.astype(str), route_counts.values)
     axes[0].set_title("Route Counts")
-    axes[0].tick_params(axis="x", rotation=20)
+    axes[0].tick_params(axis="x", rotation=35)
     axes[0].grid(True, axis="y", alpha=0.3)
+    ymax = float(route_counts.max()) if len(route_counts) else 0.0
+    if ymax > 0:
+        axes[0].set_ylim(top=ymax * 1.15)
+    axes[0].bar_label(route_bars, labels=[_format_bar_value(v) for v in route_counts.values], padding=3, fontsize=8)
 
-    axes[1].bar(reason_counts.index.astype(str), reason_counts.values)
+    reason_bars = axes[1].bar(reason_counts.index.astype(str), reason_counts.values)
     axes[1].set_title("Decision Reasons")
-    axes[1].tick_params(axis="x", rotation=25)
+    axes[1].tick_params(axis="x", rotation=35)
     axes[1].grid(True, axis="y", alpha=0.3)
+    ymax = float(reason_counts.max()) if len(reason_counts) else 0.0
+    if ymax > 0:
+        axes[1].set_ylim(top=ymax * 1.15)
+    axes[1].bar_label(reason_bars, labels=[_format_bar_value(v) for v in reason_counts.values], padding=3, fontsize=8)
 
     if summary:
         fig.suptitle(

@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-ORDER = ["nobatch", "batch2", "batch4", "batch4_guard", "batch4_guard_cap", "batch4_guard_cap1"]
+ORDER = ["v31_best", "v32_prefill2", "v32_prefill4"]
 
 
 def _format_bar_value(value: float) -> str:
@@ -31,8 +31,8 @@ def _load_rows(summary_dir: Path) -> pd.DataFrame:
             continue
         with path.open() as f:
             d = json.load(f)
-        batching = d.get("decode_batching", {})
-        local = d.get("local_scheduling", {})
+        decode_batching = d.get("decode_batching", {})
+        prefill_batching = d.get("prefill_batching", {})
         route_counts = d.get("route_counts", {})
         total_routed = sum(route_counts.values()) or 1
         rows.append({
@@ -46,14 +46,13 @@ def _load_rows(summary_dir: Path) -> pd.DataFrame:
             "gpu_util": d["gpu_util"],
             "pim_util": d["pim_util"],
             "gpu_route_frac": route_counts.get("gpu_only", 0) / total_routed,
-            "mean_batch_size": batching.get("mean_batch_size", 0.0),
-            "max_batch_size": batching.get("max_batch_size", 0.0),
-            "num_decode_steps": batching.get("num_decode_steps", 0.0),
-            "prefill_guard_trigger_count": local.get("prefill_guard_trigger_count", 0.0),
-            "decode_limit_trigger_count": local.get("decode_limit_trigger_count", 0.0),
+            "decode_mean_batch_size": decode_batching.get("mean_batch_size", 0.0),
+            "prefill_mean_batch_size": prefill_batching.get("mean_batch_size", 0.0),
+            "decode_steps": decode_batching.get("num_decode_steps", 0.0),
+            "prefill_steps": prefill_batching.get("num_prefill_steps", 0.0),
         })
     if not rows:
-        raise FileNotFoundError(f"No v3.1 summary JSONs found in {summary_dir}")
+        raise FileNotFoundError(f"No v3.2 summary JSONs found in {summary_dir}")
     df = pd.DataFrame(rows)
     df["case"] = pd.Categorical(df["case"], categories=ORDER, ordered=True)
     return df.sort_values("case").reset_index(drop=True)
@@ -61,7 +60,7 @@ def _load_rows(summary_dir: Path) -> pd.DataFrame:
 
 def _bar_plot(df: pd.DataFrame, y: str, ylabel: str, out_path: Path):
     fig, ax = plt.subplots(figsize=(7, 4))
-    colors = ["#4C72B0", "#55A868", "#C44E52", "#8172B2", "#CCB974", "#64B5CD"]
+    colors = ["#4C72B0", "#55A868", "#C44E52"]
     bars = ax.bar(df["case"], df[y], color=colors[:len(df)])
     ax.set_xlabel("Case")
     ax.set_ylabel(ylabel)
@@ -78,18 +77,18 @@ def _bar_plot(df: pd.DataFrame, y: str, ylabel: str, out_path: Path):
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Plot v3.1 prompt-aware batching sweep results.")
+    p = argparse.ArgumentParser(description="Plot v3.2 prefill batching sweep results.")
     p.add_argument("--summary-dir",
                    type=Path,
-                   default=Path("cluster_outputs/v31_sweep"),
-                   help="Directory containing replay_summary_*.json for v3.1 cases")
+                   default=Path("cluster_outputs/v32_sweep"),
+                   help="Directory containing replay_summary_*.json for v3.2 cases")
     p.add_argument("--out-dir",
                    type=Path,
-                   default=Path("cluster_outputs/v31_sweep_plots"),
+                   default=Path("cluster_outputs/v32_sweep_plots"),
                    help="Output directory for plots")
     p.add_argument("--prefix",
                    type=str,
-                   default="v31",
+                   default="v32",
                    help="Output filename prefix")
     args = p.parse_args()
 
@@ -104,13 +103,11 @@ def main() -> int:
     _bar_plot(df, "prefill_wait_p95", "Prefill wait p95 (ms)", args.out_dir / f"{args.prefix}_prefill_wait_p95.png")
     _bar_plot(df, "e2e_p95", "E2E p95 (ms)", args.out_dir / f"{args.prefix}_e2e_p95.png")
     _bar_plot(df, "tbt_p95", "TBT p95 (ms)", args.out_dir / f"{args.prefix}_tbt_p95.png")
-    _bar_plot(df, "mean_batch_size", "Mean decode batch size", args.out_dir / f"{args.prefix}_mean_batch_size.png")
-    _bar_plot(df, "num_decode_steps", "Decode steps", args.out_dir / f"{args.prefix}_num_decode_steps.png")
     _bar_plot(df, "gpu_route_frac", "GPU-only route fraction", args.out_dir / f"{args.prefix}_gpu_route_frac.png")
-    _bar_plot(df, "prefill_guard_trigger_count", "Prefill guard trigger count",
-              args.out_dir / f"{args.prefix}_prefill_guard_triggers.png")
-    _bar_plot(df, "decode_limit_trigger_count", "Decode limit trigger count",
-              args.out_dir / f"{args.prefix}_decode_limit_triggers.png")
+    _bar_plot(df, "decode_mean_batch_size", "Mean decode batch size", args.out_dir / f"{args.prefix}_decode_mean_batch_size.png")
+    _bar_plot(df, "prefill_mean_batch_size", "Mean prefill batch size", args.out_dir / f"{args.prefix}_prefill_mean_batch_size.png")
+    _bar_plot(df, "decode_steps", "Decode steps", args.out_dir / f"{args.prefix}_decode_steps.png")
+    _bar_plot(df, "prefill_steps", "Prefill steps", args.out_dir / f"{args.prefix}_prefill_steps.png")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.plot(df["case"], df["gpu_util"], marker="o", label="GPU util")

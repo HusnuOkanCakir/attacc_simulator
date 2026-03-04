@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J gen_cost_small
-#SBATCH -p cpu_part
+#SBATCH -p high_latency
 #SBATCH -c 8
 #SBATCH --mem=16GB
 #SBATCH -t 04:00:00
@@ -33,8 +33,8 @@ python -V
 python tools/gen_cost_table.py \
   --route gpu_only \
   --route lpddr5_pim_bank \
-  --lin-values 2:4096:512 \
-  --lout-values 2:160:16 \
+  --lin-values 2:4608:512 \
+  --lout-values 2:172:16 \
   --batch-values 1,2,4 \
   --resume \
   --sort

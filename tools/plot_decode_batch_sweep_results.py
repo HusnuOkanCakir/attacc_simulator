@@ -10,6 +10,16 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
+def _format_bar_value(value: float) -> str:
+    if abs(value) >= 1000:
+        return f"{value:.0f}"
+    if abs(value) >= 100:
+        return f"{value:.1f}"
+    if abs(value) >= 10:
+        return f"{value:.2f}"
+    return f"{value:.3f}"
+
+
 def _load_rows(summary_dir: Path) -> pd.DataFrame:
     rows: List[dict] = []
     for label in ("nobatch", "batch2", "batch4"):
@@ -42,11 +52,16 @@ def _load_rows(summary_dir: Path) -> pd.DataFrame:
 
 def _bar_plot(df: pd.DataFrame, x: str, y: str, ylabel: str, out_path: Path):
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(df[x], df[y], color=["#4C72B0", "#55A868", "#C44E52"][:len(df)])
+    bars = ax.bar(df[x], df[y], color=["#4C72B0", "#55A868", "#C44E52"][:len(df)])
     ax.set_xlabel("Case")
     ax.set_ylabel(ylabel)
     ax.set_title(ylabel)
     ax.grid(axis="y", alpha=0.25)
+    ax.tick_params(axis="x", rotation=35)
+    ymax = float(df[y].max()) if len(df) else 0.0
+    if ymax > 0:
+        ax.set_ylim(top=ymax * 1.15)
+    ax.bar_label(bars, labels=[_format_bar_value(v) for v in df[y]], padding=3, fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
@@ -95,6 +110,7 @@ def main() -> int:
     ax.set_title("Resource Utilization")
     ax.grid(alpha=0.25)
     ax.legend()
+    ax.tick_params(axis="x", rotation=35)
     fig.tight_layout()
     util_path = args.out_dir / f"{args.prefix}_utilization.png"
     fig.savefig(util_path, dpi=180)

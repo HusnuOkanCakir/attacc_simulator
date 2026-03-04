@@ -100,6 +100,8 @@ class ReplayConfig:
     lin_bucket: int = 1
     lout_bucket: int = 1
     batch_size: int = 1
+    enable_prefill_batching: bool = False
+    max_prefill_batch_size: int = 1
     enable_decode_batching: bool = False
     max_decode_batch_size: int = 1
     prefill_guard_ms: Optional[float] = None
@@ -422,6 +424,7 @@ class ReplaySummary:
     tbt_ms: Dict[str, float]
     slo_ttft_miss_rate: Optional[float]
     slo_e2e_miss_rate: Optional[float]
+    prefill_batching: Dict[str, float]
     decode_batching: Dict[str, float]
     local_scheduling: Dict[str, float]
 
@@ -468,6 +471,7 @@ class TraceReplaySimulator:
         self.route_fallback_count = 0
         self.mapping_clipped_lin_count = 0
         self.mapping_clipped_lout_count = 0
+        self.prefill_batch_sizes: List[int] = []
         self.decode_batch_sizes: List[int] = []
         self.consecutive_decode_batches = 0
         self.prefill_guard_trigger_count = 0
@@ -696,6 +700,61 @@ class TraceReplaySimulator:
                               predicted_finish_ms=earliest_start + e2e_ms,
                               batch_size=1)
 
+    def _estimate_prefill_batch(self,
+                                route: str,
+                                batch_reqs: List[ReplayRequest]) -> Optional[RequestServiceEstimate]:
+        if not batch_reqs:
+            return None
+        batch_lin = max(req.context_tokens for req in batch_reqs)
+        batch_lout = max(req.generated_tokens for req in batch_reqs)
+        return self.cost_model.estimate_request(
+            route,
+            context_tokens=batch_lin,
+            generated_tokens=batch_lout,
+            bs=len(batch_reqs),
+            unsupported_policy=self.config.unsupported_policy,
+            lin_bucket=self.config.lin_bucket,
+            lout_bucket=self.config.lout_bucket,
+        )
+
+    def _build_prefill_batch_candidates(self) -> List[_TaskCandidate]:
+        grouped: Dict[str, List[ReplayRequest]] = {}
+        for rr in self.requests:
+            if rr.state != "waiting_prefill" or rr.svc is None or not rr.route:
+                continue
+            grouped.setdefault(rr.route, []).append(rr)
+
+        cands: List[_TaskCandidate] = []
+        for route, route_reqs in grouped.items():
+            route_reqs.sort(key=lambda r: (r.ready_ms, r.arrival_ms, r.request_id))
+            cutoff_ms = max(self.now_ms, route_reqs[0].ready_ms)
+            cohort = [r for r in route_reqs if r.ready_ms <= cutoff_ms]
+            if not cohort:
+                continue
+
+            batch_reqs = cohort[:min(len(cohort), int(self.config.max_prefill_batch_size))]
+            batch_est = self._estimate_prefill_batch(route, batch_reqs)
+            if batch_est is None:
+                continue
+            earliest_start = self._predict_stage_start(
+                cutoff_ms,
+                batch_est.prefill_gpu_ms,
+                batch_est.prefill_pim_ms,
+                self.gpu_free_ms,
+                self.pim_free_ms,
+            )
+            cands.append(_TaskCandidate(requests=list(batch_reqs),
+                                        route=route,
+                                        phase="prefill",
+                                        ready_ms=cutoff_ms,
+                                        gpu_ms=batch_est.prefill_gpu_ms,
+                                        pim_ms=batch_est.prefill_pim_ms,
+                                        e2e_ms=batch_est.prefill_e2e_ms,
+                                        earliest_start_ms=earliest_start,
+                                        predicted_finish_ms=earliest_start + batch_est.prefill_e2e_ms,
+                                        batch_size=len(batch_reqs)))
+        return cands
+
     def _single_decode_task_for_request(self, rr: ReplayRequest) -> Optional[_TaskCandidate]:
         if rr.state != "waiting_decode" or rr.svc is None or rr.remaining_decode_tokens <= 0:
             return None
@@ -772,10 +831,13 @@ class TraceReplaySimulator:
 
     def _choose_next_task(self) -> Optional[_TaskCandidate]:
         prefill_tasks: List[_TaskCandidate] = []
-        for rr in self.requests:
-            tc = self._prefill_task_for_request(rr)
-            if tc is not None:
-                prefill_tasks.append(tc)
+        if self.config.enable_prefill_batching:
+            prefill_tasks.extend(self._build_prefill_batch_candidates())
+        else:
+            for rr in self.requests:
+                tc = self._prefill_task_for_request(rr)
+                if tc is not None:
+                    prefill_tasks.append(tc)
         decode_tasks: List[_TaskCandidate] = []
         if self.config.enable_decode_batching:
             decode_tasks.extend(self._build_decode_batch_candidates())
@@ -821,18 +883,19 @@ class TraceReplaySimulator:
         finish_ms = tc.earliest_start_ms + tc.e2e_ms
 
         if tc.phase == "prefill":
-            rr = tc.requests[0]
+            self.prefill_batch_sizes.append(tc.batch_size)
             self.consecutive_decode_batches = 0
-            rr.prefill_start_ms = tc.earliest_start_ms
-            rr.prefill_end_ms = finish_ms
-            rr.first_token_time_ms = finish_ms
-            rr.last_token_completion_ms = finish_ms
-            if rr.remaining_decode_tokens > 0:
-                rr.state = "waiting_decode"
-                rr.ready_ms = finish_ms
-            else:
-                rr.state = "done"
-                rr.completion_time_ms = finish_ms
+            for rr in tc.requests:
+                rr.prefill_start_ms = tc.earliest_start_ms
+                rr.prefill_end_ms = finish_ms
+                rr.first_token_time_ms = finish_ms
+                rr.last_token_completion_ms = finish_ms
+                if rr.remaining_decode_tokens > 0:
+                    rr.state = "waiting_decode"
+                    rr.ready_ms = finish_ms
+                else:
+                    rr.state = "done"
+                    rr.completion_time_ms = finish_ms
         else:
             self.decode_batch_sizes.append(tc.batch_size)
             self.consecutive_decode_batches += 1
@@ -934,6 +997,13 @@ class TraceReplaySimulator:
 
         makespan_s = makespan_ms / 1000.0 if makespan_ms > 0 else math.nan
         total_out_tokens = sum(r.generated_tokens for r in completed)
+        prefill_batching = {
+            "enabled": float(self.config.enable_prefill_batching),
+            "mean_batch_size": float(sum(self.prefill_batch_sizes) / len(self.prefill_batch_sizes))
+            if self.prefill_batch_sizes else 0.0,
+            "max_batch_size": float(max(self.prefill_batch_sizes)) if self.prefill_batch_sizes else 0.0,
+            "num_prefill_steps": float(len(self.prefill_batch_sizes)),
+        }
         decode_batching = {
             "enabled": float(self.config.enable_decode_batching),
             "mean_batch_size": float(sum(self.decode_batch_sizes) / len(self.decode_batch_sizes))
@@ -970,6 +1040,7 @@ class TraceReplaySimulator:
             tbt_ms=_percentiles(tbt_vals),
             slo_ttft_miss_rate=ttft_miss,
             slo_e2e_miss_rate=e2e_miss,
+            prefill_batching=prefill_batching,
             decode_batching=decode_batching,
             local_scheduling=local_scheduling,
         )

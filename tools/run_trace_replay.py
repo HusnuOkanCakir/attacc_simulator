@@ -79,6 +79,13 @@ def main() -> int:
     p.add_argument("--lin-bucket", type=int, default=1, help="Bucket size for Lin before lookup")
     p.add_argument("--lout-bucket", type=int, default=1, help="Bucket size for Lout before lookup")
     p.add_argument("--batch-size", type=int, default=1, help="Cost-table batch size for lookup")
+    p.add_argument("--enable-prefill-batching",
+                   action="store_true",
+                   help="Enable same-route batching for prefill steps")
+    p.add_argument("--max-prefill-batch-size",
+                   type=int,
+                   default=4,
+                   help="Maximum prefill batch size when --enable-prefill-batching is set")
     p.add_argument("--enable-decode-batching",
                    action="store_true",
                    help="Enable continuous batching for decode steps")
@@ -194,6 +201,8 @@ def main() -> int:
                        lin_bucket=args.lin_bucket,
                        lout_bucket=args.lout_bucket,
                        batch_size=args.batch_size,
+                       enable_prefill_batching=args.enable_prefill_batching,
+                       max_prefill_batch_size=max(1, args.max_prefill_batch_size),
                        enable_decode_batching=args.enable_decode_batching,
                        max_decode_batch_size=max(1, args.max_decode_batch_size),
                        prefill_guard_ms=args.prefill_guard_ms,

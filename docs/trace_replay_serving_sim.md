@@ -1340,3 +1340,310 @@ So the current best prompt-aware decode batching policy is:
 
 - Top `E2E p95` configs  
   <img src="../cluster_outputs/v31_tuning_sweep_plots/v31_tuning_e2e_p95_top3.png" alt="v3.1 tuning top E2E p95 configs" width="49%">
+
+## v3.1 Best-Cap Replot
+
+After identifying `decode_batch_cap_with_prefill = 1` as the best setting in
+the tuning sweep, the `v3.1` comparison was rerun with one extra case:
+
+- `batch4_guard_cap1`
+
+This makes the direct comparison:
+
+- `nobatch`
+- `batch2`
+- `batch4`
+- `batch4_guard`
+- `batch4_guard_cap` (`cap=2`)
+- `batch4_guard_cap1` (`cap=1`, best so far)
+
+Plot command:
+
+```bash
+python tools/plot_v31_sweep_results.py \
+  --summary-dir cluster_outputs/v31_sweep \
+  --out-dir cluster_outputs/v31_sweep_plots_cap1 \
+  --prefix v31_cap1
+```
+
+### Main observations
+
+- `batch4_guard_cap1` is now clearly the best overall operating point
+- it improves throughput strongly over all previous `v3.1` cases
+- it brings `TTFT p95` and `prefill_wait_p95` back close to `nobatch`
+- it also gives the best `E2E p95`
+- it keeps `TBT p95` far better than `nobatch`
+
+Observed summary:
+
+- `nobatch`
+  - `throughput_tokps = 402.83`
+  - `ttft_p95 = 21723 ms`
+  - `e2e_p95 = 102239 ms`
+  - `tbt_p95 = 3109 ms`
+- `batch4_guard_cap1`
+  - `throughput_tokps = 717.10`
+  - `ttft_p95 = 21765 ms`
+  - `e2e_p95 = 58565 ms`
+  - `tbt_p95 = 791 ms`
+
+Interpretation:
+
+- `cap=1` keeps the decode-batching benefit while eliminating most of the
+  prompt-starvation penalty seen in `batch2`, `batch4`, and `cap=2`
+- the best policy so far is:
+  - large decode batches when no prefill is waiting
+  - `decode_batch_cap_with_prefill = 1` when prefill is waiting
+
+This is the strongest result in the current replay study.
+
+### Related plots
+
+- Throughput  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_throughput.png" alt="v3.1 cap1 throughput" width="49%">
+
+- `TTFT p95`  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_ttft_p95.png" alt="v3.1 cap1 TTFT p95" width="49%">
+
+- `Prefill wait p95`  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_prefill_wait_p95.png" alt="v3.1 cap1 prefill wait p95" width="49%">
+
+- `E2E p95`  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_e2e_p95.png" alt="v3.1 cap1 E2E p95" width="49%">
+
+- `TBT p95`  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_tbt_p95.png" alt="v3.1 cap1 TBT p95" width="49%">
+
+- Mean decode batch size  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_mean_batch_size.png" alt="v3.1 cap1 mean batch size" width="49%">
+
+- Decode steps  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_num_decode_steps.png" alt="v3.1 cap1 decode steps" width="49%">
+
+- GPU-only route fraction  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_gpu_route_frac.png" alt="v3.1 cap1 GPU route fraction" width="49%">
+
+- Resource utilization  
+  <img src="../cluster_outputs/v31_sweep_plots_cap1/v31_cap1_utilization.png" alt="v3.1 cap1 utilization" width="49%">
+
+## v3.2 Prefill Batching
+
+`v3.2` adds same-route prefill batching on top of the current best `v3.1`
+decode policy:
+
+- decode batching enabled
+- `max_decode_batch_size = 4`
+- `decode_batch_cap_with_prefill = 1`
+- route policy unchanged
+- no mixed-route batching
+
+Implementation summary:
+
+- new replay config knobs:
+  - `enable_prefill_batching`
+  - `max_prefill_batch_size`
+- prefill batches are built per route from ready `waiting_prefill` requests
+- prefill batch cost uses:
+  - `Lin = max(context_tokens)`
+  - `Lout = max(generated_tokens)`
+  - `bs = batch size`
+- batched prefills complete all requests in the batch at the same `finish_ms`
+- replay summary now includes:
+  - `prefill_batching.enabled`
+  - `prefill_batching.mean_batch_size`
+  - `prefill_batching.max_batch_size`
+  - `prefill_batching.num_prefill_steps`
+
+Run command (single run example):
+
+```bash
+python tools/run_trace_replay.py \
+  --cost-model ml \
+  --route-policy min_finish \
+  --limit 2000 \
+  --arrival-time-scale 0.05 \
+  --ml-profile gpu_only=cluster_outputs/cost_models/gpu_only.pkl \
+  --ml-profile lpddr5_pim_bank=cluster_outputs/cost_models/lpddr5_pim_bank.pkl \
+  --routes gpu_only lpddr5_pim_bank \
+  --unsupported-policy clip \
+  --pim-wait-threshold-ms 1 \
+  --enable-decode-batching \
+  --max-decode-batch-size 4 \
+  --prefill-guard-ms 100 \
+  --max-consecutive-decode-batches 2 \
+  --decode-batch-cap-with-prefill 1 \
+  --enable-prefill-batching \
+  --max-prefill-batch-size 2 \
+  --requests-csv cluster_outputs/replay_requests_v32.csv \
+  --summary-json cluster_outputs/replay_summary_v32.json
+```
+
+Sweep command:
+
+```bash
+bash tools/run_v32_sweep.sh
+```
+
+Plot command:
+
+```bash
+python tools/plot_v32_sweep_results.py \
+  --summary-dir cluster_outputs/v32_sweep \
+  --out-dir cluster_outputs/v32_sweep_plots \
+  --prefix v32
+```
+
+Cases in the `v3.2` comparison:
+
+- `v31_best`
+- `v32_prefill2`
+- `v32_prefill4`
+
+Validation status:
+
+- static checks passed
+- a small table-based replay run with prefill batching completed successfully
+- full `v3.2` sweep results are the next measurement step
+
+Expected evaluation focus:
+
+- `throughput_tokps`
+- `ttft_p95`
+- `prefill_wait_p95`
+- `e2e_p95`
+- `tbt_p95`
+- `gpu_route_frac`
+- `decode_batching.*`
+- `prefill_batching.*`
+
+## v3.2 Findings
+
+From `cluster_outputs/v32_sweep_plots/v32_summary.csv`:
+
+- `v31_best`
+  - `throughput_tokps = 717.10`
+  - `ttft_p95 = 21764.53 ms`
+  - `prefill_wait_p95 = 21746.63 ms`
+  - `e2e_p95 = 58565.19 ms`
+  - `tbt_p95 = 791.22 ms`
+- `v32_prefill2`
+  - `throughput_tokps = 603.997`
+  - `ttft_p95 = 36493.26 ms`
+  - `prefill_wait_p95 = 36422.43 ms`
+  - `e2e_p95 = 73999.21 ms`
+  - `tbt_p95 = 791.22 ms`
+- `v32_prefill4`
+  - `throughput_tokps = 531.923`
+  - `ttft_p95 = 48837.84 ms`
+  - `prefill_wait_p95 = 48654.17 ms`
+  - `e2e_p95 = 87217.61 ms`
+  - `tbt_p95 = 789.59 ms`
+
+Main observations:
+
+- `v31_best` remains the best overall configuration
+- prefill batching is active mechanically:
+  - `prefill_mean_batch_size` rises `1.00 -> 1.996 -> 3.960`
+  - `prefill_steps` fall `2000 -> 1002 -> 505`
+- larger prefill batches hurt prompt latency monotonically:
+  - `ttft_p95`: `21764 -> 36493 -> 48838`
+  - `prefill_wait_p95`: `21747 -> 36422 -> 48654`
+- throughput and `e2e_p95` also degrade monotonically:
+  - throughput: `717.10 -> 603.99 -> 531.92`
+  - `e2e_p95`: `58565 -> 73999 -> 87218`
+- decode-side behavior stays almost unchanged:
+  - `decode_mean_batch_size`: `3.639`, `3.632`, `3.627`
+  - `decode_steps`: `15670`, `15700`, `15724`
+  - `tbt_p95` stays near `790 ms`
+- route behavior barely changes:
+  - `gpu_route_frac`: `0.000`, `0.000`, `0.001`
+- utilization shifts in a bad direction:
+  - `gpu_util`: `0.916 -> 0.935 -> 0.946`
+  - `pim_util`: `0.108 -> 0.092 -> 0.081`
+
+Interpretation:
+
+- current `v3.2` prefill batching is implemented correctly but is not beneficial for this workload
+- batching prefills forces requests to wait for the batch and then complete prefill together, which amplifies prompt delay
+- reducing the number of prefill steps does not compensate for the extra prompt-side waiting
+- the likely weak point is the coarse prefill batch approximation:
+  - `Lin = max(context_tokens)`
+  - `Lout = max(generated_tokens)`
+  - `bs = batch size`
+
+Bottom line:
+
+- `v31_best` remains the working policy
+- `v32_prefill2` and `v32_prefill4` are both regressions
+- prefill batching is a negative result in the current form
+- if revisited later, the prefill batch cost model or batch completion policy should change first
+
+Related plots:
+
+- Throughput  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_throughput.png" alt="v3.2 throughput" width="49%">
+
+- `TTFT p95`  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_ttft_p95.png" alt="v3.2 TTFT p95" width="49%">
+
+- `Prefill wait p95`  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_prefill_wait_p95.png" alt="v3.2 prefill wait p95" width="49%">
+
+- `E2E p95`  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_e2e_p95.png" alt="v3.2 E2E p95" width="49%">
+
+- `TBT p95`  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_tbt_p95.png" alt="v3.2 TBT p95" width="49%">
+
+- Mean decode batch size  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_decode_mean_batch_size.png" alt="v3.2 mean decode batch size" width="49%">
+
+- Mean prefill batch size  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_prefill_mean_batch_size.png" alt="v3.2 mean prefill batch size" width="49%">
+
+- Decode steps  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_decode_steps.png" alt="v3.2 decode steps" width="49%">
+
+- Prefill steps  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_prefill_steps.png" alt="v3.2 prefill steps" width="49%">
+
+- GPU-only route fraction  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_gpu_route_frac.png" alt="v3.2 GPU route fraction" width="49%">
+
+- Resource utilization  
+  <img src="../cluster_outputs/v32_sweep_plots/v32_utilization.png" alt="v3.2 utilization" width="49%">
+
+## Current state
+* v0: 
+  - trace replay
+  - admission-time route choice
+  - no batching
+
+* v1: 
+  -  PIM-threshold heuristic
+  - tail-latency reporting
+
+* v1.5: 
+  - cost-table generation
+  - learned ML cost model
+  - diagnostics plots
+
+* v2: 
+  - slack / deadline-aware routing
+
+* v2.1: 
+  - queue-pressure correction on predicted finish
+
+* v3.0: 
+  - decode continuous batching
+
+* v3.1: 
+  - prompt-aware decode batching
+  - decode_batch_cap_with_prefill
+  - guard / consecutive-decode controls
+  - tuning sweep
+
+* v3.2:
+  - same-route prefill batching
+  - prefill batching summary/diagnostics
+  - `v32` comparison sweep and plot script

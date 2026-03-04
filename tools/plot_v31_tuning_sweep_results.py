@@ -119,6 +119,7 @@ def _line_plot(df: pd.DataFrame, metric: str, ylabel: str, out_path: Path):
     ax.set_title(ylabel)
     ax.grid(alpha=0.25)
     ax.legend()
+    ax.tick_params(axis="x", rotation=35)
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
