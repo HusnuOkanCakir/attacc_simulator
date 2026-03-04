@@ -79,6 +79,27 @@ def main() -> int:
     p.add_argument("--lin-bucket", type=int, default=1, help="Bucket size for Lin before lookup")
     p.add_argument("--lout-bucket", type=int, default=1, help="Bucket size for Lout before lookup")
     p.add_argument("--batch-size", type=int, default=1, help="Cost-table batch size for lookup")
+    p.add_argument("--enable-decode-batching",
+                   action="store_true",
+                   help="Enable continuous batching for decode steps")
+    p.add_argument("--max-decode-batch-size",
+                   type=int,
+                   default=4,
+                   help="Maximum decode batch size when --enable-decode-batching is set")
+    p.add_argument("--prefill-guard-ms",
+                   type=float,
+                   default=None,
+                   help=("If any waiting prefill exceeds this wait time, schedule prefill next. "
+                         "Used for v3.1 prompt-aware decode batching."))
+    p.add_argument("--max-consecutive-decode-batches",
+                   type=int,
+                   default=0,
+                   help=("If > 0, force a prefill task after this many consecutive decode batches "
+                         "when prefills are waiting."))
+    p.add_argument("--decode-batch-cap-with-prefill",
+                   type=int,
+                   default=0,
+                   help=("If > 0 and prefills are waiting, cap decode batch size to this value."))
     p.add_argument("--sum-offload-to-pim",
                    action="store_true",
                    help="Interpret hybrid profiles as if sum/prefill stage is split across GPU+PIM")
@@ -173,6 +194,11 @@ def main() -> int:
                        lin_bucket=args.lin_bucket,
                        lout_bucket=args.lout_bucket,
                        batch_size=args.batch_size,
+                       enable_decode_batching=args.enable_decode_batching,
+                       max_decode_batch_size=max(1, args.max_decode_batch_size),
+                       prefill_guard_ms=args.prefill_guard_ms,
+                       max_consecutive_decode_batches=max(0, args.max_consecutive_decode_batches),
+                       decode_batch_cap_with_prefill=max(0, args.decode_batch_cap_with_prefill),
                        prompt_priority=(not args.no_prompt_priority),
                        slo_e2e_ms=args.slo_e2e_ms,
                        slo_ttft_ms=args.slo_ttft_ms,
