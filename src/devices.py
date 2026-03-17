@@ -282,6 +282,7 @@ class PIM:
         self.energy_table = config['ENERGY_TABLE']
         self.io_energy_table = self.energy_table['io']
         self.power_constraint = config['POWER_CONSTRAINT']
+        self.attn_atomic_pim = bool(config.get('ATTN_ATOMIC_PIM', True))
         self.ramulator = ramulator
 
     def _get_traffic(self, layer: Layer):
@@ -328,7 +329,8 @@ class PIM:
             return self._io_time_energy(layer)
 
         elif layer.type == LayerType.MATMUL:
-            ## operational granularity = the attention layer
+            # Operational granularity = whole attention on PIM.
+            # When ATTN_ATOMIC_PIM is enabled, we charge score+softmax+context once.
             if 'score' in layer.name:
                 m, n, k, numOp, dbyte = layer.get_infos()
                 time, traffic = self.ramulator.output(
@@ -345,10 +347,14 @@ class PIM:
                 energies = [dram_energy, 0, 0, 0, cal_energy, 0]
                 energies = [i * self.num_attacc for i in energies]
                 return time, energies
+            if self.attn_atomic_pim and 'context' in layer.name:
+                return 0, [0, 0, 0, 0, 0, 0]
             else:
                 return 0, [0, 0, 0, 0, 0, 0]
 
         elif layer.type == LayerType.SOFTMAX:
+            if self.attn_atomic_pim:
+                return 0, [0, 0, 0, 0, 0, 0]
             # Execution time
             compute_time = self._compute_time(layer)
             mem_time = self._mem_time(layer)

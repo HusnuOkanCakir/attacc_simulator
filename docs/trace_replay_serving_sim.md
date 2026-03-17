@@ -13,7 +13,7 @@ This enables queueing-aware evaluation, tail-latency analysis, and later continu
 
 ## Important Current Baseline (Reverted Before Starting Replay Work)
 
-Before starting the serving simulator work, we intentionally restored the simulator behavior to the previous/default assumptions:
+Before the serving-simulator study, simulator behavior was restored to the previous/default assumptions:
 
 1. `LPDDR5-PIM` PIM commands are back to **single-stage PIM activation**
 - Removed `ACTAB-1`, `ACTSB-1`, `ACTPB-1` PIM-specific two-stage variants in `ramulator2/src/dram/impl/LPDDR5-PIM.cpp`
@@ -27,7 +27,7 @@ This is important because the replay simulator currently assumes the same defaul
 
 ---
 
-## Why We Need a Trace Replay Simulator
+## Motivation for a Trace Replay Simulator
 
 `main.py` is useful for a single scenario:
 
@@ -43,7 +43,7 @@ Real serving is different:
 - resource contention changes the best routing choice
 - tail latency matters more than average latency
 
-So we added a new replay layer to simulate:
+Accordingly, a replay layer was added to simulate:
 
 - request arrivals from a real trace
 - per-request route choice (`gpu_only` vs hybrid)
@@ -52,9 +52,9 @@ So we added a new replay layer to simulate:
 
 ---
 
-## Azure Trace Input (What It Gives / What It Does Not)
+## Azure Trace Input (Provided and Missing Signals)
 
-We use:
+Dataset used:
 
 - Azure dataset: `AzureLLMInferenceTrace_code.csv`
 
@@ -80,15 +80,15 @@ Not provided by the trace:
 - model IDs
 - route decisions (GPU-only vs PIM+GPU)
 
-So we treat it as a **request arrival workload**, not a full execution trace.
+Therefore, this dataset is treated as a **request-arrival workload**, not a full execution trace.
 
 ---
 
-## Splitwise-Inspired Concepts We Adopted
+## Splitwise-Inspired Concepts
 
-We reviewed `reference_docs/Splitwise.pdf` for scheduling inspiration.
+`reference_docs/Splitwise.pdf` was reviewed for scheduling inspiration.
 
-Key ideas that directly apply to our simulator:
+Key ideas directly applicable to this simulator:
 
 - Phase-aware thinking: prefill (`sum`) vs decode (`gen`)
 - Queue-aware scheduling
@@ -96,19 +96,19 @@ Key ideas that directly apply to our simulator:
 - Two-level structure (routing policy + local scheduling behavior)
 - Future support for SLO-aware scheduling and continuous batching
 
-What we are **not** doing yet:
+Items **not** implemented at this stage:
 
 - Splitwise-style prompt/token disaggregation across different machines/pools
 - KV-cache transfer optimization across machines
 
-Our current scope is:
+Current scope:
 
 - same simulator environment
 - route choice between `gpu_only` and `hybrid_pim_gpu`
 
 ---
 
-## What We Implemented (v0)
+## Implemented Components (v0)
 
 ### New Files
 
@@ -280,9 +280,9 @@ These are intentionally simple to get a correct baseline first:
 
 ---
 
-## Important Concepts We Intentionally Designed For (Future Stages)
+## Design Concepts Reserved for Future Stages
 
-These are not all fully implemented yet, but the current design keeps space for them:
+These items are not all fully implemented yet; however, the current design preserves extension points for them:
 
 ### Continuous batching (later)
 
@@ -429,29 +429,8 @@ This separation keeps:
 - Azure trace does not contain SLOs or priorities (must be synthesized)
 - Many requests may be clipped/mapped if calibration grid is sparse
 
----
 
-## Next Steps (Recommended)
 
-1. Build a denser calibration table
-- sweep `(Lin, Lout)` buckets using `main.py`
-- separate profiles for:
-  - `gpu_only`
-  - `hbm3_pim_bank`
-  - `lpddr5_pim_bank`
-
-2. Add continuous batching (decode first)
-- this will materially improve realism for token-generation behavior
-
-3. Add SLO/deadline-aware policies
-- slack-aware routing
-- tail-latency optimization
-
-4. Compare policies under the same trace
-- FCFS baseline
-- queue-aware predicted finish time
-- PIM-threshold heuristic
-- later: SLO-aware / fairness-aware variants
 
 ---
 
@@ -464,9 +443,9 @@ This separation keeps:
 
 ---
 
-## Cost Table + ML Interpolation (v1.5)
+## Cost Table and ML Interpolation (v1.5)
 
-We added a denser cost-calibration and interpolation path on top of the replay simulator.
+A denser cost-calibration and interpolation path was added on top of the replay simulator.
 
 ### Files
 
@@ -558,7 +537,7 @@ work, making the predictor less myopic under bursty load.
 
 ### Narrow PI0 sweep
 
-Use this first if you want a conservative PI0-focused table around the current operating region:
+Use this command first for a conservative PI0-focused table around the current operating region:
 
 ```bash
 python tools/gen_cost_table.py \
@@ -572,7 +551,7 @@ python tools/gen_cost_table.py \
 
 ### Denser PI0 sweep
 
-Use this when you want enough points for ML interpolation:
+Use this command when a denser set of points is required for ML interpolation:
 
 ```bash
 python tools/gen_cost_table.py \
@@ -585,7 +564,7 @@ python tools/gen_cost_table.py \
 
 ### Wide Azure-inspired sweep
 
-Use this when you want broad heterogeneous coverage for ML-based cost prediction:
+Use this command when broad heterogeneous coverage is required for ML-based cost prediction:
 
 ```bash
 python tools/gen_cost_table.py \
@@ -1647,3 +1626,562 @@ Related plots:
   - same-route prefill batching
   - prefill batching summary/diagnostics
   - `v32` comparison sweep and plot script
+
+## ML Retraining (Expanded Range) Findings
+
+The cost predictor was retrained after expanding the cost-table range, and replay was rerun with:
+
+- `--cost-model ml`
+- `--route-policy min_finish`
+- no batching
+- same `arrival-time-scale = 0.05`
+
+Training quality improved substantially with the larger dataset (`840` rows per route):
+
+- `gpu_only`
+  - `prefill_e2e_ms`: `R^2 = 0.99983`, `MAPE = 0.12575`, `MAE = 1.64711`
+  - `decode_e2e_ms`: `R^2 = 0.9999985`, `MAPE = 0.0003845`, `MAE = 0.001133`
+- `lpddr5_pim_bank`
+  - `prefill_e2e_ms`: `R^2 = 0.99977`, `MAPE = 0.07506`, `MAE = 0.94280`
+  - `decode_e2e_ms`: `R^2 = 0.9999970`, `MAPE = 0.0002259`, `MAE = 0.000479`
+  - `decode_pim_ms`: `R^2 = 0.9999982`, `MAPE = 0.003166`, `MAE = 0.000379`
+
+### Replay comparison (`ml` before vs after retrain)
+
+| Metric | Previous `ml` | New `ml` (expanded-range retrain) |
+|---|---:|---:|
+| `throughput_tokps` | 402.832 | 387.745 |
+| `ttft_p95 (ms)` | 21,723.475 | 26,981.824 |
+| `e2e_p95 (ms)` | 102,238.599 | 107,924.563 |
+| `route_counts.gpu_only` | 0 | 321 |
+| `route_counts.lpddr5_pim_bank` | 2000 | 1679 |
+| `mapping_clipped_lin_count` | 341 | 116 |
+| `mapping_clipped_lout_count` | 60 | 36 |
+
+Interpretation:
+
+- The wider training range reduced clipping significantly, so replay relies less on boundary behavior.
+- Route behavior is now more realistic: `gpu_only` is selected for a nontrivial subset of requests (`321/2000`), whereas earlier runs were always LPDDR5-PIM.
+- The replay became less optimistic overall (lower throughput, higher p95 latency), which is consistent with reduced clipping and broader shape coverage.
+- The predictor quality itself is strong, but under heavy load admission-time prediction is still optimistic relative to actual E2E (queue growth remains the core challenge).
+
+## Predicted Finish-Time Formulation (Admission Model)
+
+The admission model in `src/trace_replay_sim.py` computes predicted completion
+for each candidate route in `_predict_route_candidate(...)`.
+
+### Notation
+
+For a request:
+
+- arrival time: `a` (ms)
+- input tokens: `L_in`
+- output tokens: `L_out`
+- decode tokens: `n = max(0, L_out - 1)`
+
+Current resource availability:
+
+- GPU next-free time: `G_0`
+- PIM next-free time: `P_0`
+
+Cost-model outputs for route `r`:
+
+- prefill times: `(p_g, p_p, p_e)`
+  - GPU, PIM, E2E prefill time
+- decode per-token times: `(d_g, d_p, d_e)`
+  - GPU, PIM, E2E decode time
+
+Decode totals:
+
+- `D_g = n * d_g`
+- `D_p = n * d_p`
+- `D_e = n * d_e`
+
+### Stage-start function
+
+The helper `_predict_stage_start(...)` is equivalent to:
+
+`start(ready, x_g, x_p, G, P) = max(ready, [x_g > 0] * G, [x_p > 0] * P)`
+
+where `[x > 0]` indicates inclusion of that resource constraint only if the
+stage uses that resource.
+
+### Prefill prediction
+
+- prefill start: `S_p = start(a, p_g, p_p, G_0, P_0)`
+- prefill end: `E_p = S_p + p_e`
+
+Resource free-times after reserving prefill service:
+
+- `G_1 = G_0` if `p_g = 0`, else `max(G_0, S_p + p_g)`
+- `P_1 = P_0` if `p_p = 0`, else `max(P_0, S_p + p_p)`
+
+### Decode prediction
+
+- decode start: `S_d = start(E_p, D_g, D_p, G_1, P_1)`
+- base predicted finish: `F_0 = S_d + D_e`
+
+### Queue-pressure correction (v2.1)
+
+If queue-pressure terms are enabled, an additive correction `Δ` is applied:
+
+`F = F_0 + Δ`
+
+Snapshot values from `_queue_pressure_snapshot(...)`:
+
+- `Q_g`: pending GPU work (ms)
+- `Q_p`: pending PIM work (ms)
+- `A`: active request count
+- `T`: pending decode tokens
+
+Route work shares:
+
+- `w_g = (p_g + D_g) / max(p_e + D_e, ε)`
+- `w_p = (p_p + D_p) / max(p_e + D_e, ε)`
+- `ε = 1e-9`
+
+Queue-pressure term:
+
+- `Δ = α_g * Q_g * w_g + α_p * Q_p * w_p + α_a * A + α_t * T * max(d_e, 0)`
+
+with coefficients:
+
+- `α_g = gpu_queue_alpha`
+- `α_p = pim_queue_alpha`
+- `α_a = active_request_alpha`
+- `α_t = decode_token_alpha`
+
+### Predicted E2E and wait terms
+
+The candidate stores absolute predicted finish time `F`. Predicted E2E is:
+
+- `E2E_pred = F - a`
+
+Additional wait terms used by routing:
+
+- predicted GPU wait: `W_g = max(0, S_p - a)`
+- predicted PIM wait:
+  - `W_p = max(0, P_1 - E_p)` when route uses PIM and decode PIM service is nonzero
+  - `W_p = 0` otherwise
+
+### Batch-size coupling in prediction
+
+The cost-model query uses predicted lookup batch size from
+`_predicted_lookup_batch_size(...)`. Therefore, admission estimates are based on
+`(L_in, L_out, b_hat)`, where `b_hat` depends on decode-batching settings and
+same-route decode backlog at the current simulation state.
+
+## v4.0 Predictive Admission Control (throttLLeM-style)
+
+### Implemented features
+
+- Admission lifecycle was extended with `waiting_admission` before `waiting_prefill`.
+- A strict FCFS admission queue was implemented:
+  - the queue head is evaluated first,
+  - if the head is rejected (and not marked lost), later arrivals cannot overtake.
+- Admission feasibility is evaluated with step-level shadow simulation:
+  - candidate route is projected with current local scheduling semantics,
+  - projected candidate E2E and mean TBT are checked against SLOs,
+  - projected impact on existing non-lost requests is checked.
+- Lost-but-run behavior was implemented:
+  - if a request is infeasible under all routes, it is marked `is_lost=true`,
+  - it is still admitted and executed as best effort.
+- New outputs were added:
+  - summary: `admission_queue.{max_len,mean_wait_ms}`, `admission.{reject_count,lost_count,shadow_timeout_count}`,
+  - request CSV: `admission_time_ms`, `admission_queue_wait_ms`, `admission_attempts`, `admission_last_reject_reason`, `is_lost`.
+
+### Implemented CLI controls
+
+- `--enable-predictive-admission`
+- `--slo-tbt-ms`
+- `--admission-shadow-max-steps`
+- `--admission-retry-interval-ms`
+
+### v4.0 deterministic debug findings
+
+From `cluster_outputs/debug_summary_v40_base.json` (baseline) and `cluster_outputs/debug_summary_v40_pred.json` (predictive admission):
+
+- predictive admission became active immediately:
+  - `reject_count: 0 -> 298`
+  - `lost_count: 0 -> 5`
+  - `admission_queue.max_len: 0 -> 3`
+  - `admission_queue.mean_wait_ms: 0 -> 56.5`
+- tail latency increased under tight SLOs in this debug scenario:
+  - `ttft_p95: 104.66 -> 174.80 ms`
+  - `e2e_p95: 705.89 -> 874.33 ms`
+  - `tbt_p95: 3.26 -> 4.87 ms`
+
+Interpretation:
+
+- v4.0 admission control is functionally correct and observable.
+- Under tight SLO settings and heavy queue pressure, queue-head blocking plus repeated rejects/lost transitions dominate.
+
+Related plots:
+
+- v4.0 latency ECDF  
+  <img src="../cluster_outputs/replay_plots/v40_pred_latency_ecdf.png" alt="v4.0 latency ECDF" width="49%">
+
+- v4.0 predicted E2E vs actual E2E  
+  <img src="../cluster_outputs/replay_plots/v40_pred_predicted_vs_actual.png" alt="v4.0 predicted vs actual" width="49%">
+
+- v4.0 route mix  
+  <img src="../cluster_outputs/replay_plots/v40_pred_route_mix.png" alt="v4.0 route mix" width="49%">
+
+## v4.1 Optional `fcfs_strict` Local Scheduling Mode
+
+### Implemented features
+
+- A new local scheduling policy selector was added:
+  - `priority` (default, existing prompt-aware policy),
+  - `fcfs_strict` (new, run-to-completion by request).
+- In `fcfs_strict`:
+  - oldest admitted active request is selected by `(admission_time_ms, request_id)`,
+  - prefill then decode is served to completion for that request,
+  - prefill/decode batching is operationally disabled (effective batch size `1`),
+  - route admission logic remains unchanged.
+- Shadow projection parity was added:
+  - the admission shadow engine runs the same `fcfs_strict` semantics when selected,
+  - this avoids projection/execution policy mismatch.
+- Summary now includes:
+  - `local_scheduling.local_scheduling_policy`.
+
+### Implemented CLI control
+
+- `--local-scheduling-policy {priority,fcfs_strict}`
+
+### v4.1 findings from current long-run outputs
+
+From `cluster_outputs/replay_summary_v41_fcfs_nopred_l1000.json` (FCFS strict, no predictive admission):
+
+- `total_requests = 1000`
+- `throughput_tokps = 52.93`
+- `ttft_p95 = 5937.34 ms`
+- `e2e_p95 = 6808.17 ms`
+- `tbt_p95 = 2.85 ms`
+- route mix: `gpu_only = 187`, `lpddr5_pim_bank = 813`
+
+From `cluster_outputs/replay_summary_v41_fcfs_pred_l1000.json` (FCFS strict + predictive admission):
+
+- current file contains `total_requests = 300` (run configuration/output should be verified before direct 1:1 throughput comparison against the 1000-request run),
+- `throughput_tokps = 263.85`
+- `ttft_p95 = 14392.11 ms`
+- `e2e_p95 = 14879.21 ms`
+- `tbt_p95 = 2.86 ms`
+- admission metrics show heavy gate pressure:
+  - `reject_count = 2531`
+  - `lost_count = 273`
+  - `shadow_timeout_count = 5062`
+  - `admission_queue.max_len = 171`
+  - `admission_queue.mean_wait_ms = 3494.45`
+
+Interpretation:
+
+- `fcfs_strict` provides deterministic execution semantics and improved interpretability.
+- Predictive admission under aggressive SLO/load settings can produce large lost fractions and queue buildup.
+- High orange density in v4.1 predictive plots corresponds to `is_lost=true` requests.
+
+Related v4.1 plots:
+
+- FCFS no-predictive latency ECDF  
+  <img src="../cluster_outputs/replay_plots/v41_fcfs_nopred_l1000_latency_ecdf.png" alt="v4.1 FCFS no predictive latency ECDF" width="49%">
+
+- FCFS no-predictive predicted E2E vs actual E2E  
+  <img src="../cluster_outputs/replay_plots/v41_fcfs_nopred_l1000_predicted_vs_actual.png" alt="v4.1 FCFS no predictive predicted vs actual" width="49%">
+
+- FCFS predictive latency ECDF  
+  <img src="../cluster_outputs/replay_plots/v41_fcfs_pred_l1000_latency_ecdf.png" alt="v4.1 FCFS predictive latency ECDF" width="49%">
+
+- FCFS predictive predicted E2E vs actual E2E  
+  <img src="../cluster_outputs/replay_plots/v41_fcfs_pred_l1000_predicted_vs_actual.png" alt="v4.1 FCFS predictive predicted vs actual" width="49%">
+
+- FCFS predictive predicted finish vs actual finish  
+  <img src="../cluster_outputs/replay_plots/v41_fcfs_pred_l1000_predicted_finish_vs_actual_finish.png" alt="v4.1 FCFS predictive finish vs finish" width="49%">
+
+- FCFS predictive route mix  
+  <img src="../cluster_outputs/replay_plots/v41_fcfs_pred_l1000_route_mix.png" alt="v4.1 FCFS predictive route mix" width="49%">
+
+
+
+## v4.2 Prefill-Priority + FCFS-Decode with Alternative Prediction Modes
+
+### Implemented features
+
+- A new local scheduling policy was added:
+  - `prefill_priority_fcfs_decode`
+- In this policy:
+  - prefills remain highest priority at task boundaries,
+  - the decode queue is ordered by stable `decode_enqueue_seq`,
+  - decode batching is continuous but restricted to the FCFS head plus the contiguous same-route prefix behind it.
+- A prediction-mode selector was added for this policy:
+  - `shadow`
+  - `legacy`
+  - `incremental`
+- `shadow` reuses the generic forward scheduler projection.
+- `legacy` reuses the earlier analytic finish-time predictor.
+- `incremental` introduces a compact deterministic forecaster specialized for the `prefill_priority_fcfs_decode` scheduler:
+  - it tracks forecasted prefills, decode queue order, resource free times, and remaining decode tokens,
+  - it evaluates both route candidates (`gpu_only`, `lpddr5_pim_bank`) at arrival,
+  - it refreshes `latest_predicted_finish_ms` for active requests after each new admission and after decode-route rebind.
+
+### Implemented CLI controls
+
+- `--local-scheduling-policy prefill_priority_fcfs_decode`
+- `--fcfs-decode-prediction-mode {shadow,legacy,incremental}`
+
+### v4.2 prediction-mode sweep findings
+
+From `cluster_outputs/v42_prediction_mode_sweep_plots/v42_prediction_modes_summary.csv`:
+
+- `shadow`
+  - `throughput_tokps = 364.92`
+  - `ttft_p95 = 4733.63 ms`
+  - `e2e_p95 = 8460.60 ms`
+  - `tbt_p95 = 2.878 ms`
+  - `gpu_route_frac = 0.0`
+  - `decode_mean_batch_size = 3.799`
+- `incremental`
+  - numerically identical to `shadow` in the 300-request sweep
+- `legacy`
+  - `throughput_tokps = 186.52`
+  - `ttft_p95 = 21542.78 ms`
+  - `e2e_p95 = 27138.71 ms`
+  - `tbt_p95 = 3.798 ms`
+  - `gpu_route_frac = 0.1267`
+  - `decode_mean_batch_size = 2.590`
+
+Interpretation:
+
+- `incremental` reproduces the same scheduler-level prediction quality as `shadow` for this workload, while avoiding the generic shadow projection path.
+- `legacy` is not adequate for `prefill_priority_fcfs_decode`; it underestimates finish time and materially degrades throughput and latency.
+- For this scheduler/workload pair, both `shadow` and `incremental` route all requests to `lpddr5_pim_bank`.
+- The `gpu_only` decisions observed in `legacy` appear to be artifacts of prediction error rather than useful routing opportunities.
+- Resource utilization is also consistent with this interpretation:
+  - `shadow` / `incremental` keep GPU utilization lower and PIM utilization higher than `legacy`,
+  - `legacy` shifts more work toward GPU (`gpu_util = 0.902`, `pim_util = 0.048`), which aligns with its inferior routing and latency behavior.
+
+Related sweep plots:
+
+- Throughput  
+  <img src="../cluster_outputs/v42_prediction_mode_sweep_plots/v42_prediction_modes_vs_v31_throughput.png" alt="v4.2 prediction-mode throughput vs v3.1" width="49%">
+
+- `TTFT p95`  
+  <img src="../cluster_outputs/v42_prediction_mode_sweep_plots/v42_prediction_modes_vs_v31_ttft_p95.png" alt="v4.2 prediction-mode TTFT p95 vs v3.1" width="49%">
+
+- `E2E p95`  
+  <img src="../cluster_outputs/v42_prediction_mode_sweep_plots/v42_prediction_modes_vs_v31_e2e_p95.png" alt="v4.2 prediction-mode E2E p95 vs v3.1" width="49%">
+
+- GPU-only route fraction  
+  <img src="../cluster_outputs/v42_prediction_mode_sweep_plots/v42_prediction_modes_vs_v31_gpu_route_frac.png" alt="v4.2 prediction-mode GPU route fraction vs v3.1" width="49%">
+
+- Resource utilization  
+  <img src="../cluster_outputs/v42_prediction_mode_sweep_plots/v42_prediction_modes_vs_v31_utilization.png" alt="v4.2 prediction-mode utilization vs v3.1" width="49%">
+
+### Finish-prediction diagnostics
+
+From the absolute finish-time scatter plots:
+
+- `incremental` and `shadow` lie almost exactly on the diagonal:
+  - predicted finish time and actual finish time are nearly identical,
+  - the FCFS-decode forecaster is therefore consistent with the realized scheduler behavior.
+- `legacy` remains far from the diagonal:
+  - finish times are substantially underpredicted,
+  - this explains the degraded latency and throughput in the sweep.
+- `v31_best` remains behaviorally strong, but its finish-time prediction is visibly less aligned than the new `v4.2` forecaster.
+
+Interpretation:
+
+- `v4.2 incremental` is currently the best finish-time predictor in the replay framework.
+- `v3.1` still provides stronger route diversity and slightly better prompt/E2E tails in the 300-request comparison, but `v4.2 incremental` provides much better finish-time calibration and much lower `TBT p95`.
+- The absence of `gpu_only` routing in `v4.2 incremental` indicates that, under the FCFS-decode policy and the current workload, `lpddr5_pim_bank` remains the consistently preferred route once finish-time prediction is corrected.
+
+Related finish-time plots:
+
+- `v31_best` predicted finish vs actual finish  
+  <img src="../cluster_outputs/replay_plots/v31_best_l300_predicted_finish_vs_actual_finish.png" alt="v31 best predicted finish vs actual finish" width="49%">
+
+- `v4.2 shadow` predicted finish vs actual finish  
+  <img src="../cluster_outputs/replay_plots/v42_fcfs_decode_l1000_predicted_finish_vs_actual_finish.png" alt="v4.2 shadow predicted finish vs actual finish" width="49%">
+
+- `v4.2 incremental` predicted finish vs actual finish  
+  <img src="../cluster_outputs/replay_plots/v42_fcfs_decode_incremental_l1000_predicted_finish_vs_actual_finish.png" alt="v4.2 incremental predicted finish vs actual finish" width="49%">
+
+- `v4.2 legacy` predicted finish vs actual finish  
+  <img src="../cluster_outputs/replay_plots/v42_fcfs_decode_legacy_l1000_predicted_finish_vs_actual_finish.png" alt="v4.2 legacy predicted finish vs actual finish" width="49%">
+
+### Modeling note: controller overhead
+
+The replay simulator currently models:
+
+- waiting due to GPU/PIM resource contention,
+- waiting in `waiting_admission` when predictive admission is enabled.
+
+It does not model the wall-clock control-plane time spent by the scheduler itself to:
+
+- evaluate route candidates,
+- run `shadow` or `incremental` forecasters,
+- refresh active-request predictions.
+
+Therefore, both predicted and actual request latencies currently assume negligible controller-compute overhead. The existing results should be interpreted under that assumption.
+
+### `heuristic_refresh` prediction model
+
+The `heuristic_refresh` mode was introduced as a cheaper alternative to `incremental` for the `prefill_priority_fcfs_decode` scheduler. The real execution policy remains unchanged:
+
+- prefills are dispatched as single-request tasks,
+- prefills have priority at task boundaries,
+- decode requests are ordered by `decode_enqueue_seq`,
+- decode batching uses the FCFS head plus the contiguous same-route prefix behind it.
+
+Only the prediction mechanism changes. Instead of replaying future tasks step by step, `heuristic_refresh` estimates completion time analytically from the current queue structure.
+
+#### Inputs used by the heuristic
+
+For a candidate request on route `r`, the predictor uses:
+
+- current `gpu_free_ms`,
+- current `pim_free_ms`,
+- the set of `waiting_decode` requests,
+- each decode request's `decode_enqueue_seq`,
+- each request's remaining decode tokens,
+- each request's route,
+- the current decode context length,
+- `max_decode_batch_size`,
+- the existing ML/table cost model for prefill and decode-step latency.
+
+#### Step 1: prefill estimate
+
+The candidate prefill start is estimated using the same stage-start rule as the main simulator:
+
+\[
+t_{\mathrm{prefill,start}} = \max(t_{\mathrm{arrival}},\ gpu\_free\ \text{if needed},\ pim\_free\ \text{if needed})
+\]
+
+The candidate prefill end is then:
+
+\[
+t_{\mathrm{prefill,end}} = t_{\mathrm{prefill,start}} + prefill\_e2e(route,\ Lin,\ Lout,\ bs=1)
+\]
+
+Prefill is always evaluated with `bs = 1` in this mode.
+
+#### Step 2: FCFS decode-queue snapshot
+
+The heuristic then constructs the current decode queue by sorting all `waiting_decode` requests by:
+
+\[
+(decode\_enqueue\_seq,\ request\_id)
+\]
+
+The candidate request is appended to the tail of this queue, because it can only enter decode after its own prefill completes.
+
+#### Step 3: contiguous route blocks
+
+The FCFS decode queue is then collapsed into maximal contiguous same-route segments. For example:
+
+```text
+[r0:H, r1:H, r2:G, r3:G, r4:H, candidate:H]
+```
+
+becomes:
+
+- block 1: `[r0:H, r1:H]`
+- block 2: `[r2:G, r3:G]`
+- block 3: `[r4:H, candidate:H]`
+
+This block representation is used because the FCFS-prefix batching policy can only batch the head request with the contiguous same-route prefix behind it.
+
+#### Step 4: per-block decode-step estimate
+
+For each block `b`:
+
+- `n_b` is the number of requests in the block,
+- `bs_eff_b = min(max_decode_batch_size, n_b)` if decode batching is enabled, otherwise `1`,
+- `Lin_b = max(context_tokens + 1 + decoded_tokens_done)` across all requests in the block.
+
+The heuristic then queries the cost model for one representative decode step:
+
+\[
+step\_cost_b = f(route_b,\ Lin_b,\ 2,\ bs\_eff_b)
+\]
+
+where `f(...)` is the ML/table decode-step latency oracle.
+
+#### Step 5: block drain approximation
+
+The total time to drain block `b` is approximated as:
+
+\[
+T_b = \max_i(remaining\_decode\_tokens_i)\cdot step\_cost_b
+\]
+
+This is an intentional approximation. It assumes that a block drains over roughly as many rounds as the longest remaining request in that block, with each round costing `step_cost_b`.
+
+#### Step 6: candidate finish estimate
+
+If the candidate request lands in block `k`, its predicted finish time is approximated by:
+
+\[
+\hat{F}_{candidate}
+\approx
+t_{\mathrm{prefill,end}}
+ \sum_{b < k} T_b
+ T^{(candidate)}_{\mathrm{intra\mbox{-}block}}
+\]
+
+The first term accounts for the candidate's own prefill. The summation accounts for all earlier FCFS route blocks that must drain before the candidate's block can become the active head block.
+
+#### Step 7: intra-block completion estimate
+
+Inside the candidate's own block, completion is estimated as:
+
+\[
+T^{(candidate)}_{\mathrm{intra\mbox{-}block}}
+\approx
+remaining\_decode\_tokens_{candidate}\cdot step\_cost_k + excess\_wait_{candidate}
+\]
+
+The `excess_wait` term captures the case where the candidate is deeper than the first effective batch window of its block and therefore cannot participate in the earliest rounds immediately.
+
+#### Step 8: wait breakdowns
+
+The heuristic also produces approximate wait components:
+
+\[
+predicted\_gpu\_wait = \max(0,\ t_{\mathrm{prefill,start}} - t_{\mathrm{arrival}})
+\]
+
+For hybrid routes, `predicted_pim_wait_ms` is estimated from the delay between candidate prefill completion and the first expected decode opportunity of the candidate block.
+
+#### Step 9: optional alpha residual
+
+After the FCFS block estimate is produced, an optional residual queue-pressure correction may be added when nonzero alpha parameters are supplied:
+
+\[
+\Delta_{\alpha}
+=
+\alpha_{\mathrm{gpu}}\cdot pending\_gpu\_work
+\;+\;
+\alpha_{\mathrm{pim}}\cdot pending\_pim\_work
+\;+\;
+\alpha_{\mathrm{active}}\cdot active\_requests
+\;+\;
+\alpha_{\mathrm{tok}}\cdot pending\_decode\_tokens\cdot decode\_step\_scale
+\]
+
+The final heuristic prediction becomes:
+
+\[
+\hat{F}_{candidate} \leftarrow \hat{F}_{candidate} + \Delta_{\alpha}
+\]
+
+These alpha terms are residual corrections only. They do not replace the FCFS queue/block calculation.
+
+#### Interpretation
+
+The distinction between the three `v4.2` predictors is therefore:
+
+- `legacy`: immediate resource-free-time estimate plus optional queue-pressure correction,
+- `incremental`: scheduler-aligned forward forecast of the currently known queue,
+- `heuristic_refresh`: FCFS queue/block approximation with rolling refresh, but without explicit future task replay.
+
+In practice, `heuristic_refresh` is faster than `incremental`, but its block-drain approximation can still underpredict finish time and distort route choice. That effect was visible in the 300-request comparison, where `heuristic_refresh` selected `gpu_only` more often than `incremental` and produced worse system-level latency and throughput.

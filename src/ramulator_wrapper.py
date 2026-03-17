@@ -3,6 +3,8 @@ import subprocess
 import math
 import os
 import re
+import json
+from pathlib import Path
 from src.config import *
 from src.model import *
 from src.type import *
@@ -70,6 +72,13 @@ class Ramulator:
         self.channel_count = int(self.pim_config.get("CHANNEL_COUNT", 16))
         self.tCK = float(self.pim_config.get("TCK_NS", self._derive_tck_ns(self.dram_timing_preset)))
         self._ensure_log_schema()
+
+    def _resolve_ramulator_binary(self):
+        direct = os.path.join(self.ramulator_dir, "ramulator2")
+        build = os.path.join(self.ramulator_dir, "build", "ramulator2")
+        if os.path.exists(build):
+            return build
+        return direct
 
     def _ensure_log_schema(self):
         if self.df.empty:
@@ -208,6 +217,68 @@ class Ramulator:
         with open(yaml_file, 'w') as f:
             f.write(line)
 
+    def make_online_yaml_file(self,
+                              yaml_file,
+                              requests_csv,
+                              requests_out_csv,
+                              template_dir,
+                              cost_gpu_csv,
+                              cost_hybrid_csv,
+                              route_policy,
+                              pim_wait_threshold_ms,
+                              unsupported_policy,
+                              arrival_time_scale=1.0,
+                              lin_bucket=1,
+                              lout_bucket=1,
+                              batch_size=1,
+                              gpu_route_name="gpu_only",
+                              hybrid_route_name="lpddr5_pim_bank"):
+        line = ""
+        line += "Frontend:\n"
+        line += "  impl: OnlineServingFrontend\n"
+        line += "  requests_csv: {}\n".format(requests_csv)
+        line += "  requests_out_csv: {}\n".format(requests_out_csv)
+        line += "  template_dir: {}\n".format(template_dir)
+        line += "  cost_gpu_csv: {}\n".format(cost_gpu_csv)
+        line += "  cost_hybrid_csv: {}\n".format(cost_hybrid_csv)
+        line += "  gpu_route_name: {}\n".format(gpu_route_name)
+        line += "  hybrid_route_name: {}\n".format(hybrid_route_name)
+        line += "  route_policy: {}\n".format(route_policy)
+        line += "  pim_wait_threshold_ms: {}\n".format(float(pim_wait_threshold_ms))
+        line += "  unsupported_policy: {}\n".format(unsupported_policy)
+        line += "  arrival_time_scale: {}\n".format(float(arrival_time_scale))
+        line += "  lin_bucket: {}\n".format(int(lin_bucket))
+        line += "  lout_bucket: {}\n".format(int(lout_bucket))
+        line += "  batch_size: {}\n".format(int(batch_size))
+        line += "  clock_ratio: 1\n"
+        line += "\n"
+        line += "MemorySystem:\n"
+        line += "  impl: PIMDRAM\n"
+        line += "  clock_ratio: 1\n"
+        line += "  DRAM:\n"
+        line += "    impl: {}\n".format(self.dram_impl)
+        line += "    org:\n"
+        line += "      preset: {}\n".format(self.dram_org_preset)
+        line += "      channel: {}\n".format(self.channel_count)
+        line += "    timing:\n"
+        line += "      preset: {}\n".format(self.dram_timing_preset)
+        line += "\n"
+        line += "  Controller:\n"
+        line += "    impl: {}\n".format(self.controller_impl)
+        line += "    Scheduler:\n"
+        line += "      impl: PIM\n"
+        line += "    RefreshManager:\n"
+        line += "      impl: {}\n".format(self.refresh_impl)
+        line += "    plugins:\n"
+        line += "    - ControllerPlugin:\n"
+        line += "        impl: {}\n".format(self.trace_recorder_impl)
+        line += "        path: ./log/online_serving/cmd.log\n"
+        line += "\n"
+        line += "  AddrMapper:\n"
+        line += "    impl: {}\n".format(self.addr_mapper_impl)
+        with open(yaml_file, 'w') as f:
+            f.write(line)
+
     def update_log_file(self, log):
         columns = self.LOG_COLUMNS
         if self.df.empty:
@@ -257,7 +328,7 @@ class Ramulator:
             print(f"Error: {e}")
 
         # run ramulator
-        ramulator_file = os.path.join(self.ramulator_dir, "ramulator2")
+        ramulator_file = self._resolve_ramulator_binary()
         run_ramulator_cmd = f"{ramulator_file} -f {yaml_file}"
         try:
             result = subprocess.run(run_ramulator_cmd,
@@ -299,6 +370,24 @@ class Ramulator:
             n_cmds["wrgb"]
         ]
         return out
+
+    def _parse_ramulator_yaml_from_stdout(self, stdout_text: str):
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            return {}
+
+        start = stdout_text.find("Frontend:")
+        if start < 0:
+            return {}
+        body = stdout_text[start:]
+        try:
+            parsed = yaml.safe_load(body)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+        return {}
 
     def run(self, pim_type: PIMType, layer: Layer, power_constraint=True):
         if os.path.exists(self.ramulator_dir):
@@ -385,3 +474,65 @@ class Ramulator:
                 pim_type, mac, mvgb, mvsb, wrgb, num_ops_group)
             exec_time = self._cycles_to_seconds(cycle, num_ops_group)
             return exec_time, traffic
+
+    def run_online_serving(self,
+                           requests_csv,
+                           template_dir,
+                           cost_gpu_csv,
+                           cost_hybrid_csv,
+                           route_policy="min_finish",
+                           pim_wait_threshold_ms=1.0,
+                           unsupported_policy="clip",
+                           output_summary_json="cluster_outputs/online_serving_summary.json",
+                           output_requests_csv="cluster_outputs/online_serving_requests.csv",
+                           yaml_file="ramulator2/online_serving.yaml",
+                           arrival_time_scale=1.0,
+                           lin_bucket=1,
+                           lout_bucket=1,
+                           batch_size=1,
+                           gpu_route_name="gpu_only",
+                           hybrid_route_name="lpddr5_pim_bank"):
+        Path(os.path.dirname(output_summary_json) or ".").mkdir(
+            parents=True, exist_ok=True)
+        Path(os.path.dirname(output_requests_csv) or ".").mkdir(
+            parents=True, exist_ok=True)
+
+        self.make_online_yaml_file(
+            yaml_file=yaml_file,
+            requests_csv=requests_csv,
+            requests_out_csv=output_requests_csv,
+            template_dir=template_dir,
+            cost_gpu_csv=cost_gpu_csv,
+            cost_hybrid_csv=cost_hybrid_csv,
+            route_policy=route_policy,
+            pim_wait_threshold_ms=pim_wait_threshold_ms,
+            unsupported_policy=unsupported_policy,
+            arrival_time_scale=arrival_time_scale,
+            lin_bucket=lin_bucket,
+            lout_bucket=lout_bucket,
+            batch_size=batch_size,
+            gpu_route_name=gpu_route_name,
+            hybrid_route_name=hybrid_route_name)
+
+        ramulator_file = self._resolve_ramulator_binary()
+        run_cmd = f"{ramulator_file} -f {yaml_file}"
+        result = subprocess.run(run_cmd,
+                                stdout=subprocess.PIPE,
+                                text=True,
+                                shell=True,
+                                check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Ramulator online serving failed (code={result.returncode})")
+
+        parsed = self._parse_ramulator_yaml_from_stdout(result.stdout)
+        frontend_stats = parsed.get("Frontend", {}) if isinstance(parsed, dict) else {}
+        memory_stats = parsed.get("MemorySystem", {}) if isinstance(parsed, dict) else {}
+        summary = {
+            "frontend": frontend_stats,
+            "memory_system": memory_stats,
+        }
+        with open(output_summary_json, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        return summary

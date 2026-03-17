@@ -41,6 +41,8 @@ required_lpddr_files=(
   ../pim_ramulator_src/LPDDR5.cpp
   ../pim_ramulator_src/hbm3_pim_controller.cpp
   ../pim_ramulator_src/CMakeLists.txt
+  ../pim_ramulator_src/frontend_CMakeLists.txt
+  ../pim_ramulator_src/online_serving_frontend.cpp
   ../pim_ramulator_src/gen_trace_attacc_lpddr5_bank.py
   ../pim_ramulator_src/gen_trace_attacc_lpddr5_bg.py
   ../pim_ramulator_src/gen_trace_attacc_lpddr5_buffer.py
@@ -58,6 +60,9 @@ cp ../pim_ramulator_src/LPDDR5-PIM.cpp src/dram/impl/
 cp ../pim_ramulator_src/LPDDR5.cpp src/dram/impl/
 cp ../pim_ramulator_src/hbm3_pim_controller.cpp src/dram_controller/impl/
 cp ../pim_ramulator_src/CMakeLists.txt src/dram/CMakeLists.txt
+cp ../pim_ramulator_src/frontend_CMakeLists.txt src/frontend/CMakeLists.txt
+mkdir -p src/frontend/impl/serving
+cp ../pim_ramulator_src/online_serving_frontend.cpp src/frontend/impl/serving/
 
 # LPDDR-native trace generators
 cp ../pim_ramulator_src/gen_trace_attacc_lpddr5_bank.py trace_gen/

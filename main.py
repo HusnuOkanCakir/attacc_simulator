@@ -1,6 +1,7 @@
 import argparse
 import csv
 import os
+import json
 from src.system import *
 from src.type import *
 from src.config import *
@@ -137,6 +138,63 @@ def main():
         help=
         "batch size, default = 1"
     )
+    parser.add_argument("--online-serving",
+                        action="store_true",
+                        help="Run online request scheduling mode inside Ramulator.")
+    parser.add_argument("--requests-csv",
+                        type=str,
+                        default="cluster_outputs/replay_requests_sw.csv",
+                        help="Input request CSV for online serving mode.")
+    parser.add_argument("--template-dir",
+                        type=str,
+                        default="ramulator2/trace_gen/templates_lpddr5_bank",
+                        help="Directory containing lin_*.trace PIM templates.")
+    parser.add_argument("--online-yaml",
+                        type=str,
+                        default="ramulator2/online_serving.yaml",
+                        help="Generated Ramulator YAML path in online mode.")
+    parser.add_argument("--route-policy",
+                        type=str,
+                        default="min_finish",
+                        choices=["min_finish", "slack_then_finish"],
+                        help="Route policy in online mode.")
+    parser.add_argument("--pim-wait-threshold-ms",
+                        type=float,
+                        default=1.0,
+                        help="Reject PIM route if predicted PIM wait exceeds this value.")
+    parser.add_argument("--unsupported-policy",
+                        type=str,
+                        default="clip",
+                        choices=["clip", "nearest", "drop"],
+                        help="Unsupported-shape handling in cost lookups.")
+    parser.add_argument("--arrival-time-scale",
+                        type=float,
+                        default=1.0,
+                        help="Scale factor applied to request arrival timeline.")
+    parser.add_argument("--lin-bucket",
+                        type=int,
+                        default=1,
+                        help="Lin bucketing size for online cost lookup.")
+    parser.add_argument("--lout-bucket",
+                        type=int,
+                        default=1,
+                        help="Lout bucketing size for online cost lookup.")
+    parser.add_argument("--online-summary-json",
+                        type=str,
+                        default="cluster_outputs/online_serving_summary.json",
+                        help="Online summary JSON output path.")
+    parser.add_argument("--online-requests-out",
+                        type=str,
+                        default="cluster_outputs/online_serving_requests.csv",
+                        help="Per-request CSV output path for online mode.")
+    parser.add_argument("--cost-gpu-csv",
+                        type=str,
+                        default="cluster_outputs/cost_tables/gpu_only.csv",
+                        help="Cost table CSV for gpu_only route.")
+    parser.add_argument("--cost-hybrid-csv",
+                        type=str,
+                        default="cluster_outputs/cost_tables/lpddr5_pim_bank.csv",
+                        help="Cost table CSV for hybrid route.")
 
     args = parser.parse_args()
 
@@ -151,6 +209,10 @@ def main():
     else:
         assert 0
 
+    num_gpu = args.ngpu
+    gmem_cap = args.gmemcap * 1024 * 1024 * 1024
+    dtype = DataType.W16A16 if args.word == 2 else DataType.W8A8
+    modelinfos = make_model_config(args.model, dtype)
     if args.system == 'dgx-attacc':
         print("{}: ({} x {}), PIM:{}, target:{}, [Lin, Lout, batch]: {}".format(
             args.system, args.gpu, args.ngpu, args.pim, args.yaml_target,
@@ -159,15 +221,49 @@ def main():
         print("{}: ({} x {}), [Lin, Lout, batch]: {}".format(
             args.system, args.gpu, args.ngpu,
             [args.lin, args.lout, args.batch]))
-    num_gpu = args.ngpu
-    gmem_cap = args.gmemcap * 1024 * 1024 * 1024
+
+    if args.online_serving:
+        if args.system != 'dgx-attacc':
+            raise ValueError("--online-serving currently requires --system dgx-attacc")
+        if args.pim == "bg":
+            pim_type = PIMType.BG
+        elif args.pim == "buffer":
+            pim_type = PIMType.BUFFER
+        else:
+            pim_type = PIMType.BA
+
+        pim_config = make_pim_config(pim_type,
+                                     InterfaceType.NVLINK3,
+                                     power_constraint=args.powerlimit,
+                                     yaml_target=args.yaml_target)
+        ramulator = Ramulator(modelinfos,
+                              "ramulator2",
+                              "ramulator.out",
+                              pim_config=pim_config)
+        summary = ramulator.run_online_serving(
+            requests_csv=args.requests_csv,
+            template_dir=args.template_dir,
+            cost_gpu_csv=args.cost_gpu_csv,
+            cost_hybrid_csv=args.cost_hybrid_csv,
+            route_policy=args.route_policy,
+            pim_wait_threshold_ms=args.pim_wait_threshold_ms,
+            unsupported_policy=args.unsupported_policy,
+            output_summary_json=args.online_summary_json,
+            output_requests_csv=args.online_requests_out,
+            yaml_file=args.online_yaml,
+            arrival_time_scale=args.arrival_time_scale,
+            lin_bucket=args.lin_bucket,
+            lout_bucket=args.lout_bucket,
+            batch_size=args.batch)
+        print("Online serving summary:")
+        print(json.dumps(summary, indent=2))
+        return
+
     output_path = "output.csv"
     if os.path.exists(output_path):
         os.system("rm " + output_path)
 
     # set system
-    dtype = DataType.W16A16 if args.word == 2 else DataType.W8A8
-    modelinfos = make_model_config(args.model, dtype)
     xpu_config = make_xpu_config(gpu_device, num_gpu=num_gpu, mem_cap=gmem_cap)
     system = System(xpu_config['GPU'], modelinfos)
     if args.system in ['dgx-attacc']:

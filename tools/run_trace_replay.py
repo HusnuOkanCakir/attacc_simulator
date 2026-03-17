@@ -107,6 +107,47 @@ def main() -> int:
                    type=int,
                    default=0,
                    help=("If > 0 and prefills are waiting, cap decode batch size to this value."))
+    p.add_argument("--local-scheduling-policy",
+                   choices=["priority", "fcfs_strict", "prefill_priority_fcfs_decode"],
+                   default="priority",
+                   help=("Local task execution policy. "
+                         "priority: current prompt-aware policy; "
+                         "fcfs_strict: strict request-level FCFS run-to-completion; "
+                         "prefill_priority_fcfs_decode: prefills are priority, decode queue is FCFS "
+                         "with continuous prefix batching."))
+    p.add_argument("--fcfs-decode-prediction-mode",
+                   choices=["shadow", "legacy", "incremental", "heuristic_refresh"],
+                   default="shadow",
+                   help=("Prediction mode used only by prefill_priority_fcfs_decode. "
+                         "shadow: scheduler-aligned forward projection; "
+                         "legacy: reuse the earlier analytic v3-style predictor; "
+                         "incremental: deterministic FCFS-decode forecaster without the generic shadow sim; "
+                         "heuristic_refresh: FCFS queue-aware analytic predictor with rolling refresh."))
+    p.add_argument("--enable-decode-rebind",
+                   action="store_true",
+                   help=("Re-evaluate route once at prefill completion and allow "
+                         "hybrid->gpu_only switch before first decode token."))
+    p.add_argument("--decode-rebind-margin-ms",
+                   type=float,
+                   default=0.0,
+                   help=("Minimum predicted finish-time improvement required to switch "
+                         "decode route during rebind."))
+    p.add_argument("--enable-predictive-admission",
+                   action="store_true",
+                   help=("Enable throttLLeM-style predictive admission gate. "
+                         "Arrivals enter waiting_admission and are admitted only when feasible."))
+    p.add_argument("--slo-tbt-ms",
+                   type=float,
+                   default=None,
+                   help="Optional TBT SLO threshold used by predictive admission gate")
+    p.add_argument("--admission-shadow-max-steps",
+                   type=int,
+                   default=10000,
+                   help="Safety bound for step-level shadow admission projection")
+    p.add_argument("--admission-retry-interval-ms",
+                   type=float,
+                   default=0.0,
+                   help="Delay before retrying rejected admission queue head (0=recheck every cycle)")
     p.add_argument("--sum-offload-to-pim",
                    action="store_true",
                    help="Interpret hybrid profiles as if sum/prefill stage is split across GPU+PIM")
@@ -156,6 +197,11 @@ def main() -> int:
                    type=str,
                    default=None,
                    help="Optional path to write summary JSON")
+    p.add_argument("--debug-events-csv",
+                   type=str,
+                   default=None,
+                   help=("Optional path to write debug event timeline CSV "
+                         "(admissions, dispatches, completions, and resource states)"))
 
     args = p.parse_args()
 
@@ -177,6 +223,18 @@ def main() -> int:
             raise ValueError(f"Route '{r}' is unavailable for --cost-model {args.cost_model}")
     if args.route_policy == "slack_then_finish" and args.slo_e2e_ms is None:
         raise ValueError("--route-policy slack_then_finish requires --slo-e2e-ms")
+    if args.enable_predictive_admission:
+        if args.slo_e2e_ms is None:
+            raise ValueError("--enable-predictive-admission requires --slo-e2e-ms")
+        if args.slo_tbt_ms is None:
+            raise ValueError("--enable-predictive-admission requires --slo-tbt-ms")
+    if args.local_scheduling_policy == "prefill_priority_fcfs_decode":
+        if args.enable_predictive_admission:
+            raise SystemExit("prefill_priority_fcfs_decode does not support --enable-predictive-admission")
+        if args.enable_prefill_batching:
+            raise SystemExit("prefill_priority_fcfs_decode does not support --enable-prefill-batching")
+    elif args.fcfs_decode_prediction_mode != "shadow":
+        raise SystemExit("--fcfs-decode-prediction-mode only applies to --local-scheduling-policy prefill_priority_fcfs_decode")
 
     arrivals = load_azure_llm_trace(args.azure_trace,
                                     limit=args.limit,
@@ -208,13 +266,22 @@ def main() -> int:
                        prefill_guard_ms=args.prefill_guard_ms,
                        max_consecutive_decode_batches=max(0, args.max_consecutive_decode_batches),
                        decode_batch_cap_with_prefill=max(0, args.decode_batch_cap_with_prefill),
+                       local_scheduling_policy=args.local_scheduling_policy,
+                       fcfs_decode_prediction_mode=args.fcfs_decode_prediction_mode,
+                       enable_decode_rebind=args.enable_decode_rebind,
+                       decode_rebind_margin_ms=max(0.0, args.decode_rebind_margin_ms),
+                       enable_predictive_admission=args.enable_predictive_admission,
+                       slo_tbt_ms=args.slo_tbt_ms,
+                       admission_shadow_max_steps=max(1, args.admission_shadow_max_steps),
+                       admission_retry_interval_ms=max(0.0, args.admission_retry_interval_ms),
                        prompt_priority=(not args.no_prompt_priority),
                        slo_e2e_ms=args.slo_e2e_ms,
                        slo_ttft_ms=args.slo_ttft_ms,
                        gpu_queue_alpha=args.gpu_queue_alpha,
                        pim_queue_alpha=args.pim_queue_alpha,
                        active_request_alpha=args.active_request_alpha,
-                       decode_token_alpha=args.decode_token_alpha)
+                       decode_token_alpha=args.decode_token_alpha,
+                       capture_debug_events=bool(args.debug_events_csv))
 
     sim = TraceReplaySimulator(arrivals=arrivals,
                                cost_model=cost_model,
@@ -234,6 +301,10 @@ def main() -> int:
         with open(args.summary_json, "w") as f:
             f.write(summary.to_json() + "\n")
         print(f"Wrote summary JSON: {args.summary_json}")
+
+    if args.debug_events_csv:
+        sim.debug_events_dataframe().to_csv(args.debug_events_csv, index=False)
+        print(f"Wrote debug events: {args.debug_events_csv}")
 
     return 0
 

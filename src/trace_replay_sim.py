@@ -68,16 +68,30 @@ class ReplayRequest:
     generated_tokens: int
     route: Optional[str] = None
     route_decision_reason: str = ""
-    state: str = "new"  # new, waiting_prefill, waiting_decode, done, dropped
+    admission_route: Optional[str] = None
+    state: str = "new"  # new, waiting_admission, waiting_prefill, waiting_decode, done, dropped
     ready_ms: float = 0.0
+    admission_next_retry_ms: float = 0.0
+    admission_time_ms: Optional[float] = None
+    admission_queue_wait_ms: Optional[float] = None
+    admission_attempts: int = 0
+    admission_last_reject_reason: str = ""
+    is_lost: bool = False
     remaining_decode_tokens: int = 0
     decoded_tokens_done: int = 0
     deadline_ms: Optional[float] = None
     chosen_predicted_finish_ms: Optional[float] = None
+    latest_predicted_finish_ms: Optional[float] = None
     chosen_predicted_gpu_wait_ms: Optional[float] = None
     chosen_predicted_pim_wait_ms: Optional[float] = None
     chosen_queue_pressure_ms: Optional[float] = None
     chosen_slack_ms: Optional[float] = None
+    decode_bind_time_ms: Optional[float] = None
+    decode_rebind_attempted: bool = False
+    decode_rebound: bool = False
+    decode_rebind_reason: str = ""
+    decode_enqueue_seq: Optional[int] = None
+    prediction_refresh_count: int = 0
 
     # Service estimate chosen at admission.
     svc: Optional[RequestServiceEstimate] = None
@@ -107,6 +121,14 @@ class ReplayConfig:
     prefill_guard_ms: Optional[float] = None
     max_consecutive_decode_batches: int = 0
     decode_batch_cap_with_prefill: int = 0
+    local_scheduling_policy: str = "priority"  # priority, fcfs_strict, prefill_priority_fcfs_decode
+    fcfs_decode_prediction_mode: str = "incremental"  # shadow, legacy, incremental, heuristic_refresh
+    enable_decode_rebind: bool = False
+    decode_rebind_margin_ms: float = 0.0
+    enable_predictive_admission: bool = False
+    slo_tbt_ms: Optional[float] = None
+    admission_shadow_max_steps: int = 10000
+    admission_retry_interval_ms: float = 0.0
     prompt_priority: bool = True
     slo_e2e_ms: Optional[float] = None
     slo_ttft_ms: Optional[float] = None
@@ -114,6 +136,7 @@ class ReplayConfig:
     pim_queue_alpha: float = 0.0
     active_request_alpha: float = 0.0
     decode_token_alpha: float = 0.0
+    capture_debug_events: bool = False
 
 
 @dataclass
@@ -404,6 +427,25 @@ class _TaskCandidate:
 
 
 @dataclass
+class _IncrementalForecastRequest:
+    request_id: int
+    arrival_ms: float
+    context_tokens: int
+    route: str
+    svc: RequestServiceEstimate
+    state: str
+    ready_ms: float
+    remaining_decode_tokens: int
+    decoded_tokens_done: int
+    decode_enqueue_seq: Optional[int]
+    prefill_start_ms: Optional[float] = None
+    prefill_end_ms: Optional[float] = None
+    first_decode_start_ms: Optional[float] = None
+    completion_time_ms: Optional[float] = None
+    last_token_completion_ms: Optional[float] = None
+
+
+@dataclass
 class ReplaySummary:
     total_requests: int
     admitted_requests: int
@@ -426,7 +468,9 @@ class ReplaySummary:
     slo_e2e_miss_rate: Optional[float]
     prefill_batching: Dict[str, float]
     decode_batching: Dict[str, float]
-    local_scheduling: Dict[str, float]
+    admission_queue: Dict[str, float]
+    admission: Dict[str, float]
+    local_scheduling: Dict[str, object]
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
@@ -457,6 +501,18 @@ class TraceReplaySimulator:
         self.policy = policy
         self.config = config
         self.route_order = route_order or cost_model.routes()
+        valid_policies = {"priority", "fcfs_strict", "prefill_priority_fcfs_decode"}
+        if self.config.local_scheduling_policy not in valid_policies:
+            raise ValueError("ReplayConfig.local_scheduling_policy must be one of: priority, fcfs_strict, prefill_priority_fcfs_decode")
+        if self.config.fcfs_decode_prediction_mode not in {"shadow", "legacy", "incremental", "heuristic_refresh"}:
+            raise ValueError("ReplayConfig.fcfs_decode_prediction_mode must be one of: shadow, legacy, incremental, heuristic_refresh")
+        if self._is_prefill_priority_fcfs_decode():
+            if self.config.enable_predictive_admission:
+                raise ValueError("prefill_priority_fcfs_decode does not support predictive admission")
+            if self.config.enable_prefill_batching:
+                raise ValueError("prefill_priority_fcfs_decode does not support prefill batching")
+        elif self.config.fcfs_decode_prediction_mode != "shadow":
+            raise ValueError("fcfs_decode_prediction_mode only applies to prefill_priority_fcfs_decode")
 
         self.gpu_free_ms = 0.0
         self.pim_free_ms = 0.0
@@ -476,6 +532,61 @@ class TraceReplaySimulator:
         self.consecutive_decode_batches = 0
         self.prefill_guard_trigger_count = 0
         self.decode_limit_trigger_count = 0
+        self.fcfs_active_request_id: Optional[int] = None
+        self.next_decode_enqueue_seq = 0
+        self.debug_events: List[Dict[str, object]] = []
+        self.admission_queue_wait_samples_ms: List[float] = []
+        self.admission_reject_count = 0
+        self.admission_lost_count = 0
+        self.admission_shadow_timeout_count = 0
+        self.admission_queue_max_len = 0
+        self._estimate_cache: Dict[Tuple[str, int, int, int, str, int, int], Optional[RequestServiceEstimate]] = {}
+
+    def _inc_route_count(self, route: Optional[str], delta: int = 1):
+        if not route:
+            return
+        new_val = self.route_counts.get(route, 0) + int(delta)
+        if new_val <= 0:
+            self.route_counts.pop(route, None)
+        else:
+            self.route_counts[route] = new_val
+
+    def _move_route_count(self, old_route: Optional[str], new_route: Optional[str]):
+        if old_route == new_route:
+            return
+        self._inc_route_count(old_route, -1)
+        self._inc_route_count(new_route, 1)
+
+    def _count_waiting_prefill(self) -> int:
+        return sum(1 for rr in self.requests if rr.state == "waiting_prefill" and rr.svc is not None)
+
+    def _count_waiting_admission(self) -> int:
+        return sum(1 for rr in self.requests if rr.state == "waiting_admission")
+
+    def _count_waiting_decode(self) -> int:
+        return sum(1 for rr in self.requests
+                   if rr.state == "waiting_decode" and rr.svc is not None and rr.remaining_decode_tokens > 0)
+
+    def _record_debug_event(self, event: str, **payload):
+        if not self.config.capture_debug_events:
+            return
+        row: Dict[str, object] = {
+            "event_index": len(self.debug_events),
+            "event": event,
+            "sim_now_ms": self.now_ms,
+            "gpu_free_ms": self.gpu_free_ms,
+            "pim_free_ms": self.pim_free_ms,
+            "waiting_admission_count": self._count_waiting_admission(),
+            "waiting_prefill_count": self._count_waiting_prefill(),
+            "waiting_decode_count": self._count_waiting_decode(),
+            "arrival_index": self._arrival_idx,
+        }
+        for k, v in payload.items():
+            if isinstance(v, (dict, list, tuple)):
+                row[k] = json.dumps(v, sort_keys=True)
+            else:
+                row[k] = v
+        self.debug_events.append(row)
 
     def _resource_ready(self, gpu_ms: float, pim_ms: float) -> float:
         t = self.now_ms
@@ -484,6 +595,30 @@ class TraceReplaySimulator:
         if pim_ms > 0:
             t = max(t, self.pim_free_ms)
         return t
+
+    def _estimate_request_cached(self,
+                                 route: str,
+                                 context_tokens: int,
+                                 generated_tokens: int,
+                                 bs: int) -> Optional[RequestServiceEstimate]:
+        key = (route,
+               int(context_tokens),
+               int(generated_tokens),
+               int(bs),
+               self.config.unsupported_policy,
+               int(self.config.lin_bucket),
+               int(self.config.lout_bucket))
+        if key not in self._estimate_cache:
+            self._estimate_cache[key] = self.cost_model.estimate_request(
+                route,
+                context_tokens=int(context_tokens),
+                generated_tokens=int(generated_tokens),
+                bs=int(bs),
+                unsupported_policy=self.config.unsupported_policy,
+                lin_bucket=self.config.lin_bucket,
+                lout_bucket=self.config.lout_bucket,
+            )
+        return self._estimate_cache[key]
 
     def _predict_stage_start(self, ready_ms: float, gpu_ms: float,
                              pim_ms: float, gpu_free_ms: float,
@@ -495,11 +630,19 @@ class TraceReplaySimulator:
             t = max(t, pim_free_ms)
         return t
 
-    def _request_decode_context_tokens(self, rr: ReplayRequest) -> int:
+    def _request_decode_context_tokens(self, rr: object) -> int:
         # Prefill emits the first token; each decode step appends one more token.
-        return int(rr.context_tokens + 1 + rr.decoded_tokens_done)
+        if isinstance(rr, dict):
+            return int(rr["context_tokens"] + 1 + rr["decoded_tokens_done"])
+        return int(rr.context_tokens + 1 + rr.decoded_tokens_done)  # type: ignore[attr-defined]
 
     def _predicted_lookup_batch_size(self, route: str) -> int:
+        if self._is_fcfs_strict():
+            return 1
+        if (self._use_shadow_prediction_for_fcfs_decode() or
+                self._use_incremental_prediction_for_fcfs_decode() or
+                self._use_heuristic_refresh_prediction_for_fcfs_decode()):
+            return 1
         bs = int(self.config.batch_size)
         if not self.config.enable_decode_batching:
             return bs
@@ -508,7 +651,9 @@ class TraceReplaySimulator:
             if rr.route == route and rr.state == "waiting_decode" and rr.svc is not None
         )
         predicted_bs = min(int(self.config.max_decode_batch_size), same_route_decode + 1)
-        if self._has_waiting_prefill() and self.config.decode_batch_cap_with_prefill > 0:
+        if (not self._is_prefill_priority_fcfs_decode() and
+                self._has_waiting_prefill() and
+                self.config.decode_batch_cap_with_prefill > 0):
             predicted_bs = min(predicted_bs, int(self.config.decode_batch_cap_with_prefill))
         return max(bs, predicted_bs)
 
@@ -520,6 +665,139 @@ class TraceReplaySimulator:
 
     def _has_waiting_prefill(self) -> bool:
         return any(rr.state == "waiting_prefill" and rr.svc is not None for rr in self.requests)
+
+    def _is_fcfs_strict(self) -> bool:
+        return self.config.local_scheduling_policy == "fcfs_strict"
+
+    def _is_prefill_priority_fcfs_decode(self) -> bool:
+        return self.config.local_scheduling_policy == "prefill_priority_fcfs_decode"
+
+    def _use_shadow_prediction_for_fcfs_decode(self) -> bool:
+        return (self._is_prefill_priority_fcfs_decode() and
+                self.config.fcfs_decode_prediction_mode == "shadow")
+
+    def _use_incremental_prediction_for_fcfs_decode(self) -> bool:
+        return (self._is_prefill_priority_fcfs_decode() and
+                self.config.fcfs_decode_prediction_mode == "incremental")
+
+    def _use_heuristic_refresh_prediction_for_fcfs_decode(self) -> bool:
+        return (self._is_prefill_priority_fcfs_decode() and
+                self.config.fcfs_decode_prediction_mode == "heuristic_refresh")
+
+    def _queue_pressure_adjustment_ms(self,
+                                      *,
+                                      prefill_gpu_ms: float,
+                                      prefill_pim_ms: float,
+                                      prefill_e2e_ms: float,
+                                      decode_gpu_ms: float,
+                                      decode_pim_ms: float,
+                                      decode_e2e_ms: float,
+                                      decode_tokens: int) -> float:
+        if (self.config.gpu_queue_alpha <= 0 and self.config.pim_queue_alpha <= 0 and
+                self.config.active_request_alpha <= 0 and self.config.decode_token_alpha <= 0):
+            return 0.0
+        snap = self._queue_pressure_snapshot()
+        decode_gpu_total = decode_gpu_ms * decode_tokens
+        decode_pim_total = decode_pim_ms * decode_tokens
+        decode_e2e_total = decode_e2e_ms * decode_tokens
+        req_gpu_work_ms = prefill_gpu_ms + decode_gpu_total
+        req_pim_work_ms = prefill_pim_ms + decode_pim_total
+        req_total_ms = max(prefill_e2e_ms + decode_e2e_total, 1e-9)
+        gpu_share = req_gpu_work_ms / req_total_ms if req_gpu_work_ms > 0 else 0.0
+        pim_share = req_pim_work_ms / req_total_ms if req_pim_work_ms > 0 else 0.0
+        queue_pressure_ms = 0.0
+        queue_pressure_ms += self.config.gpu_queue_alpha * snap.pending_gpu_work_ms * gpu_share
+        queue_pressure_ms += self.config.pim_queue_alpha * snap.pending_pim_work_ms * pim_share
+        queue_pressure_ms += self.config.active_request_alpha * snap.active_requests
+        queue_pressure_ms += (self.config.decode_token_alpha *
+                              snap.pending_decode_tokens *
+                              max(decode_e2e_ms, 0.0))
+        return queue_pressure_ms
+
+    def _fcfs_active_request(self) -> Optional[ReplayRequest]:
+        if not self._is_fcfs_strict():
+            return None
+
+        if self.fcfs_active_request_id is not None:
+            for rr in self.requests:
+                if rr.request_id != self.fcfs_active_request_id:
+                    continue
+                if rr.state == "waiting_prefill" and rr.svc is not None:
+                    return rr
+                if rr.state == "waiting_decode" and rr.svc is not None and rr.remaining_decode_tokens > 0:
+                    return rr
+                break
+            self.fcfs_active_request_id = None
+
+        active: List[ReplayRequest] = []
+        for rr in self.requests:
+            if rr.svc is None:
+                continue
+            if rr.state == "waiting_prefill":
+                active.append(rr)
+            elif rr.state == "waiting_decode" and rr.remaining_decode_tokens > 0:
+                active.append(rr)
+        if not active:
+            return None
+
+        active.sort(
+            key=lambda r: (
+                (r.admission_time_ms if r.admission_time_ms is not None else r.arrival_ms),
+                r.request_id,
+            )
+        )
+        chosen = active[0]
+        self.fcfs_active_request_id = chosen.request_id
+        return chosen
+
+    def _refresh_fcfs_active_request(self):
+        if not self._is_fcfs_strict() or self.fcfs_active_request_id is None:
+            return
+        for rr in self.requests:
+            if rr.request_id != self.fcfs_active_request_id:
+                continue
+            if rr.state == "waiting_prefill" and rr.svc is not None:
+                return
+            if rr.state == "waiting_decode" and rr.svc is not None and rr.remaining_decode_tokens > 0:
+                return
+            break
+        self.fcfs_active_request_id = None
+
+    def _pick_oldest_prefill_request(self) -> Optional[ReplayRequest]:
+        prefills = [
+            rr for rr in self.requests
+            if rr.state == "waiting_prefill" and rr.svc is not None
+        ]
+        if not prefills:
+            return None
+        return min(prefills, key=lambda r: (r.ready_ms, r.arrival_ms, r.request_id))
+
+    def _transition_to_waiting_decode(self, rr: ReplayRequest, ready_ms: float):
+        rr.state = "waiting_decode"
+        rr.ready_ms = ready_ms
+        if self._is_prefill_priority_fcfs_decode() and rr.decode_enqueue_seq is None:
+            rr.decode_enqueue_seq = self.next_decode_enqueue_seq
+            self.next_decode_enqueue_seq += 1
+            self._record_debug_event(
+                "decode_enqueue",
+                request_id=rr.request_id,
+                route=rr.route,
+                decode_enqueue_seq=rr.decode_enqueue_seq,
+                ready_ms=ready_ms,
+            )
+
+    def _fcfs_decode_queue(self) -> List[ReplayRequest]:
+        q = [
+            rr for rr in self.requests
+            if rr.state == "waiting_decode" and rr.svc is not None and rr.remaining_decode_tokens > 0
+        ]
+        for rr in q:
+            if rr.decode_enqueue_seq is None:
+                rr.decode_enqueue_seq = self.next_decode_enqueue_seq
+                self.next_decode_enqueue_seq += 1
+        q.sort(key=lambda r: ((r.decode_enqueue_seq if r.decode_enqueue_seq is not None else math.inf),
+                              r.request_id))
+        return q
 
     def _pick_prefill_task(self, prefill_tasks: List[_TaskCandidate]) -> Optional[_TaskCandidate]:
         if not prefill_tasks:
@@ -546,17 +824,699 @@ class TraceReplaySimulator:
                 snap.pending_pim_work_ms += rr.remaining_decode_tokens * rr.svc.decode_pim_ms
         return snap
 
+    def _shadow_request_from_replay_request(self, rr: ReplayRequest) -> Dict[str, object]:
+        return {
+            "id": int(rr.request_id),
+            "arrival_ms": float(rr.arrival_ms),
+            "context_tokens": int(rr.context_tokens),
+            "route": rr.route,
+            "svc": rr.svc,
+            "state": rr.state,
+            "ready_ms": float(rr.ready_ms),
+            "remaining_decode_tokens": int(rr.remaining_decode_tokens),
+            "decoded_tokens_done": int(rr.decoded_tokens_done),
+            "prefill_start_ms": rr.prefill_start_ms,
+            "prefill_end_ms": rr.prefill_end_ms,
+            "completion_time_ms": rr.completion_time_ms,
+            "last_token_completion_ms": rr.last_token_completion_ms,
+            "first_decode_start_ms": None,
+            "decode_enqueue_seq": rr.decode_enqueue_seq,
+        }
+
+    def _shadow_request_for_candidate(self,
+                                      req: AzureTraceRequest,
+                                      route: str,
+                                      est: RequestServiceEstimate) -> Dict[str, object]:
+        return {
+            "id": int(req.request_id),
+            "arrival_ms": float(req.arrival_ms),
+            "context_tokens": int(req.context_tokens),
+            "route": route,
+            "svc": est,
+            "state": "waiting_prefill",
+            "ready_ms": float(self.now_ms),
+            "remaining_decode_tokens": int(est.decode_tokens),
+            "decoded_tokens_done": 0,
+            "prefill_start_ms": None,
+            "prefill_end_ms": None,
+            "completion_time_ms": None,
+            "last_token_completion_ms": None,
+            "first_decode_start_ms": None,
+            "decode_enqueue_seq": None,
+        }
+
+    def _simulate_prefill_priority_fcfs_decode_shadow(self,
+                                                      shadow: List[Dict[str, object]]) -> Dict[int, Dict[str, float]]:
+        now = float(self.now_ms)
+        gpu_free = float(self.gpu_free_ms)
+        pim_free = float(self.pim_free_ms)
+        max_decode_seq = max(
+            [int(r["decode_enqueue_seq"]) for r in shadow if r.get("decode_enqueue_seq") is not None],
+            default=-1,
+        )
+        next_decode_seq = max(self.next_decode_enqueue_seq, max_decode_seq + 1)
+
+        def _waiting_prefills() -> List[Dict[str, object]]:
+            prefills = [r for r in shadow if r["state"] == "waiting_prefill" and r["svc"] is not None]
+            prefills.sort(key=lambda r: (float(r["ready_ms"]), float(r["arrival_ms"]), int(r["id"])))
+            return prefills
+
+        def _waiting_decodes() -> List[Dict[str, object]]:
+            decodes = [
+                r for r in shadow
+                if r["state"] == "waiting_decode" and r["svc"] is not None and int(r["remaining_decode_tokens"]) > 0
+            ]
+            for r in decodes:
+                if r.get("decode_enqueue_seq") is None:
+                    nonlocal_next[0] = max(nonlocal_next[0], next_decode_seq)
+                    r["decode_enqueue_seq"] = nonlocal_next[0]
+                    nonlocal_next[0] += 1
+            decodes.sort(key=lambda r: (int(r["decode_enqueue_seq"]), int(r["id"])))
+            return decodes
+
+        def _build_next_task() -> Optional[Dict[str, object]]:
+            prefills = _waiting_prefills()
+            if prefills:
+                rr = prefills[0]
+                svc: RequestServiceEstimate = rr["svc"]  # type: ignore[assignment]
+                start = self._predict_stage_start(float(rr["ready_ms"]),
+                                                  float(svc.prefill_gpu_ms),
+                                                  float(svc.prefill_pim_ms),
+                                                  gpu_free,
+                                                  pim_free)
+                return {
+                    "phase": "prefill",
+                    "requests": [rr],
+                    "ready_ms": float(rr["ready_ms"]),
+                    "gpu_ms": float(svc.prefill_gpu_ms),
+                    "pim_ms": float(svc.prefill_pim_ms),
+                    "e2e_ms": float(svc.prefill_e2e_ms),
+                    "earliest_start_ms": start,
+                }
+
+            decodes = _waiting_decodes()
+            if not decodes:
+                return None
+
+            head = decodes[0]
+            route = str(head["route"])
+            cutoff = max(now, float(head["ready_ms"]))
+            contiguous_prefix = [head]
+            if self.config.enable_decode_batching:
+                for rr in decodes[1:]:
+                    if len(contiguous_prefix) >= int(self.config.max_decode_batch_size):
+                        break
+                    if str(rr["route"]) != route:
+                        break
+                    if float(rr["ready_ms"]) > cutoff:
+                        break
+                    contiguous_prefix.append(rr)
+
+            if not self.config.enable_decode_batching:
+                contiguous_prefix = [head]
+
+            task_reqs: List[Dict[str, object]] = []
+            gpu_ms = pim_ms = e2e_ms = 0.0
+            for batch_size in range(len(contiguous_prefix), 0, -1):
+                task_reqs = contiguous_prefix[:batch_size]
+                if batch_size == 1:
+                    svc = task_reqs[0]["svc"]
+                    if svc is None:
+                        continue
+                    svc = svc  # type: ignore[assignment]
+                    gpu_ms = float(svc.decode_gpu_ms)
+                    pim_ms = float(svc.decode_pim_ms)
+                    e2e_ms = float(svc.decode_e2e_ms)
+                    break
+                batch_lin = max(self._request_decode_context_tokens(r) for r in task_reqs)
+                batch_est = self._estimate_request_cached(route,
+                                                          context_tokens=batch_lin,
+                                                          generated_tokens=2,
+                                                          bs=batch_size)
+                if batch_est is None:
+                    continue
+                gpu_ms = float(batch_est.decode_gpu_ms)
+                pim_ms = float(batch_est.decode_pim_ms)
+                e2e_ms = float(batch_est.decode_e2e_ms)
+                break
+            if not task_reqs:
+                return None
+
+            start = self._predict_stage_start(cutoff, gpu_ms, pim_ms, gpu_free, pim_free)
+            return {
+                "phase": "decode",
+                "requests": task_reqs,
+                "ready_ms": cutoff,
+                "gpu_ms": gpu_ms,
+                "pim_ms": pim_ms,
+                "e2e_ms": e2e_ms,
+                "earliest_start_ms": start,
+            }
+
+        nonlocal_next = [next_decode_seq]
+        while True:
+            task = _build_next_task()
+            if task is None:
+                break
+            start = float(task["earliest_start_ms"])
+            finish = start + float(task["e2e_ms"])
+            now = max(now, start)
+            if float(task["gpu_ms"]) > 0:
+                gpu_free = max(gpu_free, start) + float(task["gpu_ms"])
+            if float(task["pim_ms"]) > 0:
+                pim_free = max(pim_free, start) + float(task["pim_ms"])
+
+            if task["phase"] == "prefill":
+                rr = task["requests"][0]
+                if rr["prefill_start_ms"] is None:
+                    rr["prefill_start_ms"] = start
+                rr["prefill_end_ms"] = finish
+                rr["last_token_completion_ms"] = finish
+                if int(rr["remaining_decode_tokens"]) > 0:
+                    rr["state"] = "waiting_decode"
+                    rr["ready_ms"] = finish
+                    if rr.get("decode_enqueue_seq") is None:
+                        rr["decode_enqueue_seq"] = nonlocal_next[0]
+                        nonlocal_next[0] += 1
+                else:
+                    rr["state"] = "done"
+                    rr["completion_time_ms"] = finish
+            else:
+                for rr in task["requests"]:
+                    if rr["first_decode_start_ms"] is None:
+                        rr["first_decode_start_ms"] = start
+                    rr["last_token_completion_ms"] = finish
+                    rr["remaining_decode_tokens"] = int(rr["remaining_decode_tokens"]) - 1
+                    rr["decoded_tokens_done"] = int(rr["decoded_tokens_done"]) + 1
+                    if int(rr["remaining_decode_tokens"]) <= 0:
+                        rr["state"] = "done"
+                        rr["completion_time_ms"] = finish
+                    else:
+                        rr["state"] = "waiting_decode"
+                        rr["ready_ms"] = finish
+
+        results: Dict[int, Dict[str, float]] = {}
+        for rr in shadow:
+            results[int(rr["id"])] = {
+                "completion_time_ms": (float(rr["completion_time_ms"])
+                                       if rr["completion_time_ms"] is not None else math.inf),
+                "prefill_start_ms": (float(rr["prefill_start_ms"])
+                                     if rr["prefill_start_ms"] is not None else math.nan),
+                "prefill_end_ms": (float(rr["prefill_end_ms"])
+                                   if rr["prefill_end_ms"] is not None else math.nan),
+                "first_decode_start_ms": (float(rr["first_decode_start_ms"])
+                                          if rr["first_decode_start_ms"] is not None else math.nan),
+            }
+        return results
+
+    def _project_prefill_priority_fcfs_decode_candidate(self,
+                                                        req: AzureTraceRequest,
+                                                        route: str,
+                                                        est: RequestServiceEstimate) -> Dict[str, float]:
+        shadow = [
+            self._shadow_request_from_replay_request(rr)
+            for rr in self.requests
+            if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
+        ]
+        shadow.append(self._shadow_request_for_candidate(req, route, est))
+        results = self._simulate_prefill_priority_fcfs_decode_shadow(shadow)
+        out = results.get(req.request_id, {})
+        prefill_start = out.get("prefill_start_ms", math.nan)
+        prefill_end = out.get("prefill_end_ms", math.nan)
+        first_decode_start = out.get("first_decode_start_ms", math.nan)
+        pred_gpu_wait = 0.0 if math.isnan(prefill_start) else max(0.0, prefill_start - req.arrival_ms)
+        pred_pim_wait = 0.0
+        if est.uses_pim and not math.isnan(prefill_end) and not math.isnan(first_decode_start):
+            pred_pim_wait = max(0.0, first_decode_start - prefill_end)
+        return {
+            "candidate_finish_ms": out.get("completion_time_ms", math.inf),
+            "candidate_pred_gpu_wait_ms": pred_gpu_wait,
+            "candidate_pred_pim_wait_ms": pred_pim_wait,
+        }
+
+    def _incremental_request_from_replay_request(self,
+                                                 rr: ReplayRequest) -> _IncrementalForecastRequest:
+        if rr.route is None or rr.svc is None:
+            raise ValueError("incremental forecast requires admitted requests with route and svc")
+        return _IncrementalForecastRequest(
+            request_id=int(rr.request_id),
+            arrival_ms=float(rr.arrival_ms),
+            context_tokens=int(rr.context_tokens),
+            route=str(rr.route),
+            svc=rr.svc,
+            state=str(rr.state),
+            ready_ms=float(rr.ready_ms),
+            remaining_decode_tokens=int(rr.remaining_decode_tokens),
+            decoded_tokens_done=int(rr.decoded_tokens_done),
+            decode_enqueue_seq=rr.decode_enqueue_seq,
+        )
+
+    def _incremental_request_for_candidate(self,
+                                           req: AzureTraceRequest,
+                                           route: str,
+                                           est: RequestServiceEstimate) -> _IncrementalForecastRequest:
+        return _IncrementalForecastRequest(
+            request_id=int(req.request_id),
+            arrival_ms=float(req.arrival_ms),
+            context_tokens=int(req.context_tokens),
+            route=str(route),
+            svc=est,
+            state="waiting_prefill",
+            ready_ms=float(self.now_ms),
+            remaining_decode_tokens=int(est.decode_tokens),
+            decoded_tokens_done=0,
+            decode_enqueue_seq=None,
+        )
+
+    def _simulate_prefill_priority_fcfs_decode_incremental(
+            self,
+            forecast: List[_IncrementalForecastRequest]) -> Dict[int, Dict[str, float]]:
+        now = float(self.now_ms)
+        gpu_free = float(self.gpu_free_ms)
+        pim_free = float(self.pim_free_ms)
+        max_decode_seq = max(
+            [int(r.decode_enqueue_seq) for r in forecast if r.decode_enqueue_seq is not None],
+            default=-1,
+        )
+        next_decode_seq = max(self.next_decode_enqueue_seq, max_decode_seq + 1)
+
+        def _waiting_prefills() -> List[_IncrementalForecastRequest]:
+            prefills = [r for r in forecast if r.state == "waiting_prefill"]
+            prefills.sort(key=lambda r: (r.ready_ms, r.arrival_ms, r.request_id))
+            return prefills
+
+        def _waiting_decodes() -> List[_IncrementalForecastRequest]:
+            nonlocal next_decode_seq
+            decodes = [
+                r for r in forecast
+                if r.state == "waiting_decode" and r.remaining_decode_tokens > 0
+            ]
+            for r in decodes:
+                if r.decode_enqueue_seq is None:
+                    r.decode_enqueue_seq = next_decode_seq
+                    next_decode_seq += 1
+            decodes.sort(key=lambda r: (r.decode_enqueue_seq if r.decode_enqueue_seq is not None else math.inf,
+                                        r.request_id))
+            return decodes
+
+        while True:
+            prefills = _waiting_prefills()
+            if prefills:
+                rr = prefills[0]
+                start = self._predict_stage_start(rr.ready_ms,
+                                                  rr.svc.prefill_gpu_ms,
+                                                  rr.svc.prefill_pim_ms,
+                                                  gpu_free,
+                                                  pim_free)
+                finish = start + rr.svc.prefill_e2e_ms
+                now = max(now, start)
+                if rr.svc.prefill_gpu_ms > 0:
+                    gpu_free = max(gpu_free, start) + rr.svc.prefill_gpu_ms
+                if rr.svc.prefill_pim_ms > 0:
+                    pim_free = max(pim_free, start) + rr.svc.prefill_pim_ms
+                if rr.prefill_start_ms is None:
+                    rr.prefill_start_ms = start
+                rr.prefill_end_ms = finish
+                rr.last_token_completion_ms = finish
+                if rr.remaining_decode_tokens > 0:
+                    rr.state = "waiting_decode"
+                    rr.ready_ms = finish
+                    if rr.decode_enqueue_seq is None:
+                        rr.decode_enqueue_seq = next_decode_seq
+                        next_decode_seq += 1
+                else:
+                    rr.state = "done"
+                    rr.completion_time_ms = finish
+                continue
+
+            decodes = _waiting_decodes()
+            if not decodes:
+                break
+
+            head = decodes[0]
+            cutoff_ms = max(now, head.ready_ms)
+            batch = [head]
+            if self.config.enable_decode_batching:
+                for rr in decodes[1:]:
+                    if len(batch) >= int(self.config.max_decode_batch_size):
+                        break
+                    if rr.route != head.route:
+                        break
+                    if rr.ready_ms > cutoff_ms:
+                        break
+                    batch.append(rr)
+
+            batch_reqs: List[_IncrementalForecastRequest] = []
+            gpu_ms = pim_ms = e2e_ms = 0.0
+            for batch_size in range(len(batch), 0, -1):
+                batch_reqs = batch[:batch_size]
+                if batch_size == 1:
+                    svc = batch_reqs[0].svc
+                    gpu_ms = svc.decode_gpu_ms
+                    pim_ms = svc.decode_pim_ms
+                    e2e_ms = svc.decode_e2e_ms
+                    break
+                batch_lin = max(self._request_decode_context_tokens(r) for r in batch_reqs)
+                batch_est = self._estimate_request_cached(head.route,
+                                                          context_tokens=batch_lin,
+                                                          generated_tokens=2,
+                                                          bs=batch_size)
+                if batch_est is None:
+                    continue
+                gpu_ms = batch_est.decode_gpu_ms
+                pim_ms = batch_est.decode_pim_ms
+                e2e_ms = batch_est.decode_e2e_ms
+                break
+            if not batch_reqs:
+                break
+
+            start = self._predict_stage_start(cutoff_ms, gpu_ms, pim_ms, gpu_free, pim_free)
+            finish = start + e2e_ms
+            now = max(now, start)
+            if gpu_ms > 0:
+                gpu_free = max(gpu_free, start) + gpu_ms
+            if pim_ms > 0:
+                pim_free = max(pim_free, start) + pim_ms
+
+            for rr in batch_reqs:
+                if rr.first_decode_start_ms is None:
+                    rr.first_decode_start_ms = start
+                rr.last_token_completion_ms = finish
+                rr.remaining_decode_tokens -= 1
+                rr.decoded_tokens_done += 1
+                if rr.remaining_decode_tokens <= 0:
+                    rr.state = "done"
+                    rr.completion_time_ms = finish
+                else:
+                    rr.state = "waiting_decode"
+                    rr.ready_ms = finish
+
+        results: Dict[int, Dict[str, float]] = {}
+        for rr in forecast:
+            results[rr.request_id] = {
+                "completion_time_ms": rr.completion_time_ms if rr.completion_time_ms is not None else math.inf,
+                "prefill_start_ms": rr.prefill_start_ms if rr.prefill_start_ms is not None else math.nan,
+                "prefill_end_ms": rr.prefill_end_ms if rr.prefill_end_ms is not None else math.nan,
+                "first_decode_start_ms": (rr.first_decode_start_ms
+                                          if rr.first_decode_start_ms is not None else math.nan),
+            }
+        return results
+
+    def _project_prefill_priority_fcfs_decode_incremental_candidate(
+            self,
+            req: AzureTraceRequest,
+            route: str,
+            est: RequestServiceEstimate) -> Dict[str, float]:
+        forecast = [
+            self._incremental_request_from_replay_request(rr)
+            for rr in self.requests
+            if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
+        ]
+        forecast.append(self._incremental_request_for_candidate(req, route, est))
+        results = self._simulate_prefill_priority_fcfs_decode_incremental(forecast)
+        out = results.get(req.request_id, {})
+        prefill_start = out.get("prefill_start_ms", math.nan)
+        prefill_end = out.get("prefill_end_ms", math.nan)
+        first_decode_start = out.get("first_decode_start_ms", math.nan)
+        pred_gpu_wait = 0.0 if math.isnan(prefill_start) else max(0.0, prefill_start - req.arrival_ms)
+        pred_pim_wait = 0.0
+        if est.uses_pim and not math.isnan(prefill_end) and not math.isnan(first_decode_start):
+            pred_pim_wait = max(0.0, first_decode_start - prefill_end)
+        return {
+            "candidate_finish_ms": out.get("completion_time_ms", math.inf),
+            "candidate_pred_gpu_wait_ms": pred_gpu_wait,
+            "candidate_pred_pim_wait_ms": pred_pim_wait,
+        }
+
+    def _heuristic_decode_candidate_from_replay_request(self,
+                                                        rr: ReplayRequest,
+                                                        route: str,
+                                                        est: RequestServiceEstimate,
+                                                        decision_time_ms: float) -> _IncrementalForecastRequest:
+        return _IncrementalForecastRequest(
+            request_id=int(rr.request_id),
+            arrival_ms=float(rr.arrival_ms),
+            context_tokens=int(rr.context_tokens),
+            route=str(route),
+            svc=est,
+            state="waiting_decode",
+            ready_ms=float(decision_time_ms),
+            remaining_decode_tokens=int(rr.remaining_decode_tokens),
+            decoded_tokens_done=int(rr.decoded_tokens_done),
+            decode_enqueue_seq=rr.decode_enqueue_seq,
+            prefill_start_ms=rr.prefill_start_ms,
+            prefill_end_ms=rr.prefill_end_ms,
+        )
+
+    def _heuristic_decode_step_estimate(
+            self,
+            block: List[_IncrementalForecastRequest]) -> tuple[float, float, float, int]:
+        if not block:
+            return 0.0, 0.0, 0.0, 0
+
+        if not self.config.enable_decode_batching:
+            svc = block[0].svc
+            return svc.decode_gpu_ms, svc.decode_pim_ms, svc.decode_e2e_ms, 1
+
+        max_batch = min(int(self.config.max_decode_batch_size), len(block))
+        batch_lin = max(self._request_decode_context_tokens(r) for r in block)
+        for batch_size in range(max_batch, 0, -1):
+            if batch_size == 1:
+                svc = block[0].svc
+                return svc.decode_gpu_ms, svc.decode_pim_ms, svc.decode_e2e_ms, 1
+            batch_est = self._estimate_request_cached(block[0].route,
+                                                      context_tokens=batch_lin,
+                                                      generated_tokens=2,
+                                                      bs=batch_size)
+            if batch_est is None:
+                continue
+            return batch_est.decode_gpu_ms, batch_est.decode_pim_ms, batch_est.decode_e2e_ms, batch_size
+        svc = block[0].svc
+        return svc.decode_gpu_ms, svc.decode_pim_ms, svc.decode_e2e_ms, 1
+
+    def _simulate_prefill_priority_fcfs_decode_heuristic(
+            self,
+            forecast: List[_IncrementalForecastRequest]) -> Dict[int, Dict[str, float]]:
+        now = float(self.now_ms)
+        gpu_free = float(self.gpu_free_ms)
+        pim_free = float(self.pim_free_ms)
+        max_decode_seq = max(
+            [int(r.decode_enqueue_seq) for r in forecast if r.decode_enqueue_seq is not None],
+            default=-1,
+        )
+        next_decode_seq = max(self.next_decode_enqueue_seq, max_decode_seq + 1)
+
+        prefills = [r for r in forecast if r.state == "waiting_prefill"]
+        prefills.sort(key=lambda r: (r.ready_ms, r.arrival_ms, r.request_id))
+        for rr in prefills:
+            start = self._predict_stage_start(rr.ready_ms,
+                                              rr.svc.prefill_gpu_ms,
+                                              rr.svc.prefill_pim_ms,
+                                              gpu_free,
+                                              pim_free)
+            finish = start + rr.svc.prefill_e2e_ms
+            now = max(now, start)
+            if rr.svc.prefill_gpu_ms > 0:
+                gpu_free = max(gpu_free, start) + rr.svc.prefill_gpu_ms
+            if rr.svc.prefill_pim_ms > 0:
+                pim_free = max(pim_free, start) + rr.svc.prefill_pim_ms
+            rr.prefill_start_ms = start
+            rr.prefill_end_ms = finish
+            rr.last_token_completion_ms = finish
+            if rr.remaining_decode_tokens > 0:
+                rr.state = "waiting_decode"
+                rr.ready_ms = finish
+                if rr.decode_enqueue_seq is None:
+                    rr.decode_enqueue_seq = next_decode_seq
+                    next_decode_seq += 1
+            else:
+                rr.state = "done"
+                rr.completion_time_ms = finish
+
+        decodes = [
+            r for r in forecast
+            if r.state == "waiting_decode" and r.remaining_decode_tokens > 0
+        ]
+        for rr in decodes:
+            if rr.decode_enqueue_seq is None:
+                rr.decode_enqueue_seq = next_decode_seq
+                next_decode_seq += 1
+        decodes.sort(key=lambda r: (r.decode_enqueue_seq if r.decode_enqueue_seq is not None else math.inf,
+                                    r.request_id))
+
+        current_time = now
+        idx = 0
+        while idx < len(decodes):
+            block: List[_IncrementalForecastRequest] = [decodes[idx]]
+            idx += 1
+            while idx < len(decodes) and decodes[idx].route == block[0].route:
+                block.append(decodes[idx])
+                idx += 1
+
+            step_gpu_ms, step_pim_ms, step_e2e_ms, step_batch_size = self._heuristic_decode_step_estimate(block)
+            head_ready_ms = block[0].ready_ms
+            block_start_ms = self._predict_stage_start(max(current_time, head_ready_ms),
+                                                       step_gpu_ms,
+                                                       step_pim_ms,
+                                                       gpu_free,
+                                                       pim_free)
+
+            busy_rounds = 0
+            block_finish_ms = block_start_ms
+            for pos, rr in enumerate(block):
+                if step_batch_size <= 0:
+                    excess_rounds = 0
+                else:
+                    excess_rounds = max(0, pos - step_batch_size + 1)
+                first_decode_start_ms = max(block_start_ms + excess_rounds * step_e2e_ms, rr.ready_ms)
+                rr.first_decode_start_ms = first_decode_start_ms
+                finish_ms = first_decode_start_ms + rr.remaining_decode_tokens * step_e2e_ms
+                rr.completion_time_ms = finish_ms
+                rr.last_token_completion_ms = finish_ms
+                busy_rounds = max(busy_rounds, rr.remaining_decode_tokens + excess_rounds)
+                block_finish_ms = max(block_finish_ms, finish_ms)
+
+            if step_gpu_ms > 0:
+                gpu_free = max(gpu_free, block_start_ms) + busy_rounds * step_gpu_ms
+            if step_pim_ms > 0:
+                pim_free = max(pim_free, block_start_ms) + busy_rounds * step_pim_ms
+            current_time = max(current_time, block_finish_ms)
+
+        results: Dict[int, Dict[str, float]] = {}
+        for rr in forecast:
+            results[rr.request_id] = {
+                "completion_time_ms": rr.completion_time_ms if rr.completion_time_ms is not None else math.inf,
+                "prefill_start_ms": rr.prefill_start_ms if rr.prefill_start_ms is not None else math.nan,
+                "prefill_end_ms": rr.prefill_end_ms if rr.prefill_end_ms is not None else math.nan,
+                "first_decode_start_ms": (rr.first_decode_start_ms
+                                          if rr.first_decode_start_ms is not None else math.nan),
+            }
+        return results
+
+    def _project_prefill_priority_fcfs_decode_heuristic_candidate(
+            self,
+            req: AzureTraceRequest,
+            route: str,
+            est: RequestServiceEstimate) -> Dict[str, float]:
+        forecast = [
+            self._incremental_request_from_replay_request(rr)
+            for rr in self.requests
+            if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
+        ]
+        forecast.append(self._incremental_request_for_candidate(req, route, est))
+        results = self._simulate_prefill_priority_fcfs_decode_heuristic(forecast)
+        out = results.get(req.request_id, {})
+        prefill_start = float(out.get("prefill_start_ms", math.nan))
+        prefill_end = float(out.get("prefill_end_ms", math.nan))
+        first_decode_start = float(out.get("first_decode_start_ms", math.nan))
+        finish = float(out.get("completion_time_ms", math.inf))
+        pred_gpu_wait = 0.0 if math.isnan(prefill_start) else max(0.0, prefill_start - req.arrival_ms)
+        pred_pim_wait = 0.0
+        if est.uses_pim and not math.isnan(prefill_end) and not math.isnan(first_decode_start):
+            pred_pim_wait = max(0.0, first_decode_start - prefill_end)
+        finish += self._queue_pressure_adjustment_ms(prefill_gpu_ms=est.prefill_gpu_ms,
+                                                     prefill_pim_ms=est.prefill_pim_ms,
+                                                     prefill_e2e_ms=est.prefill_e2e_ms,
+                                                     decode_gpu_ms=est.decode_gpu_ms,
+                                                     decode_pim_ms=est.decode_pim_ms,
+                                                     decode_e2e_ms=est.decode_e2e_ms,
+                                                     decode_tokens=est.decode_tokens)
+        return {
+            "candidate_finish_ms": finish,
+            "candidate_pred_gpu_wait_ms": pred_gpu_wait,
+            "candidate_pred_pim_wait_ms": pred_pim_wait,
+        }
+
+    def _project_prefill_priority_fcfs_decode_heuristic_decode_candidate(
+            self,
+            rr: ReplayRequest,
+            route: str,
+            est: RequestServiceEstimate,
+            decision_time_ms: float) -> Dict[str, float]:
+        forecast = [
+            self._incremental_request_from_replay_request(other)
+            for other in self.requests
+            if other.request_id != rr.request_id and
+            other.state in ("waiting_prefill", "waiting_decode") and
+            other.svc is not None and other.route is not None
+        ]
+        forecast.append(self._heuristic_decode_candidate_from_replay_request(rr,
+                                                                             route=route,
+                                                                             est=est,
+                                                                             decision_time_ms=decision_time_ms))
+        results = self._simulate_prefill_priority_fcfs_decode_heuristic(forecast)
+        out = results.get(rr.request_id, {})
+        first_decode_start = float(out.get("first_decode_start_ms", math.nan))
+        finish = float(out.get("completion_time_ms", math.inf))
+        decode_wait = 0.0 if math.isnan(first_decode_start) else max(0.0, first_decode_start - decision_time_ms)
+        finish += self._queue_pressure_adjustment_ms(prefill_gpu_ms=0.0,
+                                                     prefill_pim_ms=0.0,
+                                                     prefill_e2e_ms=0.0,
+                                                     decode_gpu_ms=est.decode_gpu_ms,
+                                                     decode_pim_ms=est.decode_pim_ms,
+                                                     decode_e2e_ms=est.decode_e2e_ms,
+                                                     decode_tokens=rr.remaining_decode_tokens)
+        return {
+            "candidate_finish_ms": finish,
+            "candidate_pred_gpu_wait_ms": decode_wait if est.decode_gpu_ms > 0 else 0.0,
+            "candidate_pred_pim_wait_ms": decode_wait if est.uses_pim else 0.0,
+        }
+
+    def _refresh_active_predictions(self, cause: str):
+        if not self._is_prefill_priority_fcfs_decode():
+            return
+        active = [
+            rr for rr in self.requests
+            if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
+        ]
+        if not active:
+            return
+        if self._use_shadow_prediction_for_fcfs_decode():
+            forecast_results = self._simulate_prefill_priority_fcfs_decode_shadow(
+                [self._shadow_request_from_replay_request(rr) for rr in active]
+            )
+        elif self._use_incremental_prediction_for_fcfs_decode():
+            forecast_results = self._simulate_prefill_priority_fcfs_decode_incremental(
+                [self._incremental_request_from_replay_request(rr) for rr in active]
+            )
+        elif self._use_heuristic_refresh_prediction_for_fcfs_decode():
+            forecast_results = self._simulate_prefill_priority_fcfs_decode_heuristic(
+                [self._incremental_request_from_replay_request(rr) for rr in active]
+            )
+        else:
+            return
+        for rr in active:
+            old_finish = rr.latest_predicted_finish_ms
+            new_finish = forecast_results.get(rr.request_id, {}).get("completion_time_ms", math.inf)
+            if math.isfinite(new_finish) and self._use_heuristic_refresh_prediction_for_fcfs_decode():
+                prefill_gpu_ms = rr.svc.prefill_gpu_ms if rr.state == "waiting_prefill" else 0.0
+                prefill_pim_ms = rr.svc.prefill_pim_ms if rr.state == "waiting_prefill" else 0.0
+                prefill_e2e_ms = rr.svc.prefill_e2e_ms if rr.state == "waiting_prefill" else 0.0
+                new_finish += self._queue_pressure_adjustment_ms(prefill_gpu_ms=prefill_gpu_ms,
+                                                                 prefill_pim_ms=prefill_pim_ms,
+                                                                 prefill_e2e_ms=prefill_e2e_ms,
+                                                                 decode_gpu_ms=rr.svc.decode_gpu_ms,
+                                                                 decode_pim_ms=rr.svc.decode_pim_ms,
+                                                                 decode_e2e_ms=rr.svc.decode_e2e_ms,
+                                                                 decode_tokens=rr.remaining_decode_tokens)
+            rr.latest_predicted_finish_ms = new_finish if math.isfinite(new_finish) else old_finish
+            rr.prediction_refresh_count += 1
+            self._record_debug_event(
+                "prediction_refresh",
+                request_id=rr.request_id,
+                cause=cause,
+                old_latest_predicted_finish_ms=old_finish,
+                new_latest_predicted_finish_ms=rr.latest_predicted_finish_ms,
+            )
+
     def _predict_route_candidate(self,
                                  req: AzureTraceRequest,
                                  route: str,
                                  deadline_ms: Optional[float] = None) -> Tuple[RouteCandidate, Optional[RequestServiceEstimate]]:
-        est = self.cost_model.estimate_request(route,
-                                               context_tokens=req.context_tokens,
-                                               generated_tokens=req.generated_tokens,
-                                               bs=self._predicted_lookup_batch_size(route),
-                                               unsupported_policy=self.config.unsupported_policy,
-                                               lin_bucket=self.config.lin_bucket,
-                                               lout_bucket=self.config.lout_bucket)
+        est = self._estimate_request_cached(route,
+                                            context_tokens=req.context_tokens,
+                                            generated_tokens=req.generated_tokens,
+                                            bs=self._predicted_lookup_batch_size(route))
         if est is None:
             return (RouteCandidate(route=route,
                                    eligible=False,
@@ -564,9 +1524,55 @@ class TraceReplaySimulator:
                                    predicted_finish_ms=math.inf,
                                    predicted_gpu_wait_ms=math.inf,
                                     predicted_pim_wait_ms=math.inf,
-                                   deadline_ms=deadline_ms,
-                                   slack_ms=None,
-                                   reason="unsupported_length"), None)
+                                    deadline_ms=deadline_ms,
+                                    slack_ms=None,
+                                    reason="unsupported_length"), None)
+
+        if self._use_shadow_prediction_for_fcfs_decode():
+            proj = self._project_prefill_priority_fcfs_decode_candidate(req, route, est)
+            finish = float(proj["candidate_finish_ms"])
+            pred_gpu_wait = float(proj["candidate_pred_gpu_wait_ms"])
+            pred_pim_wait = float(proj["candidate_pred_pim_wait_ms"])
+            slack_ms = None if deadline_ms is None else (deadline_ms - finish)
+            cand = RouteCandidate(route=route,
+                                  eligible=True,
+                                  uses_pim=est.uses_pim,
+                                  predicted_finish_ms=finish,
+                                  predicted_gpu_wait_ms=pred_gpu_wait,
+                                  predicted_pim_wait_ms=pred_pim_wait,
+                                  deadline_ms=deadline_ms,
+                                  slack_ms=slack_ms)
+            return cand, est
+        if self._use_incremental_prediction_for_fcfs_decode():
+            proj = self._project_prefill_priority_fcfs_decode_incremental_candidate(req, route, est)
+            finish = float(proj["candidate_finish_ms"])
+            pred_gpu_wait = float(proj["candidate_pred_gpu_wait_ms"])
+            pred_pim_wait = float(proj["candidate_pred_pim_wait_ms"])
+            slack_ms = None if deadline_ms is None else (deadline_ms - finish)
+            cand = RouteCandidate(route=route,
+                                  eligible=True,
+                                  uses_pim=est.uses_pim,
+                                  predicted_finish_ms=finish,
+                                  predicted_gpu_wait_ms=pred_gpu_wait,
+                                  predicted_pim_wait_ms=pred_pim_wait,
+                                  deadline_ms=deadline_ms,
+                                  slack_ms=slack_ms)
+            return cand, est
+        if self._use_heuristic_refresh_prediction_for_fcfs_decode():
+            proj = self._project_prefill_priority_fcfs_decode_heuristic_candidate(req, route, est)
+            finish = float(proj["candidate_finish_ms"])
+            pred_gpu_wait = float(proj["candidate_pred_gpu_wait_ms"])
+            pred_pim_wait = float(proj["candidate_pred_pim_wait_ms"])
+            slack_ms = None if deadline_ms is None else (deadline_ms - finish)
+            cand = RouteCandidate(route=route,
+                                  eligible=True,
+                                  uses_pim=est.uses_pim,
+                                  predicted_finish_ms=finish,
+                                  predicted_gpu_wait_ms=pred_gpu_wait,
+                                  predicted_pim_wait_ms=pred_pim_wait,
+                                  deadline_ms=deadline_ms,
+                                  slack_ms=slack_ms)
+            return cand, est
 
         # Aggregate admission time prediction (simple, no batching)
         prefill_start = self._predict_stage_start(req.arrival_ms, est.prefill_gpu_ms,
@@ -593,22 +1599,14 @@ class TraceReplaySimulator:
         pred_pim_wait = 0.0
         if est.uses_pim and est.decode_tokens > 0 and est.decode_pim_ms > 0:
             pred_pim_wait = max(0.0, pim_free_after_prefill - prefill_end)
-        queue_pressure_ms = 0.0
-        if (self.config.gpu_queue_alpha > 0 or self.config.pim_queue_alpha > 0 or
-                self.config.active_request_alpha > 0 or self.config.decode_token_alpha > 0):
-            snap = self._queue_pressure_snapshot()
-            req_gpu_work_ms = est.prefill_gpu_ms + decode_gpu_total
-            req_pim_work_ms = est.prefill_pim_ms + decode_pim_total
-            req_total_ms = max(est.prefill_e2e_ms + decode_e2e_total, 1e-9)
-            gpu_share = req_gpu_work_ms / req_total_ms if req_gpu_work_ms > 0 else 0.0
-            pim_share = req_pim_work_ms / req_total_ms if req_pim_work_ms > 0 else 0.0
-            queue_pressure_ms += self.config.gpu_queue_alpha * snap.pending_gpu_work_ms * gpu_share
-            queue_pressure_ms += self.config.pim_queue_alpha * snap.pending_pim_work_ms * pim_share
-            queue_pressure_ms += self.config.active_request_alpha * snap.active_requests
-            queue_pressure_ms += (self.config.decode_token_alpha *
-                                  snap.pending_decode_tokens *
-                                  max(est.decode_e2e_ms, 0.0))
-            finish += queue_pressure_ms
+        queue_pressure_ms = self._queue_pressure_adjustment_ms(prefill_gpu_ms=est.prefill_gpu_ms,
+                                                               prefill_pim_ms=est.prefill_pim_ms,
+                                                               prefill_e2e_ms=est.prefill_e2e_ms,
+                                                               decode_gpu_ms=est.decode_gpu_ms,
+                                                               decode_pim_ms=est.decode_pim_ms,
+                                                               decode_e2e_ms=est.decode_e2e_ms,
+                                                               decode_tokens=est.decode_tokens)
+        finish += queue_pressure_ms
         slack_ms = None if deadline_ms is None else (deadline_ms - finish)
 
         cand = RouteCandidate(route=route,
@@ -621,6 +1619,765 @@ class TraceReplaySimulator:
                               deadline_ms=deadline_ms,
                               slack_ms=slack_ms)
         return cand, est
+
+    def _predict_decode_route_candidate(self,
+                                        rr: ReplayRequest,
+                                        route: str,
+                                        decision_time_ms: float) -> Tuple[RouteCandidate, Optional[RequestServiceEstimate]]:
+        est = self._estimate_request_cached(route,
+                                            context_tokens=rr.context_tokens,
+                                            generated_tokens=rr.generated_tokens,
+                                            bs=self._predicted_lookup_batch_size(route))
+        if est is None:
+            return (RouteCandidate(route=route,
+                                   eligible=False,
+                                   uses_pim=("pim" in route),
+                                   predicted_finish_ms=math.inf,
+                                   predicted_gpu_wait_ms=math.inf,
+                                   predicted_pim_wait_ms=math.inf,
+                                   deadline_ms=rr.deadline_ms,
+                                   slack_ms=None,
+                                   reason="unsupported_length"), None)
+
+        if self._use_heuristic_refresh_prediction_for_fcfs_decode():
+            proj = self._project_prefill_priority_fcfs_decode_heuristic_decode_candidate(rr,
+                                                                                         route=route,
+                                                                                         est=est,
+                                                                                         decision_time_ms=decision_time_ms)
+            finish = float(proj["candidate_finish_ms"])
+            pred_gpu_wait = float(proj["candidate_pred_gpu_wait_ms"])
+            pred_pim_wait = float(proj["candidate_pred_pim_wait_ms"])
+            slack_ms = None if rr.deadline_ms is None else (rr.deadline_ms - finish)
+            cand = RouteCandidate(route=route,
+                                  eligible=True,
+                                  uses_pim=est.uses_pim,
+                                  predicted_finish_ms=finish,
+                                  predicted_gpu_wait_ms=pred_gpu_wait,
+                                  predicted_pim_wait_ms=pred_pim_wait,
+                                  deadline_ms=rr.deadline_ms,
+                                  slack_ms=slack_ms)
+            return cand, est
+
+        decode_gpu_total = est.decode_gpu_ms * rr.remaining_decode_tokens
+        decode_pim_total = est.decode_pim_ms * rr.remaining_decode_tokens
+        decode_e2e_total = est.decode_e2e_ms * rr.remaining_decode_tokens
+        decode_start = self._predict_stage_start(decision_time_ms,
+                                                 decode_gpu_total,
+                                                 decode_pim_total,
+                                                 self.gpu_free_ms,
+                                                 self.pim_free_ms)
+        finish = decode_start + decode_e2e_total
+        pred_gpu_wait = max(0.0, self.gpu_free_ms - decision_time_ms) if decode_gpu_total > 0 else 0.0
+        pred_pim_wait = max(0.0, self.pim_free_ms - decision_time_ms) if decode_pim_total > 0 else 0.0
+        slack_ms = None if rr.deadline_ms is None else (rr.deadline_ms - finish)
+        cand = RouteCandidate(route=route,
+                              eligible=True,
+                              uses_pim=est.uses_pim,
+                              predicted_finish_ms=finish,
+                              predicted_gpu_wait_ms=pred_gpu_wait,
+                              predicted_pim_wait_ms=pred_pim_wait,
+                              deadline_ms=rr.deadline_ms,
+                              slack_ms=slack_ms)
+        return cand, est
+
+    def _maybe_rebind_decode_route(self, rr: ReplayRequest, decision_time_ms: float):
+        if not self.config.enable_decode_rebind:
+            return
+        if rr.svc is None or rr.route is None or rr.remaining_decode_tokens <= 0:
+            return
+        if rr.decoded_tokens_done > 0:
+            return
+        if not rr.svc.uses_pim:
+            rr.decode_bind_time_ms = decision_time_ms
+            rr.decode_rebind_reason = "skip_non_pim_route"
+            return
+
+        rr.decode_bind_time_ms = decision_time_ms
+        rr.decode_rebind_attempted = True
+
+        current_cand, current_est = self._predict_decode_route_candidate(rr, rr.route, decision_time_ms)
+        if current_est is None:
+            rr.decode_rebind_reason = "current_route_estimate_unavailable"
+            return
+
+        candidates = [current_cand]
+        est_by_route: Dict[str, RequestServiceEstimate] = {rr.route: current_est}
+        if current_est.uses_pim:
+            gpu_cand, gpu_est = self._predict_decode_route_candidate(rr, "gpu_only", decision_time_ms)
+            if gpu_est is not None:
+                candidates.append(gpu_cand)
+                est_by_route["gpu_only"] = gpu_est
+
+        if len(candidates) == 1:
+            rr.latest_predicted_finish_ms = current_cand.predicted_finish_ms
+            rr.decode_rebind_reason = "no_gpu_candidate"
+            self._record_debug_event(
+                "decode_rebind_decision",
+                request_id=rr.request_id,
+                decision_time_ms=decision_time_ms,
+                previous_route=rr.route,
+                chosen_route=rr.route,
+                rebound=False,
+                reason=rr.decode_rebind_reason,
+                improvement_ms=0.0,
+                route_candidates=[{
+                    "route": current_cand.route,
+                    "eligible": current_cand.eligible,
+                    "predicted_finish_ms": current_cand.predicted_finish_ms,
+                    "predicted_gpu_wait_ms": current_cand.predicted_gpu_wait_ms,
+                    "predicted_pim_wait_ms": current_cand.predicted_pim_wait_ms,
+                    "slack_ms": current_cand.slack_ms,
+                }],
+            )
+            return
+
+        decision = self.policy.choose_route(candidates,
+                                            now_ms=decision_time_ms,
+                                            deadline_ms=rr.deadline_ms)
+        chosen_cand = next((c for c in candidates if c.route == decision.route), current_cand)
+        rr.latest_predicted_finish_ms = chosen_cand.predicted_finish_ms
+
+        improvement_ms = current_cand.predicted_finish_ms - chosen_cand.predicted_finish_ms
+        old_route = rr.route
+        margin = max(0.0, float(self.config.decode_rebind_margin_ms))
+        if (decision.route == "gpu_only" and
+                old_route != "gpu_only" and
+                improvement_ms > margin and
+                "gpu_only" in est_by_route):
+            rr.route = "gpu_only"
+            rr.svc = est_by_route["gpu_only"]
+            rr.decode_rebound = True
+            rr.decode_rebind_reason = f"rebound_to_gpu:{decision.reason}"
+            self._move_route_count(old_route, rr.route)
+        else:
+            rr.decode_rebind_reason = f"keep_route:{decision.reason}"
+
+        cand_debug = [{
+            "route": c.route,
+            "eligible": c.eligible,
+            "predicted_finish_ms": c.predicted_finish_ms,
+            "predicted_gpu_wait_ms": c.predicted_gpu_wait_ms,
+            "predicted_pim_wait_ms": c.predicted_pim_wait_ms,
+            "slack_ms": c.slack_ms,
+        } for c in candidates]
+        self._record_debug_event(
+            "decode_rebind_decision",
+            request_id=rr.request_id,
+            decision_time_ms=decision_time_ms,
+            previous_route=old_route,
+            chosen_route=rr.route,
+            rebound=rr.decode_rebound,
+            reason=rr.decode_rebind_reason,
+            improvement_ms=improvement_ms,
+            route_candidates=cand_debug,
+        )
+
+    def _enqueue_arrivals_up_to_now(self):
+        while self._arrival_idx < len(self.arrivals) and self.arrivals[self._arrival_idx].arrival_ms <= self.now_ms:
+            src_req = self.arrivals[self._arrival_idx]
+            self._arrival_idx += 1
+            rr = ReplayRequest(request_id=src_req.request_id,
+                               arrival_ms=src_req.arrival_ms,
+                               context_tokens=src_req.context_tokens,
+                               generated_tokens=src_req.generated_tokens,
+                               state="waiting_admission",
+                               ready_ms=src_req.arrival_ms,
+                               admission_next_retry_ms=self.now_ms)
+            if self.config.slo_e2e_ms is not None:
+                rr.deadline_ms = rr.arrival_ms + self.config.slo_e2e_ms
+            self.requests.append(rr)
+            self._record_debug_event(
+                "arrival_enqueued",
+                request_id=rr.request_id,
+                request_arrival_ms=rr.arrival_ms,
+                context_tokens=rr.context_tokens,
+                generated_tokens=rr.generated_tokens,
+            )
+
+    def _waiting_admission_requests(self) -> List[ReplayRequest]:
+        return sorted(
+            [r for r in self.requests if r.state == "waiting_admission"],
+            key=lambda r: (r.arrival_ms, r.request_id),
+        )
+
+    def _project_admission_candidate(self,
+                                     req: ReplayRequest,
+                                     route: str,
+                                     est: RequestServiceEstimate) -> Dict[str, object]:
+        # Build immutable snapshot of currently admitted active requests + candidate.
+        shadow: List[Dict[str, object]] = []
+        for rr in self.requests:
+            if rr.state not in ("waiting_prefill", "waiting_decode"):
+                continue
+            if rr.svc is None or rr.route is None:
+                continue
+            shadow.append({
+                "id": int(rr.request_id),
+                "arrival_ms": float(rr.arrival_ms),
+                "context_tokens": int(rr.context_tokens),
+                "deadline_ms": rr.deadline_ms,
+                "is_lost": bool(rr.is_lost),
+                "route": rr.route,
+                "svc": rr.svc,
+                "state": rr.state,
+                "ready_ms": float(rr.ready_ms),
+                "admission_time_ms": (float(rr.admission_time_ms)
+                                       if rr.admission_time_ms is not None else float(rr.arrival_ms)),
+                "remaining_decode_tokens": int(rr.remaining_decode_tokens),
+                "decoded_tokens_done": int(rr.decoded_tokens_done),
+                "prefill_start_ms": rr.prefill_start_ms,
+                "prefill_end_ms": rr.prefill_end_ms,
+                "first_token_time_ms": rr.first_token_time_ms,
+                "completion_time_ms": rr.completion_time_ms,
+                "last_token_completion_ms": rr.last_token_completion_ms,
+                "tbt_intervals_ms": list(rr.tbt_intervals_ms),
+                "first_decode_start_ms": None,
+            })
+        shadow.append({
+            "id": int(req.request_id),
+            "arrival_ms": float(req.arrival_ms),
+            "context_tokens": int(req.context_tokens),
+            "deadline_ms": req.deadline_ms,
+            "is_lost": bool(req.is_lost),
+            "route": route,
+            "svc": est,
+            "state": "waiting_prefill",
+            "ready_ms": float(self.now_ms),
+            "admission_time_ms": float(self.now_ms),
+            "remaining_decode_tokens": int(est.decode_tokens),
+            "decoded_tokens_done": 0,
+            "prefill_start_ms": None,
+            "prefill_end_ms": None,
+            "first_token_time_ms": None,
+            "completion_time_ms": None,
+            "last_token_completion_ms": None,
+            "tbt_intervals_ms": [],
+            "first_decode_start_ms": None,
+        })
+        target_id = int(req.request_id)
+
+        now = float(self.now_ms)
+        gpu_free = float(self.gpu_free_ms)
+        pim_free = float(self.pim_free_ms)
+        steps = 0
+        consecutive_decode_batches = 0
+        timeout = False
+        shadow_fcfs_active_request_id: Optional[int] = None
+
+        def _has_waiting_prefill() -> bool:
+            for r in shadow:
+                if r["state"] == "waiting_prefill":
+                    return True
+            return False
+
+        def _shadow_is_active(r: Dict[str, object]) -> bool:
+            if r["state"] == "waiting_prefill":
+                return True
+            if r["state"] == "waiting_decode" and int(r["remaining_decode_tokens"]) > 0:
+                return True
+            return False
+
+        def _shadow_fcfs_active() -> Optional[Dict[str, object]]:
+            nonlocal shadow_fcfs_active_request_id
+            if shadow_fcfs_active_request_id is not None:
+                for r in shadow:
+                    if int(r["id"]) == shadow_fcfs_active_request_id and _shadow_is_active(r):
+                        return r
+                shadow_fcfs_active_request_id = None
+
+            active = [r for r in shadow if _shadow_is_active(r)]
+            if not active:
+                return None
+            active.sort(
+                key=lambda r: (
+                    float(r["admission_time_ms"]) if r.get("admission_time_ms") is not None else float(r["arrival_ms"]),
+                    int(r["id"]),
+                )
+            )
+            chosen = active[0]
+            shadow_fcfs_active_request_id = int(chosen["id"])
+            return chosen
+
+        def _pick_prefill_task(prefill_tasks: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+            if not prefill_tasks:
+                return None
+            return min(prefill_tasks,
+                       key=lambda t: (float(t["earliest_start_ms"]), float(t["ready_ms"]), int(t["first_req_id"])))
+
+        def _build_prefill_tasks() -> List[Dict[str, object]]:
+            tasks: List[Dict[str, object]] = []
+            for idx, r in enumerate(shadow):
+                if r["state"] != "waiting_prefill":
+                    continue
+                svc: RequestServiceEstimate = r["svc"]  # type: ignore
+                gpu_ms = float(svc.prefill_gpu_ms)
+                pim_ms = float(svc.prefill_pim_ms)
+                e2e_ms = float(svc.prefill_e2e_ms)
+                ready_ms = float(r["ready_ms"])
+                start = self._predict_stage_start(ready_ms, gpu_ms, pim_ms, gpu_free, pim_free)
+                tasks.append({
+                    "phase": "prefill",
+                    "idxs": [idx],
+                    "route": r["route"],
+                    "ready_ms": ready_ms,
+                    "gpu_ms": gpu_ms,
+                    "pim_ms": pim_ms,
+                    "e2e_ms": e2e_ms,
+                    "earliest_start_ms": start,
+                    "batch_size": 1,
+                    "first_req_id": int(r["id"]),
+                })
+            return tasks
+
+        def _build_decode_tasks() -> List[Dict[str, object]]:
+            tasks: List[Dict[str, object]] = []
+            if self.config.enable_decode_batching:
+                grouped: Dict[str, List[int]] = {}
+                for idx, r in enumerate(shadow):
+                    if r["state"] != "waiting_decode":
+                        continue
+                    if int(r["remaining_decode_tokens"]) <= 0:
+                        continue
+                    grouped.setdefault(str(r["route"]), []).append(idx)
+                has_prefill = _has_waiting_prefill()
+                for rname, idxs in grouped.items():
+                    idxs.sort(key=lambda i: (float(shadow[i]["ready_ms"]),
+                                             float(shadow[i]["arrival_ms"]),
+                                             int(shadow[i]["id"])))
+                    cutoff = max(now, float(shadow[idxs[0]]["ready_ms"]))
+                    cohort = [i for i in idxs if float(shadow[i]["ready_ms"]) <= cutoff]
+                    if not cohort:
+                        continue
+                    max_batch = min(len(cohort), int(self.config.max_decode_batch_size))
+                    if has_prefill and self.config.decode_batch_cap_with_prefill > 0:
+                        max_batch = min(max_batch, int(self.config.decode_batch_cap_with_prefill))
+                    for bs in range(max_batch, 0, -1):
+                        bidxs = cohort[:bs]
+                        batch_lin = max(self._request_decode_context_tokens(shadow[i]) for i in bidxs)  # type: ignore[arg-type]
+                        batch_est = self._estimate_request_cached(rname,
+                                                                  context_tokens=batch_lin,
+                                                                  generated_tokens=2,
+                                                                  bs=bs)
+                        if batch_est is None:
+                            continue
+                        gpu_ms = float(batch_est.decode_gpu_ms)
+                        pim_ms = float(batch_est.decode_pim_ms)
+                        e2e_ms = float(batch_est.decode_e2e_ms)
+                        start = self._predict_stage_start(cutoff, gpu_ms, pim_ms, gpu_free, pim_free)
+                        tasks.append({
+                            "phase": "decode",
+                            "idxs": bidxs,
+                            "route": rname,
+                            "ready_ms": cutoff,
+                            "gpu_ms": gpu_ms,
+                            "pim_ms": pim_ms,
+                            "e2e_ms": e2e_ms,
+                            "earliest_start_ms": start,
+                            "batch_size": bs,
+                            "first_req_id": min(int(shadow[i]["id"]) for i in bidxs),
+                        })
+                        break
+            else:
+                for idx, r in enumerate(shadow):
+                    if r["state"] != "waiting_decode":
+                        continue
+                    if int(r["remaining_decode_tokens"]) <= 0:
+                        continue
+                    svc: RequestServiceEstimate = r["svc"]  # type: ignore
+                    gpu_ms = float(svc.decode_gpu_ms)
+                    pim_ms = float(svc.decode_pim_ms)
+                    e2e_ms = float(svc.decode_e2e_ms)
+                    ready_ms = float(r["ready_ms"])
+                    start = self._predict_stage_start(ready_ms, gpu_ms, pim_ms, gpu_free, pim_free)
+                    tasks.append({
+                        "phase": "decode",
+                        "idxs": [idx],
+                        "route": r["route"],
+                        "ready_ms": ready_ms,
+                        "gpu_ms": gpu_ms,
+                        "pim_ms": pim_ms,
+                        "e2e_ms": e2e_ms,
+                        "earliest_start_ms": start,
+                        "batch_size": 1,
+                        "first_req_id": int(r["id"]),
+                    })
+            return tasks
+
+        def _choose_task() -> Optional[Dict[str, object]]:
+            nonlocal consecutive_decode_batches
+            if self._is_fcfs_strict():
+                active = _shadow_fcfs_active()
+                if active is None:
+                    return None
+                idx = next(i for i, r in enumerate(shadow) if int(r["id"]) == int(active["id"]))
+                svc: RequestServiceEstimate = active["svc"]  # type: ignore
+                if active["state"] == "waiting_prefill":
+                    gpu_ms = float(svc.prefill_gpu_ms)
+                    pim_ms = float(svc.prefill_pim_ms)
+                    e2e_ms = float(svc.prefill_e2e_ms)
+                else:
+                    gpu_ms = float(svc.decode_gpu_ms)
+                    pim_ms = float(svc.decode_pim_ms)
+                    e2e_ms = float(svc.decode_e2e_ms)
+                ready_ms = float(active["ready_ms"])
+                start = self._predict_stage_start(ready_ms, gpu_ms, pim_ms, gpu_free, pim_free)
+                return {
+                    "phase": ("prefill" if active["state"] == "waiting_prefill" else "decode"),
+                    "idxs": [idx],
+                    "route": active["route"],
+                    "ready_ms": ready_ms,
+                    "gpu_ms": gpu_ms,
+                    "pim_ms": pim_ms,
+                    "e2e_ms": e2e_ms,
+                    "earliest_start_ms": start,
+                    "batch_size": 1,
+                    "first_req_id": int(active["id"]),
+                }
+
+            prefill_tasks = _build_prefill_tasks()
+            decode_tasks = _build_decode_tasks()
+            cands = prefill_tasks + decode_tasks
+            if not cands:
+                return None
+            if prefill_tasks:
+                if self.config.prefill_guard_ms is not None:
+                    max_prefill_wait_ms = max(max(0.0, now - float(tc["ready_ms"])) for tc in prefill_tasks)
+                    if max_prefill_wait_ms >= float(self.config.prefill_guard_ms):
+                        return _pick_prefill_task(prefill_tasks)
+                if (self.config.max_consecutive_decode_batches > 0 and
+                        consecutive_decode_batches >= int(self.config.max_consecutive_decode_batches)):
+                    return _pick_prefill_task(prefill_tasks)
+
+            def _key(tc: Dict[str, object]):
+                phase_prio = 0
+                if self.config.prompt_priority:
+                    phase_prio = 0 if tc["phase"] == "prefill" else 1
+                return (float(tc["earliest_start_ms"]),
+                        phase_prio,
+                        float(tc["ready_ms"]),
+                        int(tc["first_req_id"]))
+
+            return min(cands, key=_key)
+
+        def _pending_existing_non_lost_with_deadline() -> bool:
+            for r in shadow:
+                if int(r["id"]) == target_id:
+                    continue
+                if bool(r["is_lost"]):
+                    continue
+                if r["deadline_ms"] is None:
+                    continue
+                if r["completion_time_ms"] is None:
+                    return True
+            return False
+
+        while steps < int(self.config.admission_shadow_max_steps):
+            target = next(r for r in shadow if int(r["id"]) == target_id)
+            if target["completion_time_ms"] is not None and not _pending_existing_non_lost_with_deadline():
+                break
+            tc = _choose_task()
+            if tc is None:
+                break
+            steps += 1
+            start = float(tc["earliest_start_ms"])
+            gpu_ms = float(tc["gpu_ms"])
+            pim_ms = float(tc["pim_ms"])
+            e2e_ms = float(tc["e2e_ms"])
+            finish = start + e2e_ms
+
+            now = max(now, start)
+            if gpu_ms > 0:
+                gpu_free = max(gpu_free, start) + gpu_ms
+            if pim_ms > 0:
+                pim_free = max(pim_free, start) + pim_ms
+
+            if tc["phase"] == "prefill":
+                consecutive_decode_batches = 0
+                for i in tc["idxs"]:
+                    r = shadow[i]
+                    if r["prefill_start_ms"] is None:
+                        r["prefill_start_ms"] = start
+                    r["prefill_end_ms"] = finish
+                    if r["first_token_time_ms"] is None:
+                        r["first_token_time_ms"] = finish
+                    r["last_token_completion_ms"] = finish
+                    if int(r["remaining_decode_tokens"]) > 0:
+                        r["state"] = "waiting_decode"
+                        r["ready_ms"] = finish
+                    else:
+                        r["state"] = "done"
+                        r["completion_time_ms"] = finish
+            else:
+                consecutive_decode_batches += 1
+                for i in tc["idxs"]:
+                    r = shadow[i]
+                    if int(r["id"]) == target_id and r["first_decode_start_ms"] is None:
+                        r["first_decode_start_ms"] = start
+                    last = r["last_token_completion_ms"]
+                    if last is not None:
+                        r["tbt_intervals_ms"].append(finish - float(last))
+                    r["last_token_completion_ms"] = finish
+                    r["remaining_decode_tokens"] = int(r["remaining_decode_tokens"]) - 1
+                    r["decoded_tokens_done"] = int(r["decoded_tokens_done"]) + 1
+                    if int(r["remaining_decode_tokens"]) <= 0:
+                        r["state"] = "done"
+                        r["completion_time_ms"] = finish
+                    else:
+                        r["state"] = "waiting_decode"
+                        r["ready_ms"] = finish
+
+            if self._is_fcfs_strict() and shadow_fcfs_active_request_id is not None:
+                live = next((r for r in shadow if int(r["id"]) == shadow_fcfs_active_request_id), None)
+                if live is None or not _shadow_is_active(live):
+                    shadow_fcfs_active_request_id = None
+        else:
+            timeout = True
+
+        target = next(r for r in shadow if int(r["id"]) == target_id)
+        cand_finish = target["completion_time_ms"]
+        if cand_finish is None:
+            timeout = True
+        cand_finish_f = float(cand_finish) if cand_finish is not None else math.inf
+        cand_first_decode_start = target["first_decode_start_ms"]
+        cand_prefill_start = target["prefill_start_ms"]
+        cand_prefill_end = target["prefill_end_ms"]
+        pred_gpu_wait = 0.0
+        if cand_prefill_start is not None:
+            pred_gpu_wait = max(0.0, float(cand_prefill_start) - self.now_ms)
+        pred_pim_wait = 0.0
+        if est.uses_pim and cand_prefill_end is not None and cand_first_decode_start is not None:
+            pred_pim_wait = max(0.0, float(cand_first_decode_start) - float(cand_prefill_end))
+        tbt_vals = [float(v) for v in target["tbt_intervals_ms"]]
+        if tbt_vals:
+            cand_mean_tbt = float(sum(tbt_vals) / len(tbt_vals))
+        else:
+            cand_mean_tbt = float(est.decode_e2e_ms)
+
+        existing_ok = True
+        for r in shadow:
+            if int(r["id"]) == target_id:
+                continue
+            if bool(r["is_lost"]):
+                continue
+            d = r["deadline_ms"]
+            if d is None:
+                continue
+            c = r["completion_time_ms"]
+            if c is None or float(c) > float(d):
+                existing_ok = False
+                break
+        if existing_ok and self.config.slo_tbt_ms is not None:
+            tbt_limit = float(self.config.slo_tbt_ms)
+            for r in shadow:
+                if int(r["id"]) == target_id:
+                    continue
+                if bool(r["is_lost"]):
+                    continue
+                if int(r["remaining_decode_tokens"]) <= 0 and not r["tbt_intervals_ms"]:
+                    continue
+                svc: RequestServiceEstimate = r["svc"]  # type: ignore
+                tbt_hist = [float(v) for v in r["tbt_intervals_ms"]]
+                mean_tbt = float(sum(tbt_hist) / len(tbt_hist)) if tbt_hist else float(svc.decode_e2e_ms)
+                if mean_tbt > tbt_limit:
+                    existing_ok = False
+                    break
+        return {
+            "timeout": timeout,
+            "candidate_finish_ms": cand_finish_f,
+            "candidate_mean_tbt_ms": cand_mean_tbt,
+            "candidate_pred_gpu_wait_ms": pred_gpu_wait,
+            "candidate_pred_pim_wait_ms": pred_pim_wait,
+            "existing_non_lost_feasible": existing_ok,
+        }
+
+    def _admit_waiting_request(self,
+                               rr: ReplayRequest,
+                               route: str,
+                               est: RequestServiceEstimate,
+                               cand: RouteCandidate,
+                               reason: str):
+        rr.route = route
+        rr.admission_route = route
+        rr.route_decision_reason = reason
+        rr.svc = est
+        rr.remaining_decode_tokens = rr.svc.decode_tokens
+        rr.state = "waiting_prefill"
+        rr.ready_ms = self.now_ms
+        rr.admission_time_ms = self.now_ms
+        rr.admission_queue_wait_ms = self.now_ms - rr.arrival_ms
+        rr.admission_last_reject_reason = ""
+        rr.chosen_predicted_finish_ms = cand.predicted_finish_ms
+        rr.latest_predicted_finish_ms = cand.predicted_finish_ms
+        rr.chosen_predicted_gpu_wait_ms = cand.predicted_gpu_wait_ms
+        rr.chosen_predicted_pim_wait_ms = cand.predicted_pim_wait_ms
+        rr.chosen_slack_ms = cand.slack_ms
+        if rr.svc.mapping.clipped_lin:
+            self.mapping_clipped_lin_count += 1
+        if rr.svc.mapping.clipped_lout:
+            self.mapping_clipped_lout_count += 1
+        self._inc_route_count(rr.route, 1)
+        self.admission_queue_wait_samples_ms.append(max(0.0, self.now_ms - rr.arrival_ms))
+        if "fallback_gpu" in reason:
+            self.route_fallback_count += 1
+        self._record_debug_event(
+            "admit_route",
+            request_id=rr.request_id,
+            request_arrival_ms=rr.arrival_ms,
+            context_tokens=rr.context_tokens,
+            generated_tokens=rr.generated_tokens,
+            admission_route=rr.admission_route,
+            chosen_route=rr.route,
+            decision_reason=rr.route_decision_reason,
+            predicted_finish_ms=rr.chosen_predicted_finish_ms,
+            predicted_e2e_ms=((rr.chosen_predicted_finish_ms - rr.arrival_ms)
+                              if rr.chosen_predicted_finish_ms is not None else None),
+            predicted_gpu_wait_ms=rr.chosen_predicted_gpu_wait_ms,
+            predicted_pim_wait_ms=rr.chosen_predicted_pim_wait_ms,
+            is_lost=rr.is_lost,
+            admission_attempts=rr.admission_attempts,
+            admission_queue_wait_ms=max(0.0, self.now_ms - rr.arrival_ms),
+        )
+
+    def _process_admission_queue(self):
+        while True:
+            q = self._waiting_admission_requests()
+            if not q:
+                return
+            self.admission_queue_max_len = max(self.admission_queue_max_len, len(q))
+            rr = q[0]
+            if rr.admission_next_retry_ms > self.now_ms:
+                return
+            rr.admission_attempts += 1
+
+            route_candidates: List[RouteCandidate] = []
+            est_by_route: Dict[str, RequestServiceEstimate] = {}
+            own_feasible_flags: List[bool] = []
+            for route in self.route_order:
+                est = self._estimate_request_cached(route,
+                                                    context_tokens=rr.context_tokens,
+                                                    generated_tokens=rr.generated_tokens,
+                                                    bs=self._predicted_lookup_batch_size(route))
+                if est is None:
+                    route_candidates.append(RouteCandidate(route=route,
+                                                           eligible=False,
+                                                           uses_pim=("pim" in route),
+                                                           predicted_finish_ms=math.inf,
+                                                           predicted_gpu_wait_ms=math.inf,
+                                                           predicted_pim_wait_ms=math.inf,
+                                                           deadline_ms=rr.deadline_ms,
+                                                           slack_ms=None,
+                                                           reason="unsupported_length"))
+                    continue
+                proj = self._project_admission_candidate(rr, route, est)
+                if bool(proj["timeout"]):
+                    self.admission_shadow_timeout_count += 1
+                    route_candidates.append(RouteCandidate(route=route,
+                                                           eligible=False,
+                                                           uses_pim=est.uses_pim,
+                                                           predicted_finish_ms=math.inf,
+                                                           predicted_gpu_wait_ms=math.inf,
+                                                           predicted_pim_wait_ms=math.inf,
+                                                           deadline_ms=rr.deadline_ms,
+                                                           slack_ms=None,
+                                                           reason="shadow_timeout"))
+                    continue
+
+                finish = float(proj["candidate_finish_ms"])
+                pred_gpu_wait = float(proj["candidate_pred_gpu_wait_ms"])
+                pred_pim_wait = float(proj["candidate_pred_pim_wait_ms"])
+                own_e2e_ok = (rr.deadline_ms is None) or (finish <= rr.deadline_ms)
+                own_tbt_ok = ((self.config.slo_tbt_ms is None) or
+                              (float(proj["candidate_mean_tbt_ms"]) <= float(self.config.slo_tbt_ms)))
+                existing_ok = bool(proj["existing_non_lost_feasible"])
+                own_feasible_flags.append(own_e2e_ok)
+                eligible = own_e2e_ok and own_tbt_ok and existing_ok
+                reason = ""
+                if not own_e2e_ok:
+                    reason = "candidate_e2e_slo_miss"
+                elif not own_tbt_ok:
+                    reason = "candidate_tbt_slo_miss"
+                elif not existing_ok:
+                    reason = "existing_slo_violation"
+                slack_ms = None if rr.deadline_ms is None else (rr.deadline_ms - finish)
+                route_candidates.append(RouteCandidate(route=route,
+                                                       eligible=eligible,
+                                                       uses_pim=est.uses_pim,
+                                                       predicted_finish_ms=finish,
+                                                       predicted_gpu_wait_ms=pred_gpu_wait,
+                                                       predicted_pim_wait_ms=pred_pim_wait,
+                                                       deadline_ms=rr.deadline_ms,
+                                                       slack_ms=slack_ms,
+                                                       reason=reason))
+                est_by_route[route] = est
+
+            decision = self.policy.choose_route(route_candidates,
+                                                now_ms=self.now_ms,
+                                                deadline_ms=rr.deadline_ms)
+            cand_by_route = {c.route: c for c in route_candidates}
+            if (not decision.dropped and decision.route is not None and
+                    decision.route in est_by_route and
+                    cand_by_route.get(decision.route) is not None and
+                    cand_by_route[decision.route].eligible):
+                self._admit_waiting_request(rr,
+                                            route=decision.route,
+                                            est=est_by_route[decision.route],
+                                            cand=cand_by_route[decision.route],
+                                            reason=decision.reason)
+                continue
+
+            # Lost-but-run: own deadline infeasible for every route with estimate.
+            own_infeasible_all = bool(own_feasible_flags) and not any(own_feasible_flags)
+            if own_infeasible_all:
+                rr.is_lost = True
+                self.admission_lost_count += 1
+                admitted = [c for c in route_candidates if c.route in est_by_route]
+                if not admitted:
+                    rr.state = "dropped"
+                    rr.dropped_reason = "no_route_for_lost_request"
+                    rr.route_decision_reason = rr.dropped_reason
+                    self._record_debug_event(
+                        "admit_drop",
+                        request_id=rr.request_id,
+                        request_arrival_ms=rr.arrival_ms,
+                        context_tokens=rr.context_tokens,
+                        generated_tokens=rr.generated_tokens,
+                        decision_reason=rr.dropped_reason,
+                    )
+                    continue
+                best = min(admitted, key=lambda c: (c.predicted_finish_ms, c.route))
+                self._admit_waiting_request(rr,
+                                            route=best.route,
+                                            est=est_by_route[best.route],
+                                            cand=best,
+                                            reason="admit_lost_best_effort")
+                continue
+
+            rr.admission_last_reject_reason = decision.reason
+            retry_dt = max(0.0, float(self.config.admission_retry_interval_ms))
+            if retry_dt == 0.0:
+                retry_dt = 1e-6
+            rr.admission_next_retry_ms = self.now_ms + retry_dt
+            self.admission_reject_count += 1
+            self._record_debug_event(
+                "admission_reject",
+                request_id=rr.request_id,
+                request_arrival_ms=rr.arrival_ms,
+                context_tokens=rr.context_tokens,
+                generated_tokens=rr.generated_tokens,
+                decision_reason=decision.reason,
+                admission_attempts=rr.admission_attempts,
+                next_retry_ms=rr.admission_next_retry_ms,
+                route_candidates=[{
+                    "route": c.route,
+                    "eligible": c.eligible,
+                    "predicted_finish_ms": c.predicted_finish_ms,
+                    "predicted_gpu_wait_ms": c.predicted_gpu_wait_ms,
+                    "predicted_pim_wait_ms": c.predicted_pim_wait_ms,
+                    "reason": c.reason,
+                    "slack_ms": c.slack_ms,
+                } for c in route_candidates],
+            )
+            return
 
     def _admit_arrivals_up_to_now(self):
         while self._arrival_idx < len(self.arrivals) and self.arrivals[self._arrival_idx].arrival_ms <= self.now_ms:
@@ -650,14 +2407,35 @@ class TraceReplaySimulator:
             decision = self.policy.choose_route(candidates,
                                                now_ms=self.now_ms,
                                                deadline_ms=rr.deadline_ms)
+            cand_debug = [{
+                "route": c.route,
+                "eligible": c.eligible,
+                "uses_pim": c.uses_pim,
+                "predicted_finish_ms": c.predicted_finish_ms,
+                "predicted_gpu_wait_ms": c.predicted_gpu_wait_ms,
+                "predicted_pim_wait_ms": c.predicted_pim_wait_ms,
+                "queue_pressure_ms": c.queue_pressure_ms,
+                "slack_ms": c.slack_ms,
+                "reason": c.reason,
+            } for c in candidates]
             if decision.dropped or decision.route is None or decision.route not in est_by_route:
                 rr.state = "dropped"
                 rr.dropped_reason = decision.reason
                 rr.route_decision_reason = decision.reason
                 self.requests.append(rr)
+                self._record_debug_event(
+                    "admit_drop",
+                    request_id=rr.request_id,
+                    request_arrival_ms=rr.arrival_ms,
+                    context_tokens=rr.context_tokens,
+                    generated_tokens=rr.generated_tokens,
+                    decision_reason=decision.reason,
+                    route_candidates=cand_debug,
+                )
                 continue
 
             rr.route = decision.route
+            rr.admission_route = decision.route
             rr.route_decision_reason = decision.reason
             if "fallback_gpu" in decision.reason:
                 self.route_fallback_count += 1
@@ -665,6 +2443,7 @@ class TraceReplaySimulator:
             chosen_cand = cand_by_route.get(decision.route)
             if chosen_cand is not None:
                 rr.chosen_predicted_finish_ms = chosen_cand.predicted_finish_ms
+                rr.latest_predicted_finish_ms = chosen_cand.predicted_finish_ms
                 rr.chosen_predicted_gpu_wait_ms = chosen_cand.predicted_gpu_wait_ms
                 rr.chosen_predicted_pim_wait_ms = chosen_cand.predicted_pim_wait_ms
                 rr.chosen_queue_pressure_ms = chosen_cand.queue_pressure_ms
@@ -672,14 +2451,34 @@ class TraceReplaySimulator:
             rr.remaining_decode_tokens = rr.svc.decode_tokens
             rr.state = "waiting_prefill"
             rr.ready_ms = rr.arrival_ms
+            rr.admission_time_ms = rr.arrival_ms
+            rr.admission_queue_wait_ms = 0.0
 
             if rr.svc.mapping.clipped_lin:
                 self.mapping_clipped_lin_count += 1
             if rr.svc.mapping.clipped_lout:
                 self.mapping_clipped_lout_count += 1
 
-            self.route_counts[rr.route] = self.route_counts.get(rr.route, 0) + 1
+            self._inc_route_count(rr.route, 1)
             self.requests.append(rr)
+            self._record_debug_event(
+                "admit_route",
+                request_id=rr.request_id,
+                request_arrival_ms=rr.arrival_ms,
+                context_tokens=rr.context_tokens,
+                generated_tokens=rr.generated_tokens,
+                admission_route=rr.admission_route,
+                chosen_route=rr.route,
+                decision_reason=rr.route_decision_reason,
+                predicted_finish_ms=rr.chosen_predicted_finish_ms,
+                predicted_e2e_ms=((rr.chosen_predicted_finish_ms - rr.arrival_ms)
+                                  if rr.chosen_predicted_finish_ms is not None else None),
+                predicted_gpu_wait_ms=rr.chosen_predicted_gpu_wait_ms,
+                predicted_pim_wait_ms=rr.chosen_predicted_pim_wait_ms,
+                predicted_queue_pressure_ms=rr.chosen_queue_pressure_ms,
+                route_candidates=cand_debug,
+            )
+            self._refresh_active_predictions(cause="new_admission")
 
     def _prefill_task_for_request(self, rr: ReplayRequest) -> Optional[_TaskCandidate]:
         if rr.state != "waiting_prefill" or rr.svc is None:
@@ -707,15 +2506,10 @@ class TraceReplaySimulator:
             return None
         batch_lin = max(req.context_tokens for req in batch_reqs)
         batch_lout = max(req.generated_tokens for req in batch_reqs)
-        return self.cost_model.estimate_request(
-            route,
-            context_tokens=batch_lin,
-            generated_tokens=batch_lout,
-            bs=len(batch_reqs),
-            unsupported_policy=self.config.unsupported_policy,
-            lin_bucket=self.config.lin_bucket,
-            lout_bucket=self.config.lout_bucket,
-        )
+        return self._estimate_request_cached(route,
+                                             context_tokens=batch_lin,
+                                             generated_tokens=batch_lout,
+                                             bs=len(batch_reqs))
 
     def _build_prefill_batch_candidates(self) -> List[_TaskCandidate]:
         grouped: Dict[str, List[ReplayRequest]] = {}
@@ -798,15 +2592,10 @@ class TraceReplaySimulator:
             for batch_size in range(max_batch, 0, -1):
                 batch_reqs = cohort[:batch_size]
                 batch_lin = max(self._request_decode_context_tokens(r) for r in batch_reqs)
-                batch_est = self.cost_model.estimate_request(
-                    route,
-                    context_tokens=batch_lin,
-                    generated_tokens=2,
-                    bs=batch_size,
-                    unsupported_policy=self.config.unsupported_policy,
-                    lin_bucket=self.config.lin_bucket,
-                    lout_bucket=self.config.lout_bucket,
-                )
+                batch_est = self._estimate_request_cached(route,
+                                                          context_tokens=batch_lin,
+                                                          generated_tokens=2,
+                                                          bs=batch_size)
                 if batch_est is None:
                     continue
                 earliest_start = self._predict_stage_start(
@@ -829,7 +2618,85 @@ class TraceReplaySimulator:
                 break
         return cands
 
+    def _build_fcfs_prefix_decode_task(self) -> Optional[_TaskCandidate]:
+        decode_q = self._fcfs_decode_queue()
+        if not decode_q:
+            return None
+
+        head = decode_q[0]
+        cutoff_ms = max(self.now_ms, head.ready_ms)
+        prefix = [head]
+        if self.config.enable_decode_batching:
+            for rr in decode_q[1:]:
+                if len(prefix) >= int(self.config.max_decode_batch_size):
+                    break
+                if rr.route != head.route:
+                    break
+                if rr.ready_ms > cutoff_ms:
+                    break
+                prefix.append(rr)
+
+        if not self.config.enable_decode_batching:
+            prefix = [head]
+
+        batch_reqs: List[ReplayRequest] = []
+        gpu_ms = pim_ms = e2e_ms = 0.0
+        for batch_size in range(len(prefix), 0, -1):
+            batch_reqs = prefix[:batch_size]
+            if batch_size == 1:
+                rr = batch_reqs[0]
+                if rr.svc is None:
+                    continue
+                gpu_ms = rr.svc.decode_gpu_ms
+                pim_ms = rr.svc.decode_pim_ms
+                e2e_ms = rr.svc.decode_e2e_ms
+                break
+            batch_lin = max(self._request_decode_context_tokens(r) for r in batch_reqs)
+            batch_est = self._estimate_request_cached(head.route or "unknown",
+                                                      context_tokens=batch_lin,
+                                                      generated_tokens=2,
+                                                      bs=batch_size)
+            if batch_est is None:
+                continue
+            gpu_ms = batch_est.decode_gpu_ms
+            pim_ms = batch_est.decode_pim_ms
+            e2e_ms = batch_est.decode_e2e_ms
+            break
+
+        if not batch_reqs:
+            return None
+
+        earliest_start = self._predict_stage_start(cutoff_ms, gpu_ms, pim_ms,
+                                                   self.gpu_free_ms, self.pim_free_ms)
+        return _TaskCandidate(requests=list(batch_reqs),
+                              route=(head.route or "unknown"),
+                              phase="decode",
+                              ready_ms=cutoff_ms,
+                              gpu_ms=gpu_ms,
+                              pim_ms=pim_ms,
+                              e2e_ms=e2e_ms,
+                              earliest_start_ms=earliest_start,
+                              predicted_finish_ms=earliest_start + e2e_ms,
+                              batch_size=len(batch_reqs))
+
     def _choose_next_task(self) -> Optional[_TaskCandidate]:
+        if self._is_fcfs_strict():
+            rr = self._fcfs_active_request()
+            if rr is None:
+                return None
+            if rr.state == "waiting_prefill":
+                return self._prefill_task_for_request(rr)
+            if rr.state == "waiting_decode":
+                return self._single_decode_task_for_request(rr)
+            self.fcfs_active_request_id = None
+            return None
+
+        if self._is_prefill_priority_fcfs_decode():
+            rr = self._pick_oldest_prefill_request()
+            if rr is not None:
+                return self._prefill_task_for_request(rr)
+            return self._build_fcfs_prefix_decode_task()
+
         prefill_tasks: List[_TaskCandidate] = []
         if self.config.enable_prefill_batching:
             prefill_tasks.extend(self._build_prefill_batch_candidates())
@@ -885,17 +2752,22 @@ class TraceReplaySimulator:
         if tc.phase == "prefill":
             self.prefill_batch_sizes.append(tc.batch_size)
             self.consecutive_decode_batches = 0
+            rebound_changed = False
             for rr in tc.requests:
                 rr.prefill_start_ms = tc.earliest_start_ms
                 rr.prefill_end_ms = finish_ms
                 rr.first_token_time_ms = finish_ms
                 rr.last_token_completion_ms = finish_ms
                 if rr.remaining_decode_tokens > 0:
-                    rr.state = "waiting_decode"
-                    rr.ready_ms = finish_ms
+                    self._transition_to_waiting_decode(rr, ready_ms=finish_ms)
+                    old_route = rr.route
+                    self._maybe_rebind_decode_route(rr, decision_time_ms=finish_ms)
+                    rebound_changed = rebound_changed or (old_route != rr.route)
                 else:
                     rr.state = "done"
                     rr.completion_time_ms = finish_ms
+            if rebound_changed:
+                self._refresh_active_predictions(cause="decode_rebind")
         else:
             self.decode_batch_sizes.append(tc.batch_size)
             self.consecutive_decode_batches += 1
@@ -912,33 +2784,110 @@ class TraceReplaySimulator:
                     rr.state = "waiting_decode"
                     rr.ready_ms = finish_ms
 
+        self._refresh_fcfs_active_request()
+
     def run(self) -> ReplaySummary:
         self.now_ms = 0.0
         if self.arrivals:
             self.now_ms = min(0.0, self.arrivals[0].arrival_ms)
 
         while True:
-            self._admit_arrivals_up_to_now()
+            if self.config.enable_predictive_admission:
+                self._enqueue_arrivals_up_to_now()
+                self._process_admission_queue()
+            else:
+                self._admit_arrivals_up_to_now()
 
             task = self._choose_next_task()
             next_arrival_ms = None
             if self._arrival_idx < len(self.arrivals):
                 next_arrival_ms = self.arrivals[self._arrival_idx].arrival_ms
+            next_retry_ms = None
+            if self.config.enable_predictive_admission:
+                waiting = self._waiting_admission_requests()
+                if waiting:
+                    next_retry_ms = waiting[0].admission_next_retry_ms
 
             if task is None:
-                if next_arrival_ms is None:
+                next_event_ms = None
+                for t in (next_arrival_ms, next_retry_ms):
+                    if t is None:
+                        continue
+                    next_event_ms = t if next_event_ms is None else min(next_event_ms, t)
+                if next_event_ms is None:
                     break
-                self.now_ms = max(self.now_ms, next_arrival_ms)
+                self._record_debug_event(
+                    "advance_to_event",
+                    next_event_ms=next_event_ms,
+                    next_arrival_ms=next_arrival_ms,
+                    next_retry_ms=next_retry_ms,
+                )
+                self.now_ms = max(self.now_ms, next_event_ms)
                 continue
 
             # Let earlier arrivals enter before scheduling a later-start task.
-            if next_arrival_ms is not None and next_arrival_ms < task.earliest_start_ms:
-                self.now_ms = max(self.now_ms, next_arrival_ms)
+            next_event_ms = None
+            for t in (next_arrival_ms, next_retry_ms):
+                if t is None:
+                    continue
+                next_event_ms = t if next_event_ms is None else min(next_event_ms, t)
+            if next_event_ms is not None and next_event_ms < task.earliest_start_ms:
+                self._record_debug_event(
+                    "yield_for_event",
+                    next_arrival_ms=next_arrival_ms,
+                    next_retry_ms=next_retry_ms,
+                    task_earliest_start_ms=task.earliest_start_ms,
+                    task_phase=task.phase,
+                    task_route=task.route,
+                    task_batch_size=task.batch_size,
+                    task_request_ids=[r.request_id for r in task.requests],
+                )
+                self.now_ms = max(self.now_ms, next_event_ms)
                 continue
 
+            before_states = [{
+                "request_id": rr.request_id,
+                "state": rr.state,
+                "remaining_decode_tokens": rr.remaining_decode_tokens,
+                "ready_ms": rr.ready_ms,
+            } for rr in task.requests]
+            self._record_debug_event(
+                "dispatch_task",
+                phase=task.phase,
+                route=task.route,
+                batch_size=task.batch_size,
+                request_ids=[r.request_id for r in task.requests],
+                task_ready_ms=task.ready_ms,
+                task_earliest_start_ms=task.earliest_start_ms,
+                task_gpu_ms=task.gpu_ms,
+                task_pim_ms=task.pim_ms,
+                task_e2e_ms=task.e2e_ms,
+                task_predicted_finish_ms=task.predicted_finish_ms,
+                request_states_before=before_states,
+            )
             self.now_ms = max(self.now_ms, task.earliest_start_ms)
             self._reserve_resources(task.earliest_start_ms, task.gpu_ms, task.pim_ms)
             self._complete_task(task)
+            finish_ms = task.earliest_start_ms + task.e2e_ms
+            after_states = [{
+                "request_id": rr.request_id,
+                "state": rr.state,
+                "remaining_decode_tokens": rr.remaining_decode_tokens,
+                "ready_ms": rr.ready_ms,
+                "completion_time_ms": rr.completion_time_ms,
+                "prefill_start_ms": rr.prefill_start_ms,
+                "prefill_end_ms": rr.prefill_end_ms,
+                "last_token_completion_ms": rr.last_token_completion_ms,
+            } for rr in task.requests]
+            self._record_debug_event(
+                "complete_task",
+                phase=task.phase,
+                route=task.route,
+                batch_size=task.batch_size,
+                request_ids=[r.request_id for r in task.requests],
+                finish_ms=finish_ms,
+                request_states_after=after_states,
+            )
 
         makespan_ms = 0.0
         if self.requests:
@@ -1011,11 +2960,33 @@ class TraceReplaySimulator:
             "max_batch_size": float(max(self.decode_batch_sizes)) if self.decode_batch_sizes else 0.0,
             "num_decode_steps": float(len(self.decode_batch_sizes)),
         }
+        admission_queue = {
+            "max_len": float(self.admission_queue_max_len),
+            "mean_wait_ms": (float(sum(self.admission_queue_wait_samples_ms) /
+                                   len(self.admission_queue_wait_samples_ms))
+                             if self.admission_queue_wait_samples_ms else 0.0),
+        }
+        admission = {
+            "reject_count": float(self.admission_reject_count),
+            "lost_count": float(self.admission_lost_count),
+            "shadow_timeout_count": float(self.admission_shadow_timeout_count),
+        }
         local_scheduling = {
+            "local_scheduling_policy": self.config.local_scheduling_policy,
+            "fcfs_decode_prediction_mode": self.config.fcfs_decode_prediction_mode,
             "prefill_guard_ms": (float(self.config.prefill_guard_ms)
                                   if self.config.prefill_guard_ms is not None else math.nan),
             "max_consecutive_decode_batches": float(self.config.max_consecutive_decode_batches),
             "decode_batch_cap_with_prefill": float(self.config.decode_batch_cap_with_prefill),
+            "enable_decode_rebind": float(self.config.enable_decode_rebind),
+            "decode_rebind_margin_ms": float(self.config.decode_rebind_margin_ms),
+            "decode_rebind_attempt_count": float(sum(1 for r in self.requests if r.decode_rebind_attempted)),
+            "decode_rebound_count": float(sum(1 for r in self.requests if r.decode_rebound)),
+            "enable_predictive_admission": float(self.config.enable_predictive_admission),
+            "slo_tbt_ms": (float(self.config.slo_tbt_ms)
+                            if self.config.slo_tbt_ms is not None else math.nan),
+            "admission_shadow_max_steps": float(self.config.admission_shadow_max_steps),
+            "admission_retry_interval_ms": float(self.config.admission_retry_interval_ms),
             "prefill_guard_trigger_count": float(self.prefill_guard_trigger_count),
             "decode_limit_trigger_count": float(self.decode_limit_trigger_count),
         }
@@ -1042,6 +3013,8 @@ class TraceReplaySimulator:
             slo_e2e_miss_rate=e2e_miss,
             prefill_batching=prefill_batching,
             decode_batching=decode_batching,
+            admission_queue=admission_queue,
+            admission=admission,
             local_scheduling=local_scheduling,
         )
 
@@ -1063,9 +3036,15 @@ class TraceReplaySimulator:
                 "context_tokens": r.context_tokens,
                 "generated_tokens": r.generated_tokens,
                 "route": r.route,
+                "admission_route": r.admission_route,
                 "state": r.state,
                 "route_decision_reason": r.route_decision_reason,
                 "dropped_reason": r.dropped_reason,
+                "admission_time_ms": r.admission_time_ms,
+                "admission_queue_wait_ms": r.admission_queue_wait_ms,
+                "admission_attempts": r.admission_attempts,
+                "admission_last_reject_reason": r.admission_last_reject_reason,
+                "is_lost": r.is_lost,
                 "ttft_ms": ttft,
                 "prefill_wait_ms": prefill_wait,
                 "e2e_ms": e2e,
@@ -1079,10 +3058,20 @@ class TraceReplaySimulator:
                 "clipped_lout": (r.svc.mapping.clipped_lout if r.svc else None),
                 "deadline_ms": r.deadline_ms,
                 "chosen_predicted_finish_ms": r.chosen_predicted_finish_ms,
+                "latest_predicted_finish_ms": r.latest_predicted_finish_ms,
                 "chosen_predicted_gpu_wait_ms": r.chosen_predicted_gpu_wait_ms,
                 "chosen_predicted_pim_wait_ms": r.chosen_predicted_pim_wait_ms,
                 "chosen_queue_pressure_ms": r.chosen_queue_pressure_ms,
                 "chosen_slack_ms": r.chosen_slack_ms,
+                "decode_bind_time_ms": r.decode_bind_time_ms,
+                "decode_rebind_attempted": r.decode_rebind_attempted,
+                "decode_rebound": r.decode_rebound,
+                "decode_rebind_reason": r.decode_rebind_reason,
+                "decode_enqueue_seq": r.decode_enqueue_seq,
+                "prediction_refresh_count": r.prediction_refresh_count,
                 "decoded_tokens_done": r.decoded_tokens_done,
             })
         return pd.DataFrame(rows)
+
+    def debug_events_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame(self.debug_events)

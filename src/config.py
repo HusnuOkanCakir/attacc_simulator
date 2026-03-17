@@ -171,11 +171,14 @@ def make_pim_config(pim_type: PIMType,
                     num_hbm=5,
                     bw_scale=None,
                     power_constraint=False,
+                    attn_atomic_pim=True,
                     yaml_target="hbm3-pim",
                     channel_count=16):
     config = {}
     config["PIM_TYPE"] = pim_type
     config["POWER_CONSTRAINT"] = power_constraint
+    # Charge attention (score+softmax+context) once on PIM by default.
+    config["ATTN_ATOMIC_PIM"] = bool(attn_atomic_pim)
     config["ENERGY_TABLE"] = ENERGY_TABLE['PIM'][pim_type]
     config["YAML_TARGET"] = yaml_target
     config["CHANNEL_COUNT"] = channel_count
