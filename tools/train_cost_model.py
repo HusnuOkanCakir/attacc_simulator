@@ -26,9 +26,11 @@ TARGET_NAMES = [
     "prefill_e2e_ms",
     "prefill_gpu_ms",
     "prefill_pim_ms",
+    "prefill_energy_nj",
     "decode_e2e_ms",
     "decode_gpu_ms",
     "decode_pim_ms",
+    "decode_energy_nj",
 ]
 
 
@@ -64,9 +66,11 @@ def _build_training_frame(route: str,
             "prefill_e2e_ms": point.prefill_e2e_ms,
             "prefill_gpu_ms": point.prefill_gpu_ms,
             "prefill_pim_ms": point.prefill_pim_ms,
+            "prefill_energy_nj": point.prefill_energy_nj,
             "decode_e2e_ms": point.decode_e2e_ms,
             "decode_gpu_ms": point.decode_gpu_ms,
             "decode_pim_ms": point.decode_pim_ms,
+            "decode_energy_nj": point.decode_energy_nj,
         })
     df = pd.DataFrame(rows)
     if df.empty:

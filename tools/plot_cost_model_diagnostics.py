@@ -25,9 +25,11 @@ TARGET_NAMES = [
     "prefill_e2e_ms",
     "prefill_gpu_ms",
     "prefill_pim_ms",
+    "prefill_energy_nj",
     "decode_e2e_ms",
     "decode_gpu_ms",
     "decode_pim_ms",
+    "decode_energy_nj",
 ]
 
 
@@ -59,9 +61,11 @@ def _build_training_frame(route: str,
             "prefill_e2e_ms": point.prefill_e2e_ms,
             "prefill_gpu_ms": point.prefill_gpu_ms,
             "prefill_pim_ms": point.prefill_pim_ms,
+            "prefill_energy_nj": point.prefill_energy_nj,
             "decode_e2e_ms": point.decode_e2e_ms,
             "decode_gpu_ms": point.decode_gpu_ms,
             "decode_pim_ms": point.decode_pim_ms,
+            "decode_energy_nj": point.decode_energy_nj,
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -85,11 +89,12 @@ def _metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str, float]:
 def _plot_pred_vs_actual(route: str,
                          df: pd.DataFrame,
                          preds: pd.DataFrame,
+                         targets: Sequence[str],
                          out_path: Path,
                          metric_map: Dict[str, Dict[str, float]]) -> None:
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
     axes = axes.flatten()
-    for ax, target in zip(axes, TARGET_NAMES):
+    for ax, target in zip(axes, targets):
         x = df[target]
         y = preds[target]
         lo = min(float(x.min()), float(y.min()))
@@ -98,9 +103,11 @@ def _plot_pred_vs_actual(route: str,
         ideal_line, = ax.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1, label="Ideal prediction (y=x)")
         m = metric_map[target]
         ax.set_title(f"{target}\nR2={m['r2']:.3f} MAE={m['mae']:.4f}")
-        ax.set_xlabel("Actual cost (ms)")
-        ax.set_ylabel("Predicted cost (ms)")
+        ax.set_xlabel("Actual value")
+        ax.set_ylabel("Predicted value")
         ax.legend(handles=[points, ideal_line], loc="best", fontsize=8)
+    for ax in axes[len(targets):]:
+        ax.axis("off")
     fig.suptitle(f"{route}: Predicted vs Actual")
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,10 +180,11 @@ def main() -> int:
                                    sum_offload_to_pim=args.sum_offload_to_pim)
         bundle = _load_bundle(route_to_model[route])
         features = df[FEATURE_NAMES]
+        available_targets = [target for target in TARGET_NAMES if target in bundle["estimators"]]
 
         preds = {}
         metrics = {}
-        for target in TARGET_NAMES:
+        for target in available_targets:
             model = bundle["estimators"][target]
             pred = pd.Series(model.predict(features), index=df.index)
             preds[target] = pred
@@ -186,6 +194,7 @@ def main() -> int:
         _plot_pred_vs_actual(route=route,
                              df=df,
                              preds=pred_df,
+                             targets=available_targets,
                              out_path=args.out_dir / f"{route}_pred_vs_actual.png",
                              metric_map=metrics)
         _plot_error_by_shape(route=route,

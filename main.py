@@ -26,7 +26,7 @@ def write_csv(logfile, perfs):
                 'g_flops', 's_time', 's_matmul', 's_fc', 's_comm', 's_softmax',
                 's_act', 's_lnorm', 'g_time (ms)', 'g_matmul', 'g_fc', 'g_comm',
                 'g_etc', 'g_qkv_time', 'g_prj_time', 'g_ff_time', 'g2g_comm',
-                'c2g_comm', 'g_softmax', 'g_act', 'g_lnorm', 'g_energy (nJ)',
+                'c2g_comm', 'g_softmax', 'g_act', 'g_lnorm', 's_energy (nJ)', 'g_energy (nJ)',
                 'g_dram_energy', 'g_l2_energy', 'g_l1_energy', 'g_reg_energy',
                 'g_alu_energy', 'g_fc_mem_energy', 'g_fc_comp_energy',
                 'g_attn_mem_energy', 'g_attn_comp_energy', 'g_etc_mem_energy',

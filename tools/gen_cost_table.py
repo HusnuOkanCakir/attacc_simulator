@@ -93,6 +93,15 @@ SWEEP_PRESETS: Dict[str, Dict[str, str]] = {
         "batch_values": "1,2,4,8",
         "description": "Wide Azure-inspired sweep for heterogeneous request lengths.",
     },
+    "azure-wide-energy": {
+        # Same shape coverage as azure-wide, but includes larger batch sizes to
+        # train energy-aware interpolation for fuller continuous batches.
+        "lin_values": "1:1024:64,1152:4096:128,4352:8000:256",
+        "lout_values": "2:64:4,72:128:8,144:200:16",
+        "batch_values": "1,2,4,8,16,32",
+        "description": ("Wide Azure-inspired sweep with larger batch sizes for "
+                        "full-request latency+energy modeling."),
+    },
 }
 
 

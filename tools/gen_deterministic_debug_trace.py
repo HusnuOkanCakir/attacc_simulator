@@ -45,6 +45,32 @@ def _scenario_heavy_sparse() -> List[Tuple[int, int, int]]:
     ]
 
 
+def _scenario_heavy_sparse16() -> List[Tuple[int, int, int]]:
+    # (arrival_ms, context_tokens, generated_tokens)
+    # 16-request extension of heavy_sparse designed for larger decode batches:
+    # - first 8 arrive in a tight burst to build decode pressure
+    # - next 8 arrive while the system is already busy
+    # - outputs stay long enough that larger max batch sizes can matter
+    return [
+        (0, 867, 180),
+        (2, 867, 170),
+        (4, 867, 160),
+        (6, 867, 150),
+        (8, 867, 140),
+        (10, 867, 130),
+        (12, 867, 120),
+        (14, 867, 110),
+        (60, 867, 150),
+        (70, 867, 140),
+        (80, 867, 130),
+        (90, 867, 120),
+        (110, 867, 110),
+        (130, 867, 100),
+        (160, 867, 90),
+        (200, 867, 80),
+    ]
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Generate a deterministic request trace CSV compatible with run_trace_replay.py")
@@ -53,7 +79,7 @@ def main() -> int:
                    default=Path("cluster_outputs/debug_trace_deterministic.csv"),
                    help="Output CSV path")
     p.add_argument("--scenario",
-                   choices=["overlap", "heavy_sparse"],
+                   choices=["overlap", "heavy_sparse", "heavy_sparse16"],
                    default="overlap",
                    help="Deterministic scenario preset")
     p.add_argument("--base-time",
@@ -66,6 +92,8 @@ def main() -> int:
         rows = _scenario_overlap()
     elif args.scenario == "heavy_sparse":
         rows = _scenario_heavy_sparse()
+    elif args.scenario == "heavy_sparse16":
+        rows = _scenario_heavy_sparse16()
     else:
         raise ValueError(f"Unsupported scenario: {args.scenario}")
 

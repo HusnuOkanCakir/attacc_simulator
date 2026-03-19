@@ -136,10 +136,14 @@ def main() -> int:
                    action="store_true",
                    help=("Enable throttLLeM-style predictive admission gate. "
                          "Arrivals enter waiting_admission and are admitted only when feasible."))
+    p.add_argument("--enable-slo-guarded-admission",
+                   action="store_true",
+                   help=("Enable deferred SLO-aware admission with admissible bypass on top of "
+                         "prefill_priority_fcfs_decode + incremental prediction."))
     p.add_argument("--slo-tbt-ms",
                    type=float,
                    default=None,
-                   help="Optional TBT SLO threshold used by predictive admission gate")
+                   help="Optional TBT SLO threshold used by admission control")
     p.add_argument("--admission-shadow-max-steps",
                    type=int,
                    default=10000,
@@ -148,6 +152,38 @@ def main() -> int:
                    type=float,
                    default=0.0,
                    help="Delay before retrying rejected admission queue head (0=recheck every cycle)")
+    p.add_argument("--admission-max-harmed-requests",
+                   type=int,
+                   default=0,
+                   help="Maximum number of existing active requests that may see increased E2E miss")
+    p.add_argument("--admission-max-total-harm-ms",
+                   type=float,
+                   default=0.0,
+                   help="Maximum total incremental E2E miss across existing active requests")
+    p.add_argument("--admission-max-single-harm-ms",
+                   type=float,
+                   default=0.0,
+                   help="Maximum incremental E2E miss allowed for any one existing active request")
+    p.add_argument("--admission-max-own-miss-ms",
+                   type=float,
+                   default=0.0,
+                   help="Maximum E2E miss allowed for the candidate request itself")
+    p.add_argument("--admission-max-bypass-count",
+                   type=int,
+                   default=0,
+                   help="Force best-effort admission once a queued request has been bypassed this many times")
+    p.add_argument("--admission-max-wait-ms",
+                   type=float,
+                   default=0.0,
+                   help="Force best-effort admission once queue wait reaches this threshold")
+    p.add_argument("--admission-aging-harm-ms-per-ms",
+                   type=float,
+                   default=0.0,
+                   help="Linear relaxation rate for total/single harm budgets as queue wait grows")
+    p.add_argument("--admission-aging-harmed-requests-per-ms",
+                   type=float,
+                   default=0.0,
+                   help="Linear relaxation rate for harmed-request-count budget as queue wait grows")
     p.add_argument("--sum-offload-to-pim",
                    action="store_true",
                    help="Interpret hybrid profiles as if sum/prefill stage is split across GPU+PIM")
@@ -176,12 +212,21 @@ def main() -> int:
                    help=("v2.1 additive penalty proportional to pending decode tokens, "
                          "scaled by the route's per-token decode latency."))
     p.add_argument("--route-policy",
-                   choices=["min_finish", "slack_then_finish"],
+                   choices=["min_finish", "slack_then_finish", "latency_guarded_energy"],
                    default="min_finish",
                    help=("Admission-time route policy. "
                          "min_finish: smallest predicted finish time. "
                          "slack_then_finish: prefer routes that meet the E2E deadline, "
-                         "otherwise choose least lateness."))
+                         "otherwise choose least lateness. "
+                         "latency_guarded_energy: choose the lowest-energy route within "
+                         "an absolute finish-time guard of the fastest route."))
+    p.add_argument("--energy-latency-guard-ms",
+                   type=float,
+                   default=5.0,
+                   help=("Absolute finish-time guard used by --route-policy "
+                         "latency_guarded_energy. Among routes within this guard "
+                         "of the fastest predicted finish, choose the lowest "
+                         "incremental forecasted energy route."))
     p.add_argument("--no-prompt-priority",
                    action="store_true",
                    help="Disable prompt/prefill prioritization in local scheduling")
@@ -223,18 +268,35 @@ def main() -> int:
             raise ValueError(f"Route '{r}' is unavailable for --cost-model {args.cost_model}")
     if args.route_policy == "slack_then_finish" and args.slo_e2e_ms is None:
         raise ValueError("--route-policy slack_then_finish requires --slo-e2e-ms")
+    if args.route_policy == "latency_guarded_energy":
+        if args.local_scheduling_policy != "prefill_priority_fcfs_decode":
+            raise ValueError("--route-policy latency_guarded_energy requires --local-scheduling-policy prefill_priority_fcfs_decode")
+        if args.fcfs_decode_prediction_mode != "incremental":
+            raise ValueError("--route-policy latency_guarded_energy requires --fcfs-decode-prediction-mode incremental")
     if args.enable_predictive_admission:
         if args.slo_e2e_ms is None:
             raise ValueError("--enable-predictive-admission requires --slo-e2e-ms")
         if args.slo_tbt_ms is None:
             raise ValueError("--enable-predictive-admission requires --slo-tbt-ms")
+    if args.enable_slo_guarded_admission:
+        if args.slo_e2e_ms is None:
+            raise ValueError("--enable-slo-guarded-admission requires --slo-e2e-ms")
+        if args.slo_tbt_ms is None:
+            raise ValueError("--enable-slo-guarded-admission requires --slo-tbt-ms")
     if args.local_scheduling_policy == "prefill_priority_fcfs_decode":
         if args.enable_predictive_admission:
             raise SystemExit("prefill_priority_fcfs_decode does not support --enable-predictive-admission")
+        if args.enable_slo_guarded_admission and args.fcfs_decode_prediction_mode != "incremental":
+            raise SystemExit("slo_guarded_admission requires --fcfs-decode-prediction-mode incremental")
         if args.enable_prefill_batching:
             raise SystemExit("prefill_priority_fcfs_decode does not support --enable-prefill-batching")
-    elif args.fcfs_decode_prediction_mode != "shadow":
-        raise SystemExit("--fcfs-decode-prediction-mode only applies to --local-scheduling-policy prefill_priority_fcfs_decode")
+    else:
+        if args.fcfs_decode_prediction_mode != "shadow":
+            raise SystemExit("--fcfs-decode-prediction-mode only applies to --local-scheduling-policy prefill_priority_fcfs_decode")
+        if args.enable_slo_guarded_admission:
+            raise SystemExit("--enable-slo-guarded-admission requires --local-scheduling-policy prefill_priority_fcfs_decode")
+    if args.enable_predictive_admission and args.enable_slo_guarded_admission:
+        raise SystemExit("--enable-predictive-admission and --enable-slo-guarded-admission are mutually exclusive")
 
     arrivals = load_azure_llm_trace(args.azure_trace,
                                     limit=args.limit,
@@ -254,7 +316,8 @@ def main() -> int:
         cost_model = LearnedCostModel.from_pickles(route_to_ml)
     policy = QueueAwareFinishTimePolicy(
         pim_wait_threshold_ms=args.pim_wait_threshold_ms,
-        route_policy=args.route_policy)
+        route_policy=args.route_policy,
+        energy_latency_guard_ms=max(0.0, args.energy_latency_guard_ms))
     cfg = ReplayConfig(unsupported_policy=args.unsupported_policy,
                        lin_bucket=args.lin_bucket,
                        lout_bucket=args.lout_bucket,
@@ -271,9 +334,18 @@ def main() -> int:
                        enable_decode_rebind=args.enable_decode_rebind,
                        decode_rebind_margin_ms=max(0.0, args.decode_rebind_margin_ms),
                        enable_predictive_admission=args.enable_predictive_admission,
+                       enable_slo_guarded_admission=args.enable_slo_guarded_admission,
                        slo_tbt_ms=args.slo_tbt_ms,
                        admission_shadow_max_steps=max(1, args.admission_shadow_max_steps),
                        admission_retry_interval_ms=max(0.0, args.admission_retry_interval_ms),
+                       admission_max_harmed_requests=max(0, args.admission_max_harmed_requests),
+                       admission_max_total_harm_ms=max(0.0, args.admission_max_total_harm_ms),
+                       admission_max_single_harm_ms=max(0.0, args.admission_max_single_harm_ms),
+                       admission_max_own_miss_ms=max(0.0, args.admission_max_own_miss_ms),
+                       admission_max_bypass_count=max(0, args.admission_max_bypass_count),
+                       admission_max_wait_ms=max(0.0, args.admission_max_wait_ms),
+                       admission_aging_harm_ms_per_ms=max(0.0, args.admission_aging_harm_ms_per_ms),
+                       admission_aging_harmed_requests_per_ms=max(0.0, args.admission_aging_harmed_requests_per_ms),
                        prompt_priority=(not args.no_prompt_priority),
                        slo_e2e_ms=args.slo_e2e_ms,
                        slo_ttft_ms=args.slo_ttft_ms,

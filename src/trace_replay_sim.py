@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 import pandas as pd
 
@@ -20,9 +20,11 @@ class RouteServicePoint:
     prefill_e2e_ms: float
     prefill_gpu_ms: float
     prefill_pim_ms: float
+    prefill_energy_nj: float
     decode_e2e_ms: float
     decode_gpu_ms: float
     decode_pim_ms: float
+    decode_energy_nj: float
     source_file: str
 
     @property
@@ -54,9 +56,11 @@ class RequestServiceEstimate:
     prefill_e2e_ms: float
     prefill_gpu_ms: float
     prefill_pim_ms: float
+    prefill_energy_nj: float
     decode_e2e_ms: float
     decode_gpu_ms: float
     decode_pim_ms: float
+    decode_energy_nj: float
     mapping: LookupResult
 
 
@@ -75,7 +79,13 @@ class ReplayRequest:
     admission_time_ms: Optional[float] = None
     admission_queue_wait_ms: Optional[float] = None
     admission_attempts: int = 0
+    admission_bypass_count: int = 0
     admission_last_reject_reason: str = ""
+    admission_last_harmed_count: int = 0
+    admission_last_total_harm_ms: float = 0.0
+    admission_last_single_harm_ms: float = 0.0
+    admission_last_own_miss_ms: float = 0.0
+    admission_forced_best_effort: bool = False
     is_lost: bool = False
     remaining_decode_tokens: int = 0
     decoded_tokens_done: int = 0
@@ -84,6 +94,8 @@ class ReplayRequest:
     latest_predicted_finish_ms: Optional[float] = None
     chosen_predicted_gpu_wait_ms: Optional[float] = None
     chosen_predicted_pim_wait_ms: Optional[float] = None
+    chosen_predicted_incremental_energy_nj: Optional[float] = None
+    chosen_predicted_incremental_decode_energy_nj: Optional[float] = None
     chosen_queue_pressure_ms: Optional[float] = None
     chosen_slack_ms: Optional[float] = None
     decode_bind_time_ms: Optional[float] = None
@@ -126,9 +138,18 @@ class ReplayConfig:
     enable_decode_rebind: bool = False
     decode_rebind_margin_ms: float = 0.0
     enable_predictive_admission: bool = False
+    enable_slo_guarded_admission: bool = False
     slo_tbt_ms: Optional[float] = None
     admission_shadow_max_steps: int = 10000
     admission_retry_interval_ms: float = 0.0
+    admission_max_harmed_requests: int = 0
+    admission_max_total_harm_ms: float = 0.0
+    admission_max_single_harm_ms: float = 0.0
+    admission_max_own_miss_ms: float = 0.0
+    admission_max_bypass_count: int = 0
+    admission_max_wait_ms: float = 0.0
+    admission_aging_harm_ms_per_ms: float = 0.0
+    admission_aging_harmed_requests_per_ms: float = 0.0
     prompt_priority: bool = True
     slo_e2e_ms: Optional[float] = None
     slo_ttft_ms: Optional[float] = None
@@ -159,6 +180,23 @@ class CostModelProtocol(Protocol):
                          unsupported_policy: str,
                          lin_bucket: int,
                          lout_bucket: int) -> Optional["RequestServiceEstimate"]:
+        ...
+
+    def supports_decode_energy(self, route: Optional[str] = None) -> bool:
+        ...
+
+    def supports_prefill_energy(self, route: Optional[str] = None) -> bool:
+        ...
+
+    def estimate_requests_batch(self,
+                                route: str,
+                                requests: Sequence[Tuple[int, int, int]],
+                                unsupported_policy: str,
+                                lin_bucket: int,
+                                lout_bucket: int) -> List[Optional["RequestServiceEstimate"]]:
+        ...
+
+    def stats(self) -> Dict[str, float]:
         ...
 
 
@@ -196,15 +234,31 @@ class OutputCsvCostModel:
 
     def __init__(self,
                  route_points: Dict[str, List[RouteServicePoint]],
-                 sum_offload_to_pim: bool = False):
+                 sum_offload_to_pim: bool = False,
+                 route_has_decode_energy: Optional[Dict[str, bool]] = None,
+                 route_has_prefill_energy: Optional[Dict[str, bool]] = None):
         self.route_points = route_points
         self.sum_offload_to_pim = sum_offload_to_pim
+        if route_has_decode_energy is None:
+            route_has_decode_energy = {
+                route: any(p.decode_energy_nj > 0.0 for p in points)
+                for route, points in route_points.items()
+            }
+        if route_has_prefill_energy is None:
+            route_has_prefill_energy = {
+                route: any(p.prefill_energy_nj > 0.0 for p in points)
+                for route, points in route_points.items()
+            }
+        self.route_has_decode_energy = route_has_decode_energy
+        self.route_has_prefill_energy = route_has_prefill_energy
 
     @classmethod
     def from_route_csvs(cls,
                         route_to_csv: Dict[str, str],
                         sum_offload_to_pim: bool = False) -> "OutputCsvCostModel":
         route_points: Dict[str, List[RouteServicePoint]] = {}
+        route_has_decode_energy: Dict[str, bool] = {}
+        route_has_prefill_energy: Dict[str, bool] = {}
         for route, csv_path in route_to_csv.items():
             df = pd.read_csv(csv_path)
             missing = cls.REQUIRED_COLUMNS - set(df.columns)
@@ -217,7 +271,12 @@ class OutputCsvCostModel:
             if not points:
                 raise ValueError(f"{csv_path}: no rows found")
             route_points[route] = points
-        return cls(route_points, sum_offload_to_pim=sum_offload_to_pim)
+            route_has_decode_energy[route] = "g_energy (nJ)" in df.columns
+            route_has_prefill_energy[route] = "s_energy (nJ)" in df.columns
+        return cls(route_points,
+                   sum_offload_to_pim=sum_offload_to_pim,
+                   route_has_decode_energy=route_has_decode_energy,
+                   route_has_prefill_energy=route_has_prefill_energy)
 
     @staticmethod
     def _safe_float(row, key: str) -> float:
@@ -271,6 +330,8 @@ class OutputCsvCostModel:
 
         prefill_e2e = max(s_time, prefill_gpu, prefill_pim)
         decode_e2e = max(g_time, decode_gpu, decode_pim)
+        prefill_energy_nj = cls._safe_float(row, "s_energy (nJ)")
+        decode_energy_nj = cls._safe_float(row, "g_energy (nJ)")
 
         return RouteServicePoint(route=route,
                                  lin=lin,
@@ -279,9 +340,11 @@ class OutputCsvCostModel:
                                  prefill_e2e_ms=prefill_e2e,
                                  prefill_gpu_ms=prefill_gpu,
                                  prefill_pim_ms=prefill_pim,
+                                 prefill_energy_nj=prefill_energy_nj,
                                  decode_e2e_ms=decode_e2e,
                                  decode_gpu_ms=decode_gpu,
                                  decode_pim_ms=decode_pim,
+                                 decode_energy_nj=decode_energy_nj,
                                  source_file=csv_path)
 
     def routes(self) -> List[str]:
@@ -389,6 +452,23 @@ class OutputCsvCostModel:
                                           generated_tokens=int(generated_tokens),
                                           lookup=lookup)
 
+    def estimate_requests_batch(self,
+                                route: str,
+                                requests: Sequence[Tuple[int, int, int]],
+                                unsupported_policy: str,
+                                lin_bucket: int,
+                                lout_bucket: int) -> List[Optional[RequestServiceEstimate]]:
+        return [
+            self.estimate_request(route,
+                                  context_tokens=context_tokens,
+                                  generated_tokens=generated_tokens,
+                                  bs=bs,
+                                  unsupported_policy=unsupported_policy,
+                                  lin_bucket=lin_bucket,
+                                  lout_bucket=lout_bucket)
+            for context_tokens, generated_tokens, bs in requests
+        ]
+
     def _estimate_from_lookup(self,
                               route: str,
                               lin: int,
@@ -406,10 +486,25 @@ class OutputCsvCostModel:
                                       prefill_e2e_ms=p.prefill_e2e_ms,
                                       prefill_gpu_ms=p.prefill_gpu_ms,
                                       prefill_pim_ms=p.prefill_pim_ms,
+                                      prefill_energy_nj=p.prefill_energy_nj,
                                       decode_e2e_ms=p.decode_e2e_ms,
                                       decode_gpu_ms=p.decode_gpu_ms,
                                       decode_pim_ms=p.decode_pim_ms,
+                                      decode_energy_nj=p.decode_energy_nj,
                                       mapping=lookup)
+
+    def supports_decode_energy(self, route: Optional[str] = None) -> bool:
+        if route is not None:
+            return bool(self.route_has_decode_energy.get(route, False))
+        return all(bool(self.route_has_decode_energy.get(r, False)) for r in self.route_points)
+
+    def supports_prefill_energy(self, route: Optional[str] = None) -> bool:
+        if route is not None:
+            return bool(self.route_has_prefill_energy.get(route, False))
+        return all(bool(self.route_has_prefill_energy.get(r, False)) for r in self.route_points)
+
+    def stats(self) -> Dict[str, float]:
+        return {}
 
 
 @dataclass
@@ -421,6 +516,8 @@ class _TaskCandidate:
     gpu_ms: float
     pim_ms: float
     e2e_ms: float
+    prefill_energy_nj: float
+    decode_energy_nj: float
     earliest_start_ms: float
     predicted_finish_ms: float
     batch_size: int
@@ -443,6 +540,15 @@ class _IncrementalForecastRequest:
     first_decode_start_ms: Optional[float] = None
     completion_time_ms: Optional[float] = None
     last_token_completion_ms: Optional[float] = None
+    tbt_intervals_ms: List[float] = field(default_factory=list)
+
+
+@dataclass
+class _IncrementalForecastRun:
+    requests: Dict[int, Dict[str, float]]
+    total_prefill_energy_nj: float
+    total_decode_energy_nj: float
+    first_task_start_ms: float
 
 
 @dataclass
@@ -468,9 +574,15 @@ class ReplaySummary:
     slo_e2e_miss_rate: Optional[float]
     prefill_batching: Dict[str, float]
     decode_batching: Dict[str, float]
+    prefill_energy_nj: Dict[str, object]
+    decode_energy_nj: Dict[str, object]
+    energy_nj: Dict[str, object]
+    energy_nj_per_request: float
+    decode_energy_nj_per_decode_token: float
     admission_queue: Dict[str, float]
     admission: Dict[str, float]
     local_scheduling: Dict[str, object]
+    cache_stats: Dict[str, float]
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
@@ -506,18 +618,45 @@ class TraceReplaySimulator:
             raise ValueError("ReplayConfig.local_scheduling_policy must be one of: priority, fcfs_strict, prefill_priority_fcfs_decode")
         if self.config.fcfs_decode_prediction_mode not in {"shadow", "legacy", "incremental", "heuristic_refresh"}:
             raise ValueError("ReplayConfig.fcfs_decode_prediction_mode must be one of: shadow, legacy, incremental, heuristic_refresh")
+        if self.config.enable_predictive_admission and self.config.enable_slo_guarded_admission:
+            raise ValueError("predictive admission and slo_guarded_admission are mutually exclusive")
         if self._is_prefill_priority_fcfs_decode():
             if self.config.enable_predictive_admission:
                 raise ValueError("prefill_priority_fcfs_decode does not support predictive admission")
             if self.config.enable_prefill_batching:
                 raise ValueError("prefill_priority_fcfs_decode does not support prefill batching")
+            if self.config.enable_slo_guarded_admission:
+                if self.config.slo_e2e_ms is None:
+                    raise ValueError("slo_guarded_admission requires slo_e2e_ms")
+                if self.config.slo_tbt_ms is None:
+                    raise ValueError("slo_guarded_admission requires slo_tbt_ms")
+                if self.config.fcfs_decode_prediction_mode != "incremental":
+                    raise ValueError("slo_guarded_admission requires fcfs_decode_prediction_mode=incremental")
         elif self.config.fcfs_decode_prediction_mode != "shadow":
             raise ValueError("fcfs_decode_prediction_mode only applies to prefill_priority_fcfs_decode")
+        elif self.config.enable_slo_guarded_admission:
+            raise ValueError("slo_guarded_admission requires prefill_priority_fcfs_decode")
+        if self._uses_latency_guarded_energy_policy():
+            if not self._is_prefill_priority_fcfs_decode():
+                raise ValueError("latency_guarded_energy requires prefill_priority_fcfs_decode")
+            if not self._use_incremental_prediction_for_fcfs_decode():
+                raise ValueError("latency_guarded_energy requires fcfs_decode_prediction_mode=incremental")
+            missing_routes = [route for route in self.route_order
+                              if not self.cost_model.supports_decode_energy(route)]
+            if missing_routes:
+                raise ValueError(
+                    "latency_guarded_energy requires decode_energy_nj support for all configured routes; "
+                    f"missing: {sorted(missing_routes)}")
 
         self.gpu_free_ms = 0.0
         self.pim_free_ms = 0.0
         self.gpu_busy_ms = 0.0
         self.pim_busy_ms = 0.0
+        self.prefill_energy_total_nj = 0.0
+        self.prefill_energy_by_route_nj: Dict[str, float] = {}
+        self.decode_energy_total_nj = 0.0
+        self.decode_energy_by_route_nj: Dict[str, float] = {}
+        self.decode_token_count = 0
         self.now_ms = 0.0
 
         self.requests: List[ReplayRequest] = []
@@ -540,7 +679,25 @@ class TraceReplaySimulator:
         self.admission_lost_count = 0
         self.admission_shadow_timeout_count = 0
         self.admission_queue_max_len = 0
+        self.admission_held_count = 0
+        self.admission_admitted_from_queue_count = 0
+        self.admission_bypassed_count = 0
+        self.admission_best_effort_count = 0
+        self.admission_blocked_request_ids: set[int] = set()
+        self.admission_tbt_blocked_request_ids: set[int] = set()
         self._estimate_cache: Dict[Tuple[str, int, int, int, str, int, int], Optional[RequestServiceEstimate]] = {}
+        self.estimate_cache_hits = 0
+        self.estimate_cache_misses = 0
+        self.estimate_prefetch_populated = 0
+        self.incremental_active_forecast_cache_hits = 0
+        self.incremental_active_forecast_cache_misses = 0
+        self._incremental_active_forecast_cache_key: Optional[Tuple[object, ...]] = None
+        self._incremental_active_forecast_cache_run: Optional[_IncrementalForecastRun] = None
+        self.projection_cache_hits = 0
+        self.projection_cache_misses = 0
+        self._incremental_projection_cache_baseline_key: Optional[Tuple[object, ...]] = None
+        self._incremental_projection_cache: Dict[Tuple[object, ...], _IncrementalForecastRun] = {}
+        self._prefetch_arrival_request_estimates()
 
     def _inc_route_count(self, route: Optional[str], delta: int = 1):
         if not route:
@@ -588,6 +745,27 @@ class TraceReplaySimulator:
                 row[k] = v
         self.debug_events.append(row)
 
+    def _route_candidate_debug_dict(self, cand: RouteCandidate) -> Dict[str, object]:
+        return {
+            "route": cand.route,
+            "eligible": cand.eligible,
+            "uses_pim": cand.uses_pim,
+            "predicted_finish_ms": cand.predicted_finish_ms,
+            "predicted_gpu_wait_ms": cand.predicted_gpu_wait_ms,
+            "predicted_pim_wait_ms": cand.predicted_pim_wait_ms,
+            "predicted_incremental_energy_nj": cand.predicted_incremental_energy_nj,
+            "predicted_incremental_decode_energy_nj": cand.predicted_incremental_decode_energy_nj,
+            "queue_pressure_ms": cand.queue_pressure_ms,
+            "deadline_ms": cand.deadline_ms,
+            "slack_ms": cand.slack_ms,
+            "candidate_mean_tbt_ms": cand.candidate_mean_tbt_ms,
+            "harmed_count": cand.harmed_count,
+            "total_harm_ms": cand.total_harm_ms,
+            "max_single_harm_ms": cand.max_single_harm_ms,
+            "own_miss_ms": cand.own_miss_ms,
+            "reason": cand.reason,
+        }
+
     def _resource_ready(self, gpu_ms: float, pim_ms: float) -> float:
         t = self.now_ms
         if gpu_ms > 0:
@@ -596,19 +774,30 @@ class TraceReplaySimulator:
             t = max(t, self.pim_free_ms)
         return t
 
+    def _estimate_cache_key(self,
+                            route: str,
+                            context_tokens: int,
+                            generated_tokens: int,
+                            bs: int) -> Tuple[str, int, int, int, str, int, int]:
+        return (str(route),
+                int(context_tokens),
+                int(generated_tokens),
+                int(bs),
+                self.config.unsupported_policy,
+                int(self.config.lin_bucket),
+                int(self.config.lout_bucket))
+
     def _estimate_request_cached(self,
                                  route: str,
                                  context_tokens: int,
                                  generated_tokens: int,
                                  bs: int) -> Optional[RequestServiceEstimate]:
-        key = (route,
-               int(context_tokens),
-               int(generated_tokens),
-               int(bs),
-               self.config.unsupported_policy,
-               int(self.config.lin_bucket),
-               int(self.config.lout_bucket))
+        key = self._estimate_cache_key(route,
+                                       context_tokens=context_tokens,
+                                       generated_tokens=generated_tokens,
+                                       bs=bs)
         if key not in self._estimate_cache:
+            self.estimate_cache_misses += 1
             self._estimate_cache[key] = self.cost_model.estimate_request(
                 route,
                 context_tokens=int(context_tokens),
@@ -618,7 +807,114 @@ class TraceReplaySimulator:
                 lin_bucket=self.config.lin_bucket,
                 lout_bucket=self.config.lout_bucket,
             )
+        else:
+            self.estimate_cache_hits += 1
         return self._estimate_cache[key]
+
+    def _prefetch_request_estimates(self,
+                                    requests: Iterable[object],
+                                    routes: Optional[Iterable[str]] = None):
+        route_list = list(routes) if routes is not None else list(self.route_order)
+        if not route_list:
+            return
+        route_bs = {route: self._predicted_lookup_batch_size(route) for route in route_list}
+        seen: set[Tuple[str, int, int, int, str, int, int]] = set()
+        missing_by_route: Dict[str, List[Tuple[int, int, int]]] = {route: [] for route in route_list}
+        missing_keys_by_route: Dict[str, List[Tuple[str, int, int, int, str, int, int]]] = {
+            route: [] for route in route_list
+        }
+        for req in requests:
+            context_tokens = int(getattr(req, "context_tokens"))
+            generated_tokens = int(getattr(req, "generated_tokens"))
+            for route in route_list:
+                bs = route_bs[route]
+                key = self._estimate_cache_key(route,
+                                               context_tokens=context_tokens,
+                                               generated_tokens=generated_tokens,
+                                               bs=bs)
+                if key in seen or key in self._estimate_cache:
+                    continue
+                seen.add(key)
+                missing_by_route[route].append((context_tokens, generated_tokens, bs))
+                missing_keys_by_route[route].append(key)
+
+        for route in route_list:
+            if not missing_by_route[route]:
+                continue
+            estimates = self.cost_model.estimate_requests_batch(
+                route,
+                missing_by_route[route],
+                unsupported_policy=self.config.unsupported_policy,
+                lin_bucket=self.config.lin_bucket,
+                lout_bucket=self.config.lout_bucket,
+            )
+            for key, est in zip(missing_keys_by_route[route], estimates):
+                self._estimate_cache[key] = est
+                self.estimate_prefetch_populated += 1
+
+    def _prefetch_arrival_request_estimates(self):
+        if not self.arrivals:
+            return
+        if not (self._use_incremental_prediction_for_fcfs_decode() or
+                self.config.enable_slo_guarded_admission or
+                self._uses_latency_guarded_energy_policy()):
+            return
+        self._prefetch_request_estimates(self.arrivals)
+
+    def _active_incremental_requests(self) -> List[ReplayRequest]:
+        active = [
+            rr for rr in self.requests
+            if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
+        ]
+        active.sort(key=lambda r: r.request_id)
+        return active
+
+    def _incremental_request_signature(self, rr: ReplayRequest) -> Tuple[object, ...]:
+        if rr.svc is None or rr.route is None:
+            raise ValueError("incremental forecast signature requires admitted requests")
+        return (
+            int(rr.request_id),
+            float(rr.arrival_ms),
+            int(rr.context_tokens),
+            int(rr.generated_tokens),
+            str(rr.route),
+            str(rr.state),
+            float(rr.ready_ms),
+            int(rr.remaining_decode_tokens),
+            int(rr.decoded_tokens_done),
+            rr.decode_enqueue_seq,
+            rr.prefill_start_ms,
+            rr.prefill_end_ms,
+            rr.first_token_time_ms,
+            rr.completion_time_ms,
+            rr.last_token_completion_ms,
+            tuple(float(v) for v in rr.tbt_intervals_ms),
+            float(rr.svc.prefill_e2e_ms),
+            float(rr.svc.prefill_gpu_ms),
+            float(rr.svc.prefill_pim_ms),
+            float(rr.svc.prefill_energy_nj),
+            float(rr.svc.decode_e2e_ms),
+            float(rr.svc.decode_gpu_ms),
+            float(rr.svc.decode_pim_ms),
+            float(rr.svc.decode_energy_nj),
+            int(rr.svc.decode_tokens),
+        )
+
+    def _incremental_active_forecast_signature(self,
+                                               active: List[ReplayRequest]) -> Tuple[object, ...]:
+        return (
+            float(self.gpu_free_ms),
+            float(self.pim_free_ms),
+            int(self.next_decode_enqueue_seq),
+            tuple(self._incremental_request_signature(rr) for rr in active),
+        )
+
+    def _sync_projection_cache_baseline(self,
+                                        baseline_signature: Optional[Tuple[object, ...]]):
+        if baseline_signature == self._incremental_projection_cache_baseline_key:
+            return
+        self._incremental_projection_cache_baseline_key = baseline_signature
+        self._incremental_projection_cache = {}
 
     def _predict_stage_start(self, ready_ms: float, gpu_ms: float,
                              pim_ms: float, gpu_free_ms: float,
@@ -672,6 +968,9 @@ class TraceReplaySimulator:
     def _is_prefill_priority_fcfs_decode(self) -> bool:
         return self.config.local_scheduling_policy == "prefill_priority_fcfs_decode"
 
+    def _uses_waiting_admission_queue(self) -> bool:
+        return self.config.enable_predictive_admission or self.config.enable_slo_guarded_admission
+
     def _use_shadow_prediction_for_fcfs_decode(self) -> bool:
         return (self._is_prefill_priority_fcfs_decode() and
                 self.config.fcfs_decode_prediction_mode == "shadow")
@@ -683,6 +982,15 @@ class TraceReplaySimulator:
     def _use_heuristic_refresh_prediction_for_fcfs_decode(self) -> bool:
         return (self._is_prefill_priority_fcfs_decode() and
                 self.config.fcfs_decode_prediction_mode == "heuristic_refresh")
+
+    def _uses_latency_guarded_energy_policy(self) -> bool:
+        return getattr(self.policy, "route_policy", "") == "latency_guarded_energy"
+
+    def _min_waiting_admission_retry_ms(self) -> Optional[float]:
+        waits = [r.admission_next_retry_ms for r in self.requests if r.state == "waiting_admission"]
+        if not waits:
+            return None
+        return min(float(v) for v in waits)
 
     def _queue_pressure_adjustment_ms(self,
                                       *,
@@ -1069,6 +1377,12 @@ class TraceReplaySimulator:
             remaining_decode_tokens=int(rr.remaining_decode_tokens),
             decoded_tokens_done=int(rr.decoded_tokens_done),
             decode_enqueue_seq=rr.decode_enqueue_seq,
+            prefill_start_ms=rr.prefill_start_ms,
+            prefill_end_ms=rr.prefill_end_ms,
+            first_decode_start_ms=None,
+            completion_time_ms=rr.completion_time_ms,
+            last_token_completion_ms=rr.last_token_completion_ms,
+            tbt_intervals_ms=list(rr.tbt_intervals_ms),
         )
 
     def _incremental_request_for_candidate(self,
@@ -1090,10 +1404,13 @@ class TraceReplaySimulator:
 
     def _simulate_prefill_priority_fcfs_decode_incremental(
             self,
-            forecast: List[_IncrementalForecastRequest]) -> Dict[int, Dict[str, float]]:
+            forecast: List[_IncrementalForecastRequest]) -> _IncrementalForecastRun:
         now = float(self.now_ms)
         gpu_free = float(self.gpu_free_ms)
         pim_free = float(self.pim_free_ms)
+        total_prefill_energy_nj = 0.0
+        total_decode_energy_nj = 0.0
+        first_task_start_ms = math.inf
         max_decode_seq = max(
             [int(r.decode_enqueue_seq) for r in forecast if r.decode_enqueue_seq is not None],
             default=-1,
@@ -1128,8 +1445,11 @@ class TraceReplaySimulator:
                                                   rr.svc.prefill_pim_ms,
                                                   gpu_free,
                                                   pim_free)
+                if not math.isfinite(first_task_start_ms):
+                    first_task_start_ms = start
                 finish = start + rr.svc.prefill_e2e_ms
                 now = max(now, start)
+                total_prefill_energy_nj += max(0.0, rr.svc.prefill_energy_nj)
                 if rr.svc.prefill_gpu_ms > 0:
                     gpu_free = max(gpu_free, start) + rr.svc.prefill_gpu_ms
                 if rr.svc.prefill_pim_ms > 0:
@@ -1167,7 +1487,7 @@ class TraceReplaySimulator:
                     batch.append(rr)
 
             batch_reqs: List[_IncrementalForecastRequest] = []
-            gpu_ms = pim_ms = e2e_ms = 0.0
+            gpu_ms = pim_ms = e2e_ms = decode_energy_nj = 0.0
             for batch_size in range(len(batch), 0, -1):
                 batch_reqs = batch[:batch_size]
                 if batch_size == 1:
@@ -1175,6 +1495,7 @@ class TraceReplaySimulator:
                     gpu_ms = svc.decode_gpu_ms
                     pim_ms = svc.decode_pim_ms
                     e2e_ms = svc.decode_e2e_ms
+                    decode_energy_nj = svc.decode_energy_nj
                     break
                 batch_lin = max(self._request_decode_context_tokens(r) for r in batch_reqs)
                 batch_est = self._estimate_request_cached(head.route,
@@ -1186,13 +1507,17 @@ class TraceReplaySimulator:
                 gpu_ms = batch_est.decode_gpu_ms
                 pim_ms = batch_est.decode_pim_ms
                 e2e_ms = batch_est.decode_e2e_ms
+                decode_energy_nj = batch_est.decode_energy_nj
                 break
             if not batch_reqs:
                 break
 
             start = self._predict_stage_start(cutoff_ms, gpu_ms, pim_ms, gpu_free, pim_free)
+            if not math.isfinite(first_task_start_ms):
+                first_task_start_ms = start
             finish = start + e2e_ms
             now = max(now, start)
+            total_decode_energy_nj += max(0.0, decode_energy_nj)
             if gpu_ms > 0:
                 gpu_free = max(gpu_free, start) + gpu_ms
             if pim_ms > 0:
@@ -1201,6 +1526,8 @@ class TraceReplaySimulator:
             for rr in batch_reqs:
                 if rr.first_decode_start_ms is None:
                     rr.first_decode_start_ms = start
+                if rr.last_token_completion_ms is not None:
+                    rr.tbt_intervals_ms.append(finish - rr.last_token_completion_ms)
                 rr.last_token_completion_ms = finish
                 rr.remaining_decode_tokens -= 1
                 rr.decoded_tokens_done += 1
@@ -1219,22 +1546,50 @@ class TraceReplaySimulator:
                 "prefill_end_ms": rr.prefill_end_ms if rr.prefill_end_ms is not None else math.nan,
                 "first_decode_start_ms": (rr.first_decode_start_ms
                                           if rr.first_decode_start_ms is not None else math.nan),
+                "mean_tbt_ms": (float(sum(rr.tbt_intervals_ms) / len(rr.tbt_intervals_ms))
+                                 if rr.tbt_intervals_ms else float(rr.svc.decode_e2e_ms)),
             }
-        return results
+        return _IncrementalForecastRun(requests=results,
+                                       total_prefill_energy_nj=float(total_prefill_energy_nj),
+                                       total_decode_energy_nj=float(total_decode_energy_nj),
+                                       first_task_start_ms=float(first_task_start_ms))
 
     def _project_prefill_priority_fcfs_decode_incremental_candidate(
             self,
             req: AzureTraceRequest,
             route: str,
-            est: RequestServiceEstimate) -> Dict[str, float]:
-        forecast = [
-            self._incremental_request_from_replay_request(rr)
-            for rr in self.requests
-            if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
-        ]
-        forecast.append(self._incremental_request_for_candidate(req, route, est))
-        results = self._simulate_prefill_priority_fcfs_decode_incremental(forecast)
-        out = results.get(req.request_id, {})
+            est: RequestServiceEstimate,
+            baseline_signature: Optional[Tuple[object, ...]] = None,
+            baseline_total_energy_nj: float = 0.0,
+            baseline_total_decode_energy_nj: float = 0.0) -> Dict[str, object]:
+        cache_key: Optional[Tuple[object, ...]] = None
+        run: Optional[_IncrementalForecastRun] = None
+        if baseline_signature is not None:
+            self._sync_projection_cache_baseline(baseline_signature)
+            cache_key = (int(req.request_id),
+                         float(req.arrival_ms),
+                         int(req.context_tokens),
+                         int(req.generated_tokens),
+                         float(self.now_ms),
+                         str(route))
+            run = self._incremental_projection_cache.get(cache_key)
+            if run is not None:
+                self.projection_cache_hits += 1
+            else:
+                self.projection_cache_misses += 1
+
+        if run is None:
+            forecast = [
+                self._incremental_request_from_replay_request(rr)
+                for rr in self.requests
+                if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
+            ]
+            forecast.append(self._incremental_request_for_candidate(req, route, est))
+            run = self._simulate_prefill_priority_fcfs_decode_incremental(forecast)
+            if cache_key is not None:
+                self._incremental_projection_cache[cache_key] = run
+
+        out = run.requests.get(req.request_id, {})
         prefill_start = out.get("prefill_start_ms", math.nan)
         prefill_end = out.get("prefill_end_ms", math.nan)
         first_decode_start = out.get("first_decode_start_ms", math.nan)
@@ -1243,10 +1598,167 @@ class TraceReplaySimulator:
         if est.uses_pim and not math.isnan(prefill_end) and not math.isnan(first_decode_start):
             pred_pim_wait = max(0.0, first_decode_start - prefill_end)
         return {
+            "run": run,
             "candidate_finish_ms": out.get("completion_time_ms", math.inf),
             "candidate_pred_gpu_wait_ms": pred_gpu_wait,
             "candidate_pred_pim_wait_ms": pred_pim_wait,
+            "candidate_incremental_energy_nj": max(
+                0.0,
+                float(run.total_prefill_energy_nj + run.total_decode_energy_nj - baseline_total_energy_nj)),
+            "candidate_incremental_decode_energy_nj": max(
+                0.0, float(run.total_decode_energy_nj - baseline_total_decode_energy_nj)),
         }
+
+    def _incremental_request_for_waiting_request(self,
+                                                 rr: ReplayRequest,
+                                                 route: str,
+                                                 est: RequestServiceEstimate) -> _IncrementalForecastRequest:
+        return _IncrementalForecastRequest(
+            request_id=int(rr.request_id),
+            arrival_ms=float(rr.arrival_ms),
+            context_tokens=int(rr.context_tokens),
+            route=str(route),
+            svc=est,
+            state="waiting_prefill",
+            ready_ms=float(self.now_ms),
+            remaining_decode_tokens=int(est.decode_tokens),
+            decoded_tokens_done=0,
+            decode_enqueue_seq=None,
+        )
+
+    def _incremental_active_forecast_results(self) -> _IncrementalForecastRun:
+        active = self._active_incremental_requests()
+        if not active:
+            return _IncrementalForecastRun(requests={},
+                                           total_prefill_energy_nj=0.0,
+                                           total_decode_energy_nj=0.0,
+                                           first_task_start_ms=math.inf)
+
+        cache_key = self._incremental_active_forecast_signature(active)
+        cached_run = self._incremental_active_forecast_cache_run
+        if (cached_run is not None and
+                self._incremental_active_forecast_cache_key == cache_key and
+                self.now_ms <= cached_run.first_task_start_ms):
+            self.incremental_active_forecast_cache_hits += 1
+            return cached_run
+
+        self.incremental_active_forecast_cache_misses += 1
+        forecast = [self._incremental_request_from_replay_request(rr) for rr in active]
+        run = self._simulate_prefill_priority_fcfs_decode_incremental(forecast)
+        self._incremental_active_forecast_cache_key = cache_key
+        self._incremental_active_forecast_cache_run = run
+        return run
+
+    def _effective_slo_guard_budgets(self, rr: ReplayRequest) -> Dict[str, float]:
+        queue_wait_ms = max(0.0, self.now_ms - rr.arrival_ms)
+        return {
+            "max_harmed_requests": float(self.config.admission_max_harmed_requests) +
+            queue_wait_ms * float(self.config.admission_aging_harmed_requests_per_ms),
+            "max_total_harm_ms": float(self.config.admission_max_total_harm_ms) +
+            queue_wait_ms * float(self.config.admission_aging_harm_ms_per_ms),
+            "max_single_harm_ms": float(self.config.admission_max_single_harm_ms) +
+            queue_wait_ms * float(self.config.admission_aging_harm_ms_per_ms),
+            "max_own_miss_ms": float(self.config.admission_max_own_miss_ms),
+        }
+
+    def _evaluate_slo_guarded_route(self,
+                                    rr: ReplayRequest,
+                                    route: str,
+                                    est: RequestServiceEstimate,
+                                    baseline_signature: Optional[Tuple[object, ...]],
+                                    baseline_results: Dict[int, Dict[str, float]],
+                                    baseline_total_energy_nj: float,
+                                    baseline_total_decode_energy_nj: float) -> RouteCandidate:
+        projected = self._project_prefill_priority_fcfs_decode_incremental_candidate(
+            rr,
+            route,
+            est,
+            baseline_signature=baseline_signature,
+            baseline_total_energy_nj=baseline_total_energy_nj,
+            baseline_total_decode_energy_nj=baseline_total_decode_energy_nj,
+        )
+        projected_run = projected["run"]  # type: ignore[assignment]
+        projected = projected_run.requests
+        out = projected.get(rr.request_id, {})
+        finish = float(out.get("completion_time_ms", math.inf))
+        prefill_start = float(out.get("prefill_start_ms", math.nan))
+        prefill_end = float(out.get("prefill_end_ms", math.nan))
+        first_decode_start = float(out.get("first_decode_start_ms", math.nan))
+        candidate_mean_tbt = float(out.get("mean_tbt_ms", est.decode_e2e_ms))
+        pred_gpu_wait = 0.0 if math.isnan(prefill_start) else max(0.0, prefill_start - self.now_ms)
+        pred_pim_wait = 0.0
+        if est.uses_pim and not math.isnan(prefill_end) and not math.isnan(first_decode_start):
+            pred_pim_wait = max(0.0, first_decode_start - prefill_end)
+
+        own_miss_ms = 0.0
+        slack_ms = None
+        if rr.deadline_ms is not None:
+            own_miss_ms = max(0.0, finish - rr.deadline_ms)
+            slack_ms = rr.deadline_ms - finish
+
+        harmed_count = 0
+        total_harm_ms = 0.0
+        max_single_harm_ms = 0.0
+        for active in self.requests:
+            if active.state not in ("waiting_prefill", "waiting_decode"):
+                continue
+            if active.svc is None or active.route is None or active.deadline_ms is None:
+                continue
+            if active.is_lost:
+                continue
+            before_finish = float(baseline_results.get(active.request_id, {}).get("completion_time_ms", math.inf))
+            after_finish = float(projected.get(active.request_id, {}).get("completion_time_ms", math.inf))
+            before_miss = max(0.0, before_finish - active.deadline_ms)
+            after_miss = max(0.0, after_finish - active.deadline_ms)
+            harm_ms = max(0.0, after_miss - before_miss)
+            if harm_ms > 0.0:
+                harmed_count += 1
+                total_harm_ms += harm_ms
+                max_single_harm_ms = max(max_single_harm_ms, harm_ms)
+
+        budgets = self._effective_slo_guard_budgets(rr)
+        own_ok = own_miss_ms <= budgets["max_own_miss_ms"]
+        tbt_ok = candidate_mean_tbt <= float(self.config.slo_tbt_ms)
+        harmed_ok = harmed_count <= budgets["max_harmed_requests"]
+        total_harm_ok = total_harm_ms <= budgets["max_total_harm_ms"]
+        single_harm_ok = max_single_harm_ms <= budgets["max_single_harm_ms"]
+        eligible = own_ok and tbt_ok and harmed_ok and total_harm_ok and single_harm_ok
+
+        if not own_ok:
+            reason = "candidate_e2e_slo_miss"
+        elif not tbt_ok:
+            reason = "candidate_tbt_slo_miss"
+        elif not harmed_ok:
+            reason = "existing_harmed_count_exceeded"
+        elif not total_harm_ok:
+            reason = "existing_total_harm_exceeded"
+        elif not single_harm_ok:
+            reason = "existing_single_harm_exceeded"
+        else:
+            reason = ""
+
+        return RouteCandidate(route=route,
+                              eligible=eligible,
+                              uses_pim=est.uses_pim,
+                              predicted_finish_ms=finish,
+                              predicted_gpu_wait_ms=pred_gpu_wait,
+                              predicted_pim_wait_ms=pred_pim_wait,
+                              predicted_incremental_energy_nj=max(
+                                  0.0,
+                                  float(projected_run.total_prefill_energy_nj +
+                                        projected_run.total_decode_energy_nj -
+                                        baseline_total_energy_nj)),
+                              predicted_incremental_decode_energy_nj=max(
+                                  0.0,
+                                  float(projected_run.total_decode_energy_nj - baseline_total_decode_energy_nj)),
+                              deadline_ms=rr.deadline_ms,
+                              slack_ms=slack_ms,
+                              candidate_mean_tbt_ms=candidate_mean_tbt,
+                              harmed_count=harmed_count,
+                              total_harm_ms=total_harm_ms,
+                              max_single_harm_ms=max_single_harm_ms,
+                              own_miss_ms=own_miss_ms,
+                              reason=reason)
 
     def _heuristic_decode_candidate_from_replay_request(self,
                                                         rr: ReplayRequest,
@@ -1465,10 +1977,7 @@ class TraceReplaySimulator:
     def _refresh_active_predictions(self, cause: str):
         if not self._is_prefill_priority_fcfs_decode():
             return
-        active = [
-            rr for rr in self.requests
-            if rr.state in ("waiting_prefill", "waiting_decode") and rr.svc is not None and rr.route is not None
-        ]
+        active = self._active_incremental_requests()
         if not active:
             return
         if self._use_shadow_prediction_for_fcfs_decode():
@@ -1476,9 +1985,7 @@ class TraceReplaySimulator:
                 [self._shadow_request_from_replay_request(rr) for rr in active]
             )
         elif self._use_incremental_prediction_for_fcfs_decode():
-            forecast_results = self._simulate_prefill_priority_fcfs_decode_incremental(
-                [self._incremental_request_from_replay_request(rr) for rr in active]
-            )
+            forecast_results = self._incremental_active_forecast_results().requests
         elif self._use_heuristic_refresh_prediction_for_fcfs_decode():
             forecast_results = self._simulate_prefill_priority_fcfs_decode_heuristic(
                 [self._incremental_request_from_replay_request(rr) for rr in active]
@@ -1512,7 +2019,9 @@ class TraceReplaySimulator:
     def _predict_route_candidate(self,
                                  req: AzureTraceRequest,
                                  route: str,
-                                 deadline_ms: Optional[float] = None) -> Tuple[RouteCandidate, Optional[RequestServiceEstimate]]:
+                                 deadline_ms: Optional[float] = None,
+                                 baseline_total_energy_nj: Optional[float] = None,
+                                 baseline_total_decode_energy_nj: Optional[float] = None) -> Tuple[RouteCandidate, Optional[RequestServiceEstimate]]:
         est = self._estimate_request_cached(route,
                                             context_tokens=req.context_tokens,
                                             generated_tokens=req.generated_tokens,
@@ -1540,11 +2049,29 @@ class TraceReplaySimulator:
                                   predicted_finish_ms=finish,
                                   predicted_gpu_wait_ms=pred_gpu_wait,
                                   predicted_pim_wait_ms=pred_pim_wait,
+                                  predicted_incremental_energy_nj=max(
+                                      0.0,
+                                      est.prefill_energy_nj +
+                                      est.decode_energy_nj * est.decode_tokens),
                                   deadline_ms=deadline_ms,
                                   slack_ms=slack_ms)
             return cand, est
         if self._use_incremental_prediction_for_fcfs_decode():
-            proj = self._project_prefill_priority_fcfs_decode_incremental_candidate(req, route, est)
+            if baseline_total_energy_nj is None or baseline_total_decode_energy_nj is None:
+                baseline_total_energy_nj = 0.0 if baseline_total_energy_nj is None else baseline_total_energy_nj
+                baseline_total_decode_energy_nj = 0.0 if baseline_total_decode_energy_nj is None else baseline_total_decode_energy_nj
+                if self._uses_latency_guarded_energy_policy():
+                    baseline_run = self._incremental_active_forecast_results()
+                    baseline_total_energy_nj = (
+                        baseline_run.total_prefill_energy_nj + baseline_run.total_decode_energy_nj)
+                    baseline_total_decode_energy_nj = baseline_run.total_decode_energy_nj
+            proj = self._project_prefill_priority_fcfs_decode_incremental_candidate(
+                req,
+                route,
+                est,
+                baseline_total_energy_nj=float(baseline_total_energy_nj),
+                baseline_total_decode_energy_nj=float(baseline_total_decode_energy_nj),
+            )
             finish = float(proj["candidate_finish_ms"])
             pred_gpu_wait = float(proj["candidate_pred_gpu_wait_ms"])
             pred_pim_wait = float(proj["candidate_pred_pim_wait_ms"])
@@ -1555,6 +2082,10 @@ class TraceReplaySimulator:
                                   predicted_finish_ms=finish,
                                   predicted_gpu_wait_ms=pred_gpu_wait,
                                   predicted_pim_wait_ms=pred_pim_wait,
+                                  predicted_incremental_energy_nj=float(
+                                      proj["candidate_incremental_energy_nj"]),
+                                  predicted_incremental_decode_energy_nj=float(
+                                      proj["candidate_incremental_decode_energy_nj"]),
                                   deadline_ms=deadline_ms,
                                   slack_ms=slack_ms)
             return cand, est
@@ -1615,6 +2146,10 @@ class TraceReplaySimulator:
                               predicted_finish_ms=finish,
                               predicted_gpu_wait_ms=pred_gpu_wait,
                               predicted_pim_wait_ms=pred_pim_wait,
+                              predicted_incremental_energy_nj=max(
+                                  0.0,
+                                  est.prefill_energy_nj +
+                                  est.decode_energy_nj * est.decode_tokens),
                               queue_pressure_ms=queue_pressure_ms,
                               deadline_ms=deadline_ms,
                               slack_ms=slack_ms)
@@ -1654,6 +2189,12 @@ class TraceReplaySimulator:
                                   predicted_finish_ms=finish,
                                   predicted_gpu_wait_ms=pred_gpu_wait,
                                   predicted_pim_wait_ms=pred_pim_wait,
+                                  predicted_incremental_energy_nj=max(
+                                      0.0,
+                                      est.prefill_energy_nj +
+                                      est.decode_energy_nj * rr.remaining_decode_tokens),
+                                  predicted_incremental_decode_energy_nj=max(
+                                      0.0, est.decode_energy_nj * rr.remaining_decode_tokens),
                                   deadline_ms=rr.deadline_ms,
                                   slack_ms=slack_ms)
             return cand, est
@@ -1676,6 +2217,12 @@ class TraceReplaySimulator:
                               predicted_finish_ms=finish,
                               predicted_gpu_wait_ms=pred_gpu_wait,
                               predicted_pim_wait_ms=pred_pim_wait,
+                              predicted_incremental_energy_nj=max(
+                                  0.0,
+                                  est.prefill_energy_nj +
+                                  est.decode_energy_nj * rr.remaining_decode_tokens),
+                              predicted_incremental_decode_energy_nj=max(
+                                  0.0, est.decode_energy_nj * rr.remaining_decode_tokens),
                               deadline_ms=rr.deadline_ms,
                               slack_ms=slack_ms)
         return cand, est
@@ -1720,14 +2267,7 @@ class TraceReplaySimulator:
                 rebound=False,
                 reason=rr.decode_rebind_reason,
                 improvement_ms=0.0,
-                route_candidates=[{
-                    "route": current_cand.route,
-                    "eligible": current_cand.eligible,
-                    "predicted_finish_ms": current_cand.predicted_finish_ms,
-                    "predicted_gpu_wait_ms": current_cand.predicted_gpu_wait_ms,
-                    "predicted_pim_wait_ms": current_cand.predicted_pim_wait_ms,
-                    "slack_ms": current_cand.slack_ms,
-                }],
+                route_candidates=[self._route_candidate_debug_dict(current_cand)],
             )
             return
 
@@ -1752,14 +2292,7 @@ class TraceReplaySimulator:
         else:
             rr.decode_rebind_reason = f"keep_route:{decision.reason}"
 
-        cand_debug = [{
-            "route": c.route,
-            "eligible": c.eligible,
-            "predicted_finish_ms": c.predicted_finish_ms,
-            "predicted_gpu_wait_ms": c.predicted_gpu_wait_ms,
-            "predicted_pim_wait_ms": c.predicted_pim_wait_ms,
-            "slack_ms": c.slack_ms,
-        } for c in candidates]
+        cand_debug = [self._route_candidate_debug_dict(c) for c in candidates]
         self._record_debug_event(
             "decode_rebind_decision",
             request_id=rr.request_id,
@@ -2195,10 +2728,12 @@ class TraceReplaySimulator:
                                route: str,
                                est: RequestServiceEstimate,
                                cand: RouteCandidate,
-                               reason: str):
+                               reason: str,
+                               forced_best_effort: bool = False):
         rr.route = route
         rr.admission_route = route
         rr.route_decision_reason = reason
+        rr.admission_forced_best_effort = forced_best_effort
         rr.svc = est
         rr.remaining_decode_tokens = rr.svc.decode_tokens
         rr.state = "waiting_prefill"
@@ -2206,10 +2741,16 @@ class TraceReplaySimulator:
         rr.admission_time_ms = self.now_ms
         rr.admission_queue_wait_ms = self.now_ms - rr.arrival_ms
         rr.admission_last_reject_reason = ""
+        rr.admission_last_harmed_count = cand.harmed_count
+        rr.admission_last_total_harm_ms = cand.total_harm_ms
+        rr.admission_last_single_harm_ms = cand.max_single_harm_ms
+        rr.admission_last_own_miss_ms = cand.own_miss_ms
         rr.chosen_predicted_finish_ms = cand.predicted_finish_ms
         rr.latest_predicted_finish_ms = cand.predicted_finish_ms
         rr.chosen_predicted_gpu_wait_ms = cand.predicted_gpu_wait_ms
         rr.chosen_predicted_pim_wait_ms = cand.predicted_pim_wait_ms
+        rr.chosen_predicted_incremental_energy_nj = cand.predicted_incremental_energy_nj
+        rr.chosen_predicted_incremental_decode_energy_nj = cand.predicted_incremental_decode_energy_nj
         rr.chosen_slack_ms = cand.slack_ms
         if rr.svc.mapping.clipped_lin:
             self.mapping_clipped_lin_count += 1
@@ -2233,8 +2774,12 @@ class TraceReplaySimulator:
                               if rr.chosen_predicted_finish_ms is not None else None),
             predicted_gpu_wait_ms=rr.chosen_predicted_gpu_wait_ms,
             predicted_pim_wait_ms=rr.chosen_predicted_pim_wait_ms,
+            predicted_incremental_energy_nj=rr.chosen_predicted_incremental_energy_nj,
+            predicted_incremental_decode_energy_nj=rr.chosen_predicted_incremental_decode_energy_nj,
             is_lost=rr.is_lost,
+            forced_best_effort=rr.admission_forced_best_effort,
             admission_attempts=rr.admission_attempts,
+            admission_bypass_count=rr.admission_bypass_count,
             admission_queue_wait_ms=max(0.0, self.now_ms - rr.arrival_ms),
         )
 
@@ -2244,6 +2789,7 @@ class TraceReplaySimulator:
             if not q:
                 return
             self.admission_queue_max_len = max(self.admission_queue_max_len, len(q))
+            self._prefetch_request_estimates(q)
             rr = q[0]
             if rr.admission_next_retry_ms > self.now_ms:
                 return
@@ -2367,17 +2913,189 @@ class TraceReplaySimulator:
                 decision_reason=decision.reason,
                 admission_attempts=rr.admission_attempts,
                 next_retry_ms=rr.admission_next_retry_ms,
-                route_candidates=[{
-                    "route": c.route,
-                    "eligible": c.eligible,
-                    "predicted_finish_ms": c.predicted_finish_ms,
-                    "predicted_gpu_wait_ms": c.predicted_gpu_wait_ms,
-                    "predicted_pim_wait_ms": c.predicted_pim_wait_ms,
-                    "reason": c.reason,
-                    "slack_ms": c.slack_ms,
-                } for c in route_candidates],
+                route_candidates=[self._route_candidate_debug_dict(c) for c in route_candidates],
             )
             return
+
+    def _process_slo_guarded_admission_queue(self):
+        while True:
+            q = self._waiting_admission_requests()
+            if not q:
+                return
+            self.admission_queue_max_len = max(self.admission_queue_max_len, len(q))
+            self._prefetch_request_estimates(q)
+            baseline_run = self._incremental_active_forecast_results()
+            baseline_signature = self._incremental_active_forecast_cache_key
+            baseline_results = baseline_run.requests
+            baseline_total_energy_nj = (
+                baseline_run.total_prefill_energy_nj + baseline_run.total_decode_energy_nj)
+            baseline_total_decode_energy_nj = baseline_run.total_decode_energy_nj
+            admitted_any = False
+
+            for idx, rr in enumerate(q):
+                if rr.admission_next_retry_ms > self.now_ms:
+                    continue
+                rr.admission_attempts += 1
+
+                route_candidates: List[RouteCandidate] = []
+                est_by_route: Dict[str, RequestServiceEstimate] = {}
+                for route in self.route_order:
+                    est = self._estimate_request_cached(route,
+                                                        context_tokens=rr.context_tokens,
+                                                        generated_tokens=rr.generated_tokens,
+                                                        bs=self._predicted_lookup_batch_size(route))
+                    if est is None:
+                        route_candidates.append(RouteCandidate(route=route,
+                                                               eligible=False,
+                                                               uses_pim=("pim" in route),
+                                                               predicted_finish_ms=math.inf,
+                                                               predicted_gpu_wait_ms=math.inf,
+                                                               predicted_pim_wait_ms=math.inf,
+                                                               deadline_ms=rr.deadline_ms,
+                                                               slack_ms=None,
+                                                               reason="unsupported_length"))
+                        continue
+                    cand = self._evaluate_slo_guarded_route(rr,
+                                                            route,
+                                                            est,
+                                                            baseline_signature,
+                                                            baseline_results,
+                                                            baseline_total_energy_nj,
+                                                            baseline_total_decode_energy_nj)
+                    route_candidates.append(cand)
+                    est_by_route[route] = est
+
+                self._record_debug_event(
+                    "admission_eval",
+                    request_id=rr.request_id,
+                    request_arrival_ms=rr.arrival_ms,
+                    admission_attempts=rr.admission_attempts,
+                    route_candidates=[self._route_candidate_debug_dict(c) for c in route_candidates],
+                )
+
+                decision = self.policy.choose_route(route_candidates,
+                                                    now_ms=self.now_ms,
+                                                    deadline_ms=rr.deadline_ms)
+                cand_by_route = {c.route: c for c in route_candidates}
+                chosen = cand_by_route.get(decision.route) if decision.route is not None else None
+                if (not decision.dropped and decision.route is not None and
+                        decision.route in est_by_route and chosen is not None and chosen.eligible):
+                    self._admit_waiting_request(rr,
+                                                route=decision.route,
+                                                est=est_by_route[decision.route],
+                                                cand=chosen,
+                                                reason=decision.reason)
+                    self.admission_admitted_from_queue_count += 1
+                    for blocked in q[:idx]:
+                        if blocked.state != "waiting_admission":
+                            continue
+                        blocked.admission_bypass_count += 1
+                        self.admission_bypassed_count += 1
+                        self._record_debug_event(
+                            "admission_bypass",
+                            bypassed_request_id=blocked.request_id,
+                            admitted_request_id=rr.request_id,
+                            bypass_count=blocked.admission_bypass_count,
+                        )
+                    self._refresh_active_predictions(cause="new_admission")
+                    admitted_any = True
+                    break
+
+                queue_wait_ms = max(0.0, self.now_ms - rr.arrival_ms)
+                force_best_effort = (
+                    (self.config.admission_max_wait_ms > 0.0 and queue_wait_ms >= float(self.config.admission_max_wait_ms)) or
+                    (self.config.admission_max_bypass_count > 0 and rr.admission_bypass_count >= int(self.config.admission_max_bypass_count))
+                )
+                if force_best_effort:
+                    admitted = [c for c in route_candidates if c.route in est_by_route]
+                    if not admitted:
+                        rr.state = "dropped"
+                        rr.dropped_reason = "no_route_for_best_effort"
+                        rr.route_decision_reason = rr.dropped_reason
+                        self._record_debug_event(
+                            "admit_drop",
+                            request_id=rr.request_id,
+                            request_arrival_ms=rr.arrival_ms,
+                            context_tokens=rr.context_tokens,
+                            generated_tokens=rr.generated_tokens,
+                            decision_reason=rr.dropped_reason,
+                        )
+                        admitted_any = True
+                        break
+                    rr.is_lost = True
+                    rr.admission_forced_best_effort = True
+                    self.admission_lost_count += 1
+                    self.admission_best_effort_count += 1
+                    best = min(admitted, key=lambda c: (c.predicted_finish_ms, c.route))
+                    self._admit_waiting_request(rr,
+                                                route=best.route,
+                                                est=est_by_route[best.route],
+                                                cand=best,
+                                                reason="admit_best_effort_due_to_wait_or_bypass",
+                                                forced_best_effort=True)
+                    self.admission_admitted_from_queue_count += 1
+                    self._record_debug_event(
+                        "admission_best_effort",
+                        request_id=rr.request_id,
+                        queue_wait_ms=queue_wait_ms,
+                        bypass_count=rr.admission_bypass_count,
+                        chosen_route=best.route,
+                    )
+                    for blocked in q[:idx]:
+                        if blocked.state != "waiting_admission":
+                            continue
+                        blocked.admission_bypass_count += 1
+                        self.admission_bypassed_count += 1
+                        self._record_debug_event(
+                            "admission_bypass",
+                            bypassed_request_id=blocked.request_id,
+                            admitted_request_id=rr.request_id,
+                            bypass_count=blocked.admission_bypass_count,
+                        )
+                    self._refresh_active_predictions(cause="new_admission")
+                    admitted_any = True
+                    break
+
+                best_reason = decision.reason
+                if decision.dropped:
+                    ranked = [c for c in route_candidates if c.route in est_by_route]
+                    if ranked:
+                        ranked.sort(key=lambda c: (c.predicted_finish_ms, c.route))
+                        best_reason = ranked[0].reason or decision.reason
+                        best_cand = ranked[0]
+                    else:
+                        best_cand = None
+                else:
+                    best_cand = chosen
+                rr.admission_last_reject_reason = best_reason
+                rr.admission_last_harmed_count = best_cand.harmed_count if best_cand is not None else 0
+                rr.admission_last_total_harm_ms = best_cand.total_harm_ms if best_cand is not None else 0.0
+                rr.admission_last_single_harm_ms = best_cand.max_single_harm_ms if best_cand is not None else 0.0
+                rr.admission_last_own_miss_ms = best_cand.own_miss_ms if best_cand is not None else math.inf
+                retry_dt = max(0.0, float(self.config.admission_retry_interval_ms))
+                if retry_dt == 0.0:
+                    retry_dt = 1e-6
+                rr.admission_next_retry_ms = self.now_ms + retry_dt
+                self.admission_held_count += 1
+                self.admission_blocked_request_ids.add(rr.request_id)
+                estimated_routes = [c for c in route_candidates if c.route in est_by_route]
+                if estimated_routes and all(c.reason == "candidate_tbt_slo_miss" for c in estimated_routes):
+                    self.admission_tbt_blocked_request_ids.add(rr.request_id)
+                self._record_debug_event(
+                    "admission_hold",
+                    request_id=rr.request_id,
+                    queue_wait_ms=queue_wait_ms,
+                    admission_attempts=rr.admission_attempts,
+                    next_retry_ms=rr.admission_next_retry_ms,
+                    reason=best_reason,
+                    harmed_count=rr.admission_last_harmed_count,
+                    total_harm_ms=rr.admission_last_total_harm_ms,
+                    max_single_harm_ms=rr.admission_last_single_harm_ms,
+                    own_miss_ms=rr.admission_last_own_miss_ms,
+                )
+
+            if not admitted_any:
+                return
 
     def _admit_arrivals_up_to_now(self):
         while self._arrival_idx < len(self.arrivals) and self.arrivals[self._arrival_idx].arrival_ms <= self.now_ms:
@@ -2395,10 +3113,20 @@ class TraceReplaySimulator:
             candidates: List[RouteCandidate] = []
             est_by_route: Dict[str, RequestServiceEstimate] = {}
             cand_by_route: Dict[str, RouteCandidate] = {}
+            self._prefetch_request_estimates([src_req])
+            baseline_total_decode_energy_nj = None
+            baseline_total_energy_nj = None
+            if self._uses_latency_guarded_energy_policy():
+                baseline_run = self._incremental_active_forecast_results()
+                baseline_total_energy_nj = (
+                    baseline_run.total_prefill_energy_nj + baseline_run.total_decode_energy_nj)
+                baseline_total_decode_energy_nj = baseline_run.total_decode_energy_nj
             for route in self.route_order:
                 cand, est = self._predict_route_candidate(src_req,
                                                           route,
-                                                          deadline_ms=rr.deadline_ms)
+                                                          deadline_ms=rr.deadline_ms,
+                                                          baseline_total_energy_nj=baseline_total_energy_nj,
+                                                          baseline_total_decode_energy_nj=baseline_total_decode_energy_nj)
                 candidates.append(cand)
                 cand_by_route[route] = cand
                 if est is not None:
@@ -2407,17 +3135,7 @@ class TraceReplaySimulator:
             decision = self.policy.choose_route(candidates,
                                                now_ms=self.now_ms,
                                                deadline_ms=rr.deadline_ms)
-            cand_debug = [{
-                "route": c.route,
-                "eligible": c.eligible,
-                "uses_pim": c.uses_pim,
-                "predicted_finish_ms": c.predicted_finish_ms,
-                "predicted_gpu_wait_ms": c.predicted_gpu_wait_ms,
-                "predicted_pim_wait_ms": c.predicted_pim_wait_ms,
-                "queue_pressure_ms": c.queue_pressure_ms,
-                "slack_ms": c.slack_ms,
-                "reason": c.reason,
-            } for c in candidates]
+            cand_debug = [self._route_candidate_debug_dict(c) for c in candidates]
             if decision.dropped or decision.route is None or decision.route not in est_by_route:
                 rr.state = "dropped"
                 rr.dropped_reason = decision.reason
@@ -2446,6 +3164,10 @@ class TraceReplaySimulator:
                 rr.latest_predicted_finish_ms = chosen_cand.predicted_finish_ms
                 rr.chosen_predicted_gpu_wait_ms = chosen_cand.predicted_gpu_wait_ms
                 rr.chosen_predicted_pim_wait_ms = chosen_cand.predicted_pim_wait_ms
+                rr.chosen_predicted_incremental_energy_nj = (
+                    chosen_cand.predicted_incremental_energy_nj)
+                rr.chosen_predicted_incremental_decode_energy_nj = (
+                    chosen_cand.predicted_incremental_decode_energy_nj)
                 rr.chosen_queue_pressure_ms = chosen_cand.queue_pressure_ms
                 rr.chosen_slack_ms = chosen_cand.slack_ms
             rr.remaining_decode_tokens = rr.svc.decode_tokens
@@ -2475,6 +3197,8 @@ class TraceReplaySimulator:
                                   if rr.chosen_predicted_finish_ms is not None else None),
                 predicted_gpu_wait_ms=rr.chosen_predicted_gpu_wait_ms,
                 predicted_pim_wait_ms=rr.chosen_predicted_pim_wait_ms,
+                predicted_incremental_energy_nj=rr.chosen_predicted_incremental_energy_nj,
+                predicted_incremental_decode_energy_nj=rr.chosen_predicted_incremental_decode_energy_nj,
                 predicted_queue_pressure_ms=rr.chosen_queue_pressure_ms,
                 route_candidates=cand_debug,
             )
@@ -2495,6 +3219,8 @@ class TraceReplaySimulator:
                               gpu_ms=gpu_ms,
                               pim_ms=pim_ms,
                               e2e_ms=e2e_ms,
+                              prefill_energy_nj=rr.svc.prefill_energy_nj,
+                              decode_energy_nj=0.0,
                               earliest_start_ms=earliest_start,
                               predicted_finish_ms=earliest_start + e2e_ms,
                               batch_size=1)
@@ -2544,6 +3270,8 @@ class TraceReplaySimulator:
                                         gpu_ms=batch_est.prefill_gpu_ms,
                                         pim_ms=batch_est.prefill_pim_ms,
                                         e2e_ms=batch_est.prefill_e2e_ms,
+                                        prefill_energy_nj=batch_est.prefill_energy_nj,
+                                        decode_energy_nj=0.0,
                                         earliest_start_ms=earliest_start,
                                         predicted_finish_ms=earliest_start + batch_est.prefill_e2e_ms,
                                         batch_size=len(batch_reqs)))
@@ -2564,6 +3292,8 @@ class TraceReplaySimulator:
                               gpu_ms=gpu_ms,
                               pim_ms=pim_ms,
                               e2e_ms=e2e_ms,
+                              prefill_energy_nj=0.0,
+                              decode_energy_nj=rr.svc.decode_energy_nj,
                               earliest_start_ms=earliest_start,
                               predicted_finish_ms=earliest_start + e2e_ms,
                               batch_size=1)
@@ -2612,6 +3342,8 @@ class TraceReplaySimulator:
                                             gpu_ms=batch_est.decode_gpu_ms,
                                             pim_ms=batch_est.decode_pim_ms,
                                             e2e_ms=batch_est.decode_e2e_ms,
+                                            prefill_energy_nj=0.0,
+                                            decode_energy_nj=batch_est.decode_energy_nj,
                                             earliest_start_ms=earliest_start,
                                             predicted_finish_ms=earliest_start + batch_est.decode_e2e_ms,
                                             batch_size=batch_size))
@@ -2640,7 +3372,7 @@ class TraceReplaySimulator:
             prefix = [head]
 
         batch_reqs: List[ReplayRequest] = []
-        gpu_ms = pim_ms = e2e_ms = 0.0
+        gpu_ms = pim_ms = e2e_ms = decode_energy_nj = 0.0
         for batch_size in range(len(prefix), 0, -1):
             batch_reqs = prefix[:batch_size]
             if batch_size == 1:
@@ -2650,6 +3382,7 @@ class TraceReplaySimulator:
                 gpu_ms = rr.svc.decode_gpu_ms
                 pim_ms = rr.svc.decode_pim_ms
                 e2e_ms = rr.svc.decode_e2e_ms
+                decode_energy_nj = rr.svc.decode_energy_nj
                 break
             batch_lin = max(self._request_decode_context_tokens(r) for r in batch_reqs)
             batch_est = self._estimate_request_cached(head.route or "unknown",
@@ -2661,6 +3394,7 @@ class TraceReplaySimulator:
             gpu_ms = batch_est.decode_gpu_ms
             pim_ms = batch_est.decode_pim_ms
             e2e_ms = batch_est.decode_e2e_ms
+            decode_energy_nj = batch_est.decode_energy_nj
             break
 
         if not batch_reqs:
@@ -2675,6 +3409,8 @@ class TraceReplaySimulator:
                               gpu_ms=gpu_ms,
                               pim_ms=pim_ms,
                               e2e_ms=e2e_ms,
+                              prefill_energy_nj=0.0,
+                              decode_energy_nj=decode_energy_nj,
                               earliest_start_ms=earliest_start,
                               predicted_finish_ms=earliest_start + e2e_ms,
                               batch_size=len(batch_reqs))
@@ -2752,6 +3488,9 @@ class TraceReplaySimulator:
         if tc.phase == "prefill":
             self.prefill_batch_sizes.append(tc.batch_size)
             self.consecutive_decode_batches = 0
+            self.prefill_energy_total_nj += max(0.0, tc.prefill_energy_nj)
+            self.prefill_energy_by_route_nj[tc.route] = (
+                self.prefill_energy_by_route_nj.get(tc.route, 0.0) + max(0.0, tc.prefill_energy_nj))
             rebound_changed = False
             for rr in tc.requests:
                 rr.prefill_start_ms = tc.earliest_start_ms
@@ -2771,6 +3510,10 @@ class TraceReplaySimulator:
         else:
             self.decode_batch_sizes.append(tc.batch_size)
             self.consecutive_decode_batches += 1
+            self.decode_energy_total_nj += max(0.0, tc.decode_energy_nj)
+            self.decode_energy_by_route_nj[tc.route] = (
+                self.decode_energy_by_route_nj.get(tc.route, 0.0) + max(0.0, tc.decode_energy_nj))
+            self.decode_token_count += tc.batch_size
             for rr in tc.requests:
                 if rr.last_token_completion_ms is not None:
                     rr.tbt_intervals_ms.append(finish_ms - rr.last_token_completion_ms)
@@ -2792,9 +3535,12 @@ class TraceReplaySimulator:
             self.now_ms = min(0.0, self.arrivals[0].arrival_ms)
 
         while True:
-            if self.config.enable_predictive_admission:
+            if self._uses_waiting_admission_queue():
                 self._enqueue_arrivals_up_to_now()
-                self._process_admission_queue()
+                if self.config.enable_predictive_admission:
+                    self._process_admission_queue()
+                else:
+                    self._process_slo_guarded_admission_queue()
             else:
                 self._admit_arrivals_up_to_now()
 
@@ -2802,11 +3548,7 @@ class TraceReplaySimulator:
             next_arrival_ms = None
             if self._arrival_idx < len(self.arrivals):
                 next_arrival_ms = self.arrivals[self._arrival_idx].arrival_ms
-            next_retry_ms = None
-            if self.config.enable_predictive_admission:
-                waiting = self._waiting_admission_requests()
-                if waiting:
-                    next_retry_ms = waiting[0].admission_next_retry_ms
+            next_retry_ms = self._min_waiting_admission_retry_ms() if self._uses_waiting_admission_queue() else None
 
             if task is None:
                 next_event_ms = None
@@ -2862,6 +3604,9 @@ class TraceReplaySimulator:
                 task_gpu_ms=task.gpu_ms,
                 task_pim_ms=task.pim_ms,
                 task_e2e_ms=task.e2e_ms,
+                task_prefill_energy_nj=task.prefill_energy_nj,
+                task_decode_energy_nj=task.decode_energy_nj,
+                task_energy_nj=(task.prefill_energy_nj + task.decode_energy_nj),
                 task_predicted_finish_ms=task.predicted_finish_ms,
                 request_states_before=before_states,
             )
@@ -2960,6 +3705,27 @@ class TraceReplaySimulator:
             "max_batch_size": float(max(self.decode_batch_sizes)) if self.decode_batch_sizes else 0.0,
             "num_decode_steps": float(len(self.decode_batch_sizes)),
         }
+        prefill_energy_nj = {
+            "total": float(self.prefill_energy_total_nj),
+            "by_route": dict(sorted(
+                (route, float(val)) for route, val in self.prefill_energy_by_route_nj.items())),
+        }
+        decode_energy_nj = {
+            "total": float(self.decode_energy_total_nj),
+            "by_route": dict(sorted(
+                (route, float(val)) for route, val in self.decode_energy_by_route_nj.items())),
+        }
+        total_energy_by_route: Dict[str, float] = {}
+        for route, val in self.prefill_energy_by_route_nj.items():
+            total_energy_by_route[route] = total_energy_by_route.get(route, 0.0) + float(val)
+        for route, val in self.decode_energy_by_route_nj.items():
+            total_energy_by_route[route] = total_energy_by_route.get(route, 0.0) + float(val)
+        energy_nj = {
+            "total": float(self.prefill_energy_total_nj + self.decode_energy_total_nj),
+            "prefill_total": float(self.prefill_energy_total_nj),
+            "decode_total": float(self.decode_energy_total_nj),
+            "by_route": dict(sorted((route, float(val)) for route, val in total_energy_by_route.items())),
+        }
         admission_queue = {
             "max_len": float(self.admission_queue_max_len),
             "mean_wait_ms": (float(sum(self.admission_queue_wait_samples_ms) /
@@ -2970,6 +3736,12 @@ class TraceReplaySimulator:
             "reject_count": float(self.admission_reject_count),
             "lost_count": float(self.admission_lost_count),
             "shadow_timeout_count": float(self.admission_shadow_timeout_count),
+            "held_count": float(self.admission_held_count),
+            "admitted_from_queue_count": float(self.admission_admitted_from_queue_count),
+            "bypassed_count": float(self.admission_bypassed_count),
+            "best_effort_count": float(self.admission_best_effort_count),
+            "blocked_count": float(len(self.admission_blocked_request_ids)),
+            "blocked_due_to_tbt_count": float(len(self.admission_tbt_blocked_request_ids)),
         }
         local_scheduling = {
             "local_scheduling_policy": self.config.local_scheduling_policy,
@@ -2983,13 +3755,40 @@ class TraceReplaySimulator:
             "decode_rebind_attempt_count": float(sum(1 for r in self.requests if r.decode_rebind_attempted)),
             "decode_rebound_count": float(sum(1 for r in self.requests if r.decode_rebound)),
             "enable_predictive_admission": float(self.config.enable_predictive_admission),
+            "enable_slo_guarded_admission": float(self.config.enable_slo_guarded_admission),
             "slo_tbt_ms": (float(self.config.slo_tbt_ms)
                             if self.config.slo_tbt_ms is not None else math.nan),
             "admission_shadow_max_steps": float(self.config.admission_shadow_max_steps),
             "admission_retry_interval_ms": float(self.config.admission_retry_interval_ms),
+            "admission_max_harmed_requests": float(self.config.admission_max_harmed_requests),
+            "admission_max_total_harm_ms": float(self.config.admission_max_total_harm_ms),
+            "admission_max_single_harm_ms": float(self.config.admission_max_single_harm_ms),
+            "admission_max_own_miss_ms": float(self.config.admission_max_own_miss_ms),
+            "admission_max_bypass_count": float(self.config.admission_max_bypass_count),
+            "admission_max_wait_ms": float(self.config.admission_max_wait_ms),
+            "admission_aging_harm_ms_per_ms": float(self.config.admission_aging_harm_ms_per_ms),
+            "admission_aging_harmed_requests_per_ms": float(self.config.admission_aging_harmed_requests_per_ms),
             "prefill_guard_trigger_count": float(self.prefill_guard_trigger_count),
             "decode_limit_trigger_count": float(self.decode_limit_trigger_count),
         }
+        cost_model_stats = {}
+        try:
+            cost_model_stats = {
+                str(k): float(v) for k, v in self.cost_model.stats().items()
+            }
+        except Exception:
+            cost_model_stats = {}
+        cache_stats = {
+            "estimate_cache_hits": float(self.estimate_cache_hits),
+            "estimate_cache_misses": float(self.estimate_cache_misses),
+            "estimate_prefetch_populated": float(self.estimate_prefetch_populated),
+            "incremental_active_forecast_cache_hits": float(self.incremental_active_forecast_cache_hits),
+            "incremental_active_forecast_cache_misses": float(self.incremental_active_forecast_cache_misses),
+            "projection_cache_hits": float(self.projection_cache_hits),
+            "projection_cache_misses": float(self.projection_cache_misses),
+        }
+        for key, value in cost_model_stats.items():
+            cache_stats[f"cost_model_{key}"] = value
 
         return ReplaySummary(
             total_requests=len(self.requests),
@@ -3013,9 +3812,19 @@ class TraceReplaySimulator:
             slo_e2e_miss_rate=e2e_miss,
             prefill_batching=prefill_batching,
             decode_batching=decode_batching,
+            prefill_energy_nj=prefill_energy_nj,
+            decode_energy_nj=decode_energy_nj,
+            energy_nj=energy_nj,
+            energy_nj_per_request=(
+                float((self.prefill_energy_total_nj + self.decode_energy_total_nj) / len(completed))
+                if completed else math.nan),
+            decode_energy_nj_per_decode_token=(
+                float(self.decode_energy_total_nj / self.decode_token_count)
+                if self.decode_token_count > 0 else math.nan),
             admission_queue=admission_queue,
             admission=admission,
             local_scheduling=local_scheduling,
+            cache_stats=cache_stats,
         )
 
     def requests_dataframe(self) -> pd.DataFrame:
@@ -3043,11 +3852,19 @@ class TraceReplaySimulator:
                 "admission_time_ms": r.admission_time_ms,
                 "admission_queue_wait_ms": r.admission_queue_wait_ms,
                 "admission_attempts": r.admission_attempts,
+                "admission_bypass_count": r.admission_bypass_count,
                 "admission_last_reject_reason": r.admission_last_reject_reason,
+                "admission_last_harmed_count": r.admission_last_harmed_count,
+                "admission_last_total_harm_ms": r.admission_last_total_harm_ms,
+                "admission_last_single_harm_ms": r.admission_last_single_harm_ms,
+                "admission_last_own_miss_ms": r.admission_last_own_miss_ms,
+                "admission_forced_best_effort": r.admission_forced_best_effort,
                 "is_lost": r.is_lost,
                 "ttft_ms": ttft,
                 "prefill_wait_ms": prefill_wait,
                 "e2e_ms": e2e,
+                "prefill_energy_nj": (r.svc.prefill_energy_nj if r.svc else None),
+                "decode_energy_nj": (r.svc.decode_energy_nj if r.svc else None),
                 "decode_tokens": (r.svc.decode_tokens if r.svc else None),
                 "mean_tbt_ms": (sum(r.tbt_intervals_ms) / len(r.tbt_intervals_ms)
                                 if r.tbt_intervals_ms else None),
@@ -3061,6 +3878,10 @@ class TraceReplaySimulator:
                 "latest_predicted_finish_ms": r.latest_predicted_finish_ms,
                 "chosen_predicted_gpu_wait_ms": r.chosen_predicted_gpu_wait_ms,
                 "chosen_predicted_pim_wait_ms": r.chosen_predicted_pim_wait_ms,
+                "chosen_predicted_incremental_energy_nj":
+                    r.chosen_predicted_incremental_energy_nj,
+                "chosen_predicted_incremental_decode_energy_nj":
+                    r.chosen_predicted_incremental_decode_energy_nj,
                 "chosen_queue_pressure_ms": r.chosen_queue_pressure_ms,
                 "chosen_slack_ms": r.chosen_slack_ms,
                 "decode_bind_time_ms": r.decode_bind_time_ms,

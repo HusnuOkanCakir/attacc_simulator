@@ -222,6 +222,7 @@ class System:
             wrt_io_busy = 0
             s_decoder = self.model.sum_decoder
             g_decoder = self.model.gen_decoder
+            sum_energy_total = 0.0
 
             ## Summarization stage
             for layer in s_decoder:
@@ -237,6 +238,7 @@ class System:
                 layer.energy = energy
 
                 s_flops += layer.get_flops() * self.devices['GPU'].num_xpu
+                sum_energy_total += sum(layer.energy)
                 time += exec_time
                 _opb_print(layer, 'sum')
 
@@ -363,7 +365,7 @@ class System:
 
             g_perf = {k: v / (lout - 1) for k, v in g_perf.items()}
 
-            energies = [
+            decode_energies = [
                 unit_energy['g_all'], unit_energy['g_offmem'],
                 unit_energy['g_l2'], unit_energy['g_l1'], unit_energy['g_reg'],
                 unit_energy['g_alu'], gen_energies[LayerType.FC]['mem'],
@@ -378,9 +380,9 @@ class System:
                 gen_energies[LayerType.NORM]['comp']
             ]
             comm_energy = sum([v['comm'] for k, v in gen_energies.items()])
-            energies.append(comm_energy)
+            decode_energies.append(comm_energy)
 
-            energies = [i / (lout - 1) for i in energies]
+            decode_energies = [i / (lout - 1) for i in decode_energies]
 
             perf = list(s_perf.values()) + list(g_perf.values())
 
@@ -389,7 +391,9 @@ class System:
             ## Scaling to all decoder
             ## Perf: ms, energy: nJ
             perf = [t * self.model.ndec * 1000 for t in perf]
-            energies = [t * self.model.ndec / 1000 for t in energies]
+            sum_energy = sum_energy_total * self.model.ndec / 1000
+            decode_energies = [t * self.model.ndec / 1000 for t in decode_energies]
+            energies = [sum_energy] + decode_energies
 
             if itr == 0:
                 if len(perf_all) > 0:
