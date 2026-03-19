@@ -2052,15 +2052,15 @@ For a candidate request on route `r`, the predictor uses:
 
 The candidate prefill start is estimated using the same stage-start rule as the main simulator:
 
-\[
-t_{\mathrm{prefill,start}} = \max(t_{\mathrm{arrival}},\ gpu\_free\ \text{if needed},\ pim\_free\ \text{if needed})
-\]
+```text
+t_prefill_start = max(t_arrival, gpu_free_if_needed, pim_free_if_needed)
+```
 
 The candidate prefill end is then:
 
-\[
-t_{\mathrm{prefill,end}} = t_{\mathrm{prefill,start}} + prefill\_e2e(route,\ Lin,\ Lout,\ bs=1)
-\]
+```text
+t_prefill_end = t_prefill_start + prefill_e2e(route, Lin, Lout, bs=1)
+```
 
 Prefill is always evaluated with `bs = 1` in this mode.
 
@@ -2068,9 +2068,9 @@ Prefill is always evaluated with `bs = 1` in this mode.
 
 The heuristic then constructs the current decode queue by sorting all `waiting_decode` requests by:
 
-\[
-(decode\_enqueue\_seq,\ request\_id)
-\]
+```text
+(decode_enqueue_seq, request_id)
+```
 
 The candidate request is appended to the tail of this queue, because it can only enter decode after its own prefill completes.
 
@@ -2100,9 +2100,9 @@ For each block `b`:
 
 The heuristic then queries the cost model for one representative decode step:
 
-\[
-step\_cost_b = f(route_b,\ Lin_b,\ 2,\ bs\_eff_b)
-\]
+```text
+step_cost_b = f(route_b, Lin_b, 2, bs_eff_b)
+```
 
 where `f(...)` is the ML/table decode-step latency oracle.
 
@@ -2110,9 +2110,9 @@ where `f(...)` is the ML/table decode-step latency oracle.
 
 The total time to drain block `b` is approximated as:
 
-\[
-T_b = \max_i(remaining\_decode\_tokens_i)\cdot step\_cost_b
-\]
+```text
+T_b = max_i(remaining_decode_tokens_i) * step_cost_b
+```
 
 This is an intentional approximation. It assumes that a block drains over roughly as many rounds as the longest remaining request in that block, with each round costing `step_cost_b`.
 
@@ -2120,13 +2120,11 @@ This is an intentional approximation. It assumes that a block drains over roughl
 
 If the candidate request lands in block `k`, its predicted finish time is approximated by:
 
-\[
-\hat{F}_{candidate}
-\approx
-t_{\mathrm{prefill,end}}
- \sum_{b < k} T_b
- T^{(candidate)}_{\mathrm{intra\mbox{-}block}}
-\]
+```text
+F_hat_candidate ≈ t_prefill_end
+                 + sum_{b < k} T_b
+                 + T_intra_block_candidate
+```
 
 The first term accounts for the candidate's own prefill. The summation accounts for all earlier FCFS route blocks that must drain before the candidate's block can become the active head block.
 
@@ -2134,11 +2132,10 @@ The first term accounts for the candidate's own prefill. The summation accounts 
 
 Inside the candidate's own block, completion is estimated as:
 
-\[
-T^{(candidate)}_{\mathrm{intra\mbox{-}block}}
-\approx
-remaining\_decode\_tokens_{candidate}\cdot step\_cost_k + excess\_wait_{candidate}
-\]
+```text
+T_intra_block_candidate ≈ remaining_decode_tokens_candidate * step_cost_k
+                          + excess_wait_candidate
+```
 
 The `excess_wait` term captures the case where the candidate is deeper than the first effective batch window of its block and therefore cannot participate in the earliest rounds immediately.
 
@@ -2146,9 +2143,9 @@ The `excess_wait` term captures the case where the candidate is deeper than the 
 
 The heuristic also produces approximate wait components:
 
-\[
-predicted\_gpu\_wait = \max(0,\ t_{\mathrm{prefill,start}} - t_{\mathrm{arrival}})
-\]
+```text
+predicted_gpu_wait = max(0, t_prefill_start - t_arrival)
+```
 
 For hybrid routes, `predicted_pim_wait_ms` is estimated from the delay between candidate prefill completion and the first expected decode opportunity of the candidate block.
 
@@ -2156,23 +2153,19 @@ For hybrid routes, `predicted_pim_wait_ms` is estimated from the delay between c
 
 After the FCFS block estimate is produced, an optional residual queue-pressure correction may be added when nonzero alpha parameters are supplied:
 
-\[
-\Delta_{\alpha}
-=
-\alpha_{\mathrm{gpu}}\cdot pending\_gpu\_work
-\;+\;
-\alpha_{\mathrm{pim}}\cdot pending\_pim\_work
-\;+\;
-\alpha_{\mathrm{active}}\cdot active\_requests
-\;+\;
-\alpha_{\mathrm{tok}}\cdot pending\_decode\_tokens\cdot decode\_step\_scale
-\]
+```text
+Delta_alpha =
+    alpha_gpu    * pending_gpu_work
+  + alpha_pim    * pending_pim_work
+  + alpha_active * active_requests
+  + alpha_tok    * pending_decode_tokens * decode_step_scale
+```
 
 The final heuristic prediction becomes:
 
-\[
-\hat{F}_{candidate} \leftarrow \hat{F}_{candidate} + \Delta_{\alpha}
-\]
+```text
+F_hat_candidate <- F_hat_candidate + Delta_alpha
+```
 
 These alpha terms are residual corrections only. They do not replace the FCFS queue/block calculation.
 
@@ -2185,3 +2178,505 @@ The distinction between the three `v4.2` predictors is therefore:
 - `heuristic_refresh`: FCFS queue/block approximation with rolling refresh, but without explicit future task replay.
 
 In practice, `heuristic_refresh` is faster than `incremental`, but its block-drain approximation can still underpredict finish time and distort route choice. That effect was visible in the 300-request comparison, where `heuristic_refresh` selected `gpu_only` more often than `incremental` and produced worse system-level latency and throughput.
+
+## v4.3 Deferred SLO-Guarded Admission on Top of FCFS Decode
+
+The next step was to keep the `prefill_priority_fcfs_decode` executor, but place a deferred SLO-aware admission queue in front of it. The admission queue evaluates queued arrivals in FCFS order, but blocked requests can be bypassed by later arrivals that are currently admissible. Requests that remain blocked eventually enter as best-effort traffic.
+
+The real executor is unchanged:
+
+- prefills are still highest-priority work at task boundaries,
+- decode still runs one iteration at a time,
+- decode batches are still the FCFS head plus the contiguous same-route prefix.
+
+### Baseline comparison
+
+Against the earlier baselines on the 300-request setting:
+
+- `v31_best` remained the best end-to-end latency point in this comparison (`E2E p95 = 7603.84 ms`),
+- `v4.2 incremental` and `v4.3 guarded` had almost identical throughput (`364.92` vs `364.91 tok/s`),
+- but `v4.3 guarded` with the tested harm budgets produced many forced best-effort admissions:
+  - `best_effort_count = 120`
+  - `lost_count = 120`
+  - `admission_queue.max_len = 33`
+  - `admission_queue.mean_wait_ms = 34.75`
+  - `slo_e2e_miss_rate = 0.79`
+
+This means the guarded-admission mechanism worked mechanically, but the tested queue budgets were too strict under the `limit=300`, `scale=0.05` load.
+
+![](../cluster_outputs/v43_sweep_plots/v43_vs_baselines_throughput.png)
+
+![](../cluster_outputs/v43_sweep_plots/v43_vs_baselines_e2e_p95.png)
+
+![](../cluster_outputs/v43_sweep_plots/v43_vs_baselines_tbt_p95.png)
+
+![](../cluster_outputs/v43_sweep_plots/v43_vs_baselines_utilization.png)
+
+### Debug behavior
+
+For small debug runs, the queue plots make the guarded-admission behavior readable directly. The key events are:
+
+- arrival to `waiting_admission`,
+- repeated `admission_eval` / `admission_hold`,
+- `admission_bypass` when a later request is admitted while an earlier one stays queued,
+- eventual `admit_route` or `admission_best_effort`.
+
+The debug timeline below is useful because it shows the actual request state progression instead of only aggregate percentiles.
+
+![](../cluster_outputs/replay_plots/v43_guarded_scale1_l10_debug_request_timeline.png)
+
+![](../cluster_outputs/replay_plots/v43_guarded_scale1_l10_debug_queue_counts.png)
+
+### Clean scale=1 TBT sweep
+
+At `scale=1.0`, the system is mostly arrival-limited, not compute-limited. That makes the TBT sweep a clean way to study admission behavior without conflating it with throughput saturation.
+
+Across the clean `scale=1.0` TBT sweep:
+
+- throughput stayed flat at `69.18 tok/s`,
+- GPU utilization stayed around `0.124`,
+- PIM utilization stayed around `0.018`,
+- tighter TBT SLOs mostly increased admission intervention instead of changing throughput.
+
+Examples:
+
+- `slo_tbt_ms = 50`
+  - `best_effort_count = 230`
+  - `blocked_count = 234`
+  - `bypassed_count = 178`
+  - `TTFT p95 = 345.40 ms`
+- `slo_tbt_ms = 400`
+  - `best_effort_count = 44`
+  - `blocked_count = 45`
+  - `bypassed_count = 10`
+  - `TTFT p95 = 315.55 ms`
+
+So at `scale=1.0`, tighter TBT protection mostly controls the admission tail, while throughput is still determined by the arrival trace.
+
+![](../cluster_outputs/v43_scale1_tbt_sweep_plots/v43_scale1_tbt_sweep_admission_counts.png)
+
+![](../cluster_outputs/v43_scale1_tbt_sweep_plots/v43_scale1_tbt_sweep_latency_p95.png)
+
+![](../cluster_outputs/v43_scale1_tbt_sweep_plots/v43_scale1_tbt_sweep_utilization.png)
+
+## v5 Decode-Energy-Aware Routing
+
+The next addition was energy-aware routing on top of the same replay executor. In `v5`, routing still respects latency first, but when two routes are close enough in predicted finish time, the scheduler can prefer the lower-energy route.
+
+### Implementation model
+
+`v5` uses:
+
+- the existing decode energy column already present in the cost tables: `g_energy (nJ)`,
+- retrained ML bundles that predict `decode_energy_nj`,
+- the incremental FCFS forecaster to accumulate future decode energy,
+- a new route policy: `latency_guarded_energy`.
+
+The policy is:
+
+1. predict finish time and incremental decode energy for each route,
+2. keep routes within `fastest_finish + 5 ms`,
+3. choose the route with the lowest predicted incremental decode energy inside that latency guard.
+
+Important current limitation:
+
+- `v5` is **decode-energy only**
+- prefill energy is still not modeled in route selection
+
+### What changed in decision quality
+
+The useful point is that `v5` does not always choose the fastest route. It chooses the lowest-energy route only when the finish-time penalty is small enough.
+
+The `limit=10`, `scale=1.0` debug run shows this clearly:
+
+- `request 4`
+  - `gpu_only`: finish `462.759 ms`, energy `1.0936e9 nJ`
+  - `lpddr5_pim_bank`: finish `463.710 ms`, energy `1.0736e9 nJ`
+  - chosen: `lpddr5_pim_bank`
+  - reason: latency gap is only `0.95 ms`, inside the `5 ms` guard, so lower energy wins
+
+- `request 5`
+  - `gpu_only`: finish `575.381 ms`, energy `1.3437e9 nJ`
+  - `lpddr5_pim_bank`: finish `571.521 ms`, energy `1.5113e9 nJ`
+  - chosen: `gpu_only`
+  - reason: `gpu_only` is slightly slower (`3.86 ms`), still inside the guard, and lower energy
+
+- `request 7`
+  - `gpu_only`: finish `1051.592 ms`, energy `2.1872e9 nJ`
+  - `lpddr5_pim_bank`: finish `1052.485 ms`, energy `2.1473e9 nJ`
+  - chosen: `lpddr5_pim_bank`
+  - reason: finish gap is only `0.89 ms`, so lower energy wins
+
+- `request 8`
+  - `gpu_only`: finish `1339.691 ms`, energy `6.2652e8 nJ`
+  - `lpddr5_pim_bank`: finish `1326.283 ms`, energy `7.6919e8 nJ`
+  - chosen: `lpddr5_pim_bank`
+  - reason: finish gap is `13.4 ms`, outside the guard, so latency dominates and energy is ignored
+
+This is the intended behavior: energy is active, but it is a secondary objective inside a bounded latency window.
+
+### Aggregate v5 result so far
+
+For the current `limit=2000`, `scale=1.0` replay:
+
+- route mix:
+  - `gpu_only = 63`
+  - `lpddr5_pim_bank = 1937`
+- `throughput_tokps = 69.18`
+- `E2E p95 = 4257.04 ms`
+- `TTFT p95 = 314.08 ms`
+- `TBT p95 = 2.878 ms`
+- actual decode energy:
+  - `decode_energy_nj.total = 7.096e12 nJ`
+  - `decode_energy_nj_per_decode_token = 1.244e8 nJ/token`
+
+So far, the aggregate result says:
+
+- the workload still strongly prefers the hybrid route,
+- energy did not flip the system into GPU-heavy routing,
+- but route choice now changes in near-tie cases.
+
+The standard replay plots below confirm that prediction quality remained stable while adding the energy-aware route selection logic.
+
+![](../cluster_outputs/replay_plots/v5_energy_l2000_predicted_finish_vs_actual_finish.png)
+
+![](../cluster_outputs/replay_plots/v5_energy_l2000_route_mix.png)
+
+For the small debug run:
+
+![](../cluster_outputs/replay_plots/v5_energy_l10_debug_predicted_finish_vs_actual_finish.png)
+
+![](../cluster_outputs/replay_plots/v5_energy_l10_debug_route_mix.png)
+
+### How to interpret the new energy fields
+
+`v5` now records two different energy notions:
+
+- `decode_energy_nj` in the cost model:
+  - predicted energy of one decode step at a given `(route, Lin, Lout, bs)`
+- `chosen_predicted_incremental_decode_energy_nj` in the replay CSV:
+  - predicted **marginal future decode energy added to the system** by choosing that route
+
+The second one is the routing signal that matters. It is not just isolated request energy; it includes batching effects through the incremental forecast. That is why `v5` can prefer a route that creates more efficient future decode batching, even if the isolated single-step energy is not the whole story.
+
+## v5 Full-Request Energy and Guarded Bypass Debugging
+
+After the decode-only `v5` pass, the simulator was extended to model **full request energy** instead of decode energy alone.
+
+### Full-request energy implementation
+
+The following changes were added:
+
+- generated cost tables now include:
+  - `s_energy (nJ)` for prefill
+  - `g_energy (nJ)` for decode
+- learned ML bundles now predict:
+  - `prefill_energy_nj`
+  - `decode_energy_nj`
+- runtime service estimates now carry:
+  - `prefill_energy_nj`
+  - `decode_energy_nj`
+- the incremental FCFS forecaster now accumulates:
+  - total prefill energy
+  - total decode energy
+- `latency_guarded_energy` now routes using **full marginal predicted energy**, not only decode energy
+
+This means the routing signal is now:
+
+```text
+Delta_E_r = E_with(r) - E_base
+```
+
+where `E` includes both forecasted prefill energy and forecasted decode energy.
+
+### Aggregate full-energy run
+
+For the `limit=2000`, `scale=1.0` replay with full-energy ML models:
+
+- `route_counts`
+  - `gpu_only = 98`
+  - `lpddr5_pim_bank = 1902`
+- `energy_nj.total = 1.3682e13`
+- `energy_nj.prefill_total = 7.1029e12`
+- `energy_nj.decode_total = 6.5794e12`
+- `energy_nj_per_request = 6.8412e9`
+- `decode_energy_nj_per_decode_token = 1.1538e8`
+
+This shows that:
+
+- the hybrid route still dominates under this workload,
+- prefill energy is now a first-class part of the accounting,
+- full-request energy can be compared directly against latency metrics in the replay summaries.
+
+![](../cluster_outputs/replay_plots/full_energy_l2000_predicted_finish_vs_actual_finish.png)
+
+![](../cluster_outputs/replay_plots/full_energy_l2000_route_mix.png)
+
+![](../cluster_outputs/replay_plots/full_energy_l2000_latency_ecdf.png)
+
+### Pure-energy routing vs time-only baseline
+
+To isolate the effect of energy-aware routing itself, two matched `limit=10`, `scale=1.0` replays were compared:
+
+- baseline:
+  - `route_policy = min_finish`
+- pure-energy:
+  - `route_policy = latency_guarded_energy`
+  - `energy_latency_guard_ms = 1e9`
+  - no E2E deadline and no guarded admission
+
+With this setup, routing is effectively:
+
+```text
+choose the lowest predicted marginal full-request energy route
+among all eligible routes
+```
+
+#### Deterministic 10-request trace
+
+For `cluster_outputs/debug_trace_deterministic_heavy_sparse.csv`:
+
+- baseline route mix:
+  - `lpddr5_pim_bank = 8`
+- pure-energy route mix:
+  - `gpu_only = 8`
+- total energy:
+  - `5.4583e10 nJ -> 3.7586e10 nJ`
+  - `-31.1%`
+- energy per request:
+  - `6.8229e9 nJ -> 4.6982e9 nJ`
+  - `-31.1%`
+- decode energy per token:
+  - `5.1668e7 nJ -> 3.0806e7 nJ`
+  - `-40.4%`
+- throughput:
+  - `1412.6 tok/s -> 1179.8 tok/s`
+  - `-16.5%`
+- `E2E p95`:
+  - `488.5 ms -> 604.7 ms`
+  - `+23.8%`
+
+Interpretation:
+
+- on this deterministic debug slice, pure-energy routing flips all requests from hybrid to `gpu_only`,
+- that buys a substantial energy reduction,
+- but the energy savings come with a clear latency and throughput penalty.
+
+![](../cluster_outputs/full_energy_det_compare_plots/full_energy_det_compare_energy_total.png)
+
+![](../cluster_outputs/full_energy_det_compare_plots/full_energy_det_compare_decode_energy_per_token.png)
+
+![](../cluster_outputs/full_energy_det_compare_plots/full_energy_det_compare_gpu_route_frac.png)
+
+![](../cluster_outputs/full_energy_det_compare_plots/full_energy_det_compare_e2e_p95.png)
+
+![](../cluster_outputs/replay_plots/full_energy_min_finish_det_l10_debug_request_execution_timeline.png)
+
+![](../cluster_outputs/replay_plots/full_energy_pure_energy_det_l10_debug_request_execution_timeline.png)
+
+#### Azure 10-request slice
+
+For the first `10` requests from `AzureLLMInferenceTrace_code.csv` at `scale=1.0`:
+
+- baseline route mix:
+  - `lpddr5_pim_bank = 10`
+- pure-energy route mix:
+  - `gpu_only = 9`
+  - `lpddr5_pim_bank = 1`
+- total energy:
+  - `6.0201e10 nJ -> 4.9413e10 nJ`
+  - `-17.9%`
+- energy per request:
+  - `6.0201e9 nJ -> 4.9413e9 nJ`
+  - `-17.9%`
+- decode energy per token:
+  - `1.2096e8 nJ -> 6.3259e7 nJ`
+  - `-47.7%`
+- throughput:
+  - `93.59 tok/s -> 88.63 tok/s`
+  - `-5.3%`
+- `E2E p95`:
+  - `1482.0 ms -> 1530.5 ms`
+  - `+3.3%`
+- `TBT p95`:
+  - `286.5 ms -> 140.4 ms`
+  - `-51.0%`
+
+Interpretation:
+
+- even on a tiny Azure slice, the pure-energy policy materially changes route choice,
+- the route mix shifts strongly toward `gpu_only`,
+- total energy drops meaningfully,
+- latency impact is milder than in the deterministic slice,
+- this small sample should be treated as directional, not definitive.
+
+![](../cluster_outputs/replay_plots/full_energy_min_finish_l10_debug_route_mix.png)
+
+![](../cluster_outputs/replay_plots/full_energy_pure_energy_l10_debug_route_mix.png)
+
+![](../cluster_outputs/replay_plots/full_energy_min_finish_l10_debug_latency_ecdf.png)
+
+![](../cluster_outputs/replay_plots/full_energy_pure_energy_l10_debug_latency_ecdf.png)
+
+### Deterministic guarded-bypass debug trace
+
+To make the deferred guarded-admission behavior inspectable, a heterogeneous 8-request deterministic debug trace was added:
+
+- `cluster_outputs/debug_trace_deterministic_bypass8.csv`
+
+This trace is intentionally shaped so that:
+
+- `r2` and `r4` are expensive and get held,
+- later short requests such as `r3`, `r5`, `r6`, and `r7` can be admitted first,
+- the admission queue therefore exhibits real bypass behavior.
+
+On the table-model guarded run with this trace:
+
+- `bypassed_count = 7`
+- `blocked_count = 2`
+- `best_effort_count = 2`
+- `held_count = 30`
+- `admission_queue.max_len = 3`
+
+The queue snapshots show the intended behavior directly:
+
+- `r2` is held,
+- `r3` bypasses `r2`,
+- `r5` bypasses both `r2` and `r4`,
+- `r6` and `r7` also bypass the blocked long requests,
+- the long blocked requests are eventually admitted as best-effort after `max_wait_ms`.
+
+![](../cluster_outputs/replay_plots/full_energy_guarded_bypass8_table_waiting_queue_slots.png)
+
+![](../cluster_outputs/replay_plots/full_energy_guarded_bypass8_table_request_execution_timeline.png)
+
+![](../cluster_outputs/replay_plots/full_energy_guarded_bypass8_table_predicted_finish_vs_actual_finish.png)
+
+### Runtime optimization for guarded-admission ML
+
+Full-energy ML guarded-admission runs became significantly slower than table runs because guarded admission repeatedly triggers:
+
+- route estimates for queued requests,
+- incremental baseline forecasts,
+- projected candidate forecasts,
+- multiple ML target predictions per estimate.
+
+To reduce this cost, the simulator now includes:
+
+- stronger estimate caching for repeated `(route, Lin, Lout, bs)` tuples,
+- prefetch of request estimates for arrivals and waiting-admission requests,
+- cached incremental baseline forecasts when the active state has not changed,
+- projected candidate cache keyed by waiting request, route, and baseline signature,
+- batched ML target inference in `src/learned_cost_model.py`
+
+Replay summaries now expose `cache_stats`, including:
+
+- `estimate_cache_hits`
+- `estimate_cache_misses`
+- `estimate_prefetch_populated`
+- `incremental_active_forecast_cache_hits`
+- `incremental_active_forecast_cache_misses`
+- `projection_cache_hits`
+- `projection_cache_misses`
+- cost-model batched inference counters when using learned models
+
+This makes it possible to see whether runtime is dominated by estimate generation, baseline forecasting, or projected-candidate replay.
+
+## Commands Used
+
+### Main run: full-energy ML replay
+
+```bash
+conda run -n lerobot python tools/run_trace_replay.py \
+  --azure-trace cluster_outputs/trace_cache/AzureLLMInferenceTrace_code.csv \
+  --cost-model ml \
+  --route-policy latency_guarded_energy \
+  --energy-latency-guard-ms 5 \
+  --slo-e2e-ms 5000 \
+  --limit 2000 \
+  --arrival-time-scale 1.0 \
+  --ml-profile gpu_only=cluster_outputs/cost_models_full_energy/gpu_only.pkl \
+  --ml-profile lpddr5_pim_bank=cluster_outputs/cost_models_full_energy/lpddr5_pim_bank.pkl \
+  --routes gpu_only lpddr5_pim_bank \
+  --unsupported-policy clip \
+  --local-scheduling-policy prefill_priority_fcfs_decode \
+  --fcfs-decode-prediction-mode incremental \
+  --enable-decode-batching \
+  --max-decode-batch-size 4 \
+  --requests-csv cluster_outputs/replay_requests_full_energy_l2000.csv \
+  --summary-json cluster_outputs/replay_summary_full_energy_l2000.json
+```
+
+### Debug run: deterministic guarded bypass
+
+This is the stable debug configuration used to demonstrate actual bypass behavior:
+
+```bash
+python tools/run_trace_replay.py \
+  --azure-trace cluster_outputs/debug_trace_deterministic_bypass8.csv \
+  --cost-model table \
+  --profile gpu_only=cluster_outputs/cost_tables_full_energy/gpu_only.csv \
+  --profile lpddr5_pim_bank=cluster_outputs/cost_tables_full_energy/lpddr5_pim_bank.csv \
+  --route-policy latency_guarded_energy \
+  --energy-latency-guard-ms 5 \
+  --slo-e2e-ms 350 \
+  --slo-tbt-ms 3 \
+  --limit 8 \
+  --arrival-time-scale 1.0 \
+  --routes gpu_only lpddr5_pim_bank \
+  --unsupported-policy clip \
+  --local-scheduling-policy prefill_priority_fcfs_decode \
+  --fcfs-decode-prediction-mode incremental \
+  --enable-decode-batching \
+  --max-decode-batch-size 4 \
+  --enable-slo-guarded-admission \
+  --admission-max-harmed-requests 0 \
+  --admission-max-total-harm-ms 0 \
+  --admission-max-single-harm-ms 0 \
+  --admission-max-own-miss-ms 0 \
+  --admission-max-bypass-count 5 \
+  --admission-max-wait-ms 150 \
+  --admission-aging-harm-ms-per-ms 0.01 \
+  --admission-aging-harmed-requests-per-ms 0.001 \
+  --admission-retry-interval-ms 10 \
+  --requests-csv cluster_outputs/replay_requests_full_energy_guarded_bypass8_table.csv \
+  --summary-json cluster_outputs/replay_summary_full_energy_guarded_bypass8_table.json \
+  --debug-events-csv cluster_outputs/debug_events_full_energy_guarded_bypass8_table.csv
+```
+
+### Plot replay results
+
+For the main full-energy replay:
+
+```bash
+python tools/plot_replay_results.py \
+  --requests-csv cluster_outputs/replay_requests_full_energy_l2000.csv \
+  --summary-json cluster_outputs/replay_summary_full_energy_l2000.json \
+  --out-dir cluster_outputs/replay_plots \
+  --prefix full_energy_l2000
+```
+
+### Plot debug results
+
+Regular replay/debug plots:
+
+```bash
+python tools/plot_replay_results.py \
+  --requests-csv cluster_outputs/replay_requests_full_energy_guarded_bypass8_table.csv \
+  --summary-json cluster_outputs/replay_summary_full_energy_guarded_bypass8_table.json \
+  --debug-events-csv cluster_outputs/debug_events_full_energy_guarded_bypass8_table.csv \
+  --prediction-history-min-request-id 0 \
+  --prediction-history-max-request-id 7 \
+  --out-dir cluster_outputs/replay_plots \
+  --prefix full_energy_guarded_bypass8_table
+```
+
+Admission-queue / execution-debug plots:
+
+```bash
+python tools/plot_debug_admission.py \
+  --events-csv cluster_outputs/debug_events_full_energy_guarded_bypass8_table.csv \
+  --requests-csv cluster_outputs/replay_requests_full_energy_guarded_bypass8_table.csv \
+  --out-dir cluster_outputs/replay_plots \
+  --prefix full_energy_guarded_bypass8_table
+```
