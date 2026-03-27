@@ -8,8 +8,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from src.trace_replay_sim import (LookupResult, RequestServiceEstimate,
-                                  RouteServicePoint)
+from src.trace_replay.types import (LookupResult, RequestServiceEstimate,
+                                    RouteServicePoint)
 
 
 TARGET_NAMES = (

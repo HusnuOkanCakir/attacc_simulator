@@ -2680,3 +2680,802 @@ python tools/plot_debug_admission.py \
   --out-dir cluster_outputs/replay_plots \
   --prefix full_energy_guarded_bypass8_table
 ```
+
+## Azure Guarded-Admission Exploration
+
+To look for the same guarded-bypass behavior on the Azure trace, a small automation script was added:
+
+- `tools/run_azure_guarded_bypass_explore.sh`
+
+It runs a few strict guarded-admission cases automatically, writes replay outputs under:
+
+- `cluster_outputs/azure_guarded_bypass_explore`
+
+and writes replay/debug plots under:
+
+- `cluster_outputs/azure_guarded_bypass_explore_plots`
+
+The default run command is:
+
+```bash
+bash tools/run_azure_guarded_bypass_explore.sh
+```
+
+The generated summary table is:
+
+- `cluster_outputs/azure_guarded_bypass_explore/summary_table.csv`
+
+### Why this script is needed
+
+With the Azure trace, `arrival_time_scale=1.0` is usually too sparse to expose interesting guarded-admission behavior in short runs. To make queueing and bypass observable, the trace has to be densified and the SLOs have to be made intentionally strict.
+
+The default exploration cases were:
+
+- `azure_scale025_e1200_t5_w150_r10`
+- `azure_scale025_e900_t3_w150_r10`
+- `azure_scale01_e900_t3_w150_r10`
+
+All cases use:
+
+- full-energy ML routing,
+- `latency_guarded_energy`,
+- `energy_latency_guard_ms=5`,
+- strict guarded-admission thresholds,
+- `admission_max_wait_ms=150`,
+- `admission_retry_interval_ms=10`
+
+### Main observations
+
+1. Azure does show real bypass, but only under denser slices.
+
+- `arrival_time_scale=0.25` already produces queueing and some bypass.
+- `arrival_time_scale=0.1` produces the clearest repeated bypass behavior.
+
+2. `azure_scale025_e1200_t5_w150_r10` shows guarded queueing, but only modest bypass.
+
+- `bypassed_count = 5`
+- `held_count = 616`
+- `best_effort_count = 41`
+- `queue_max_len = 8`
+- `queue_mean_wait_ms = 123.2`
+- `route_counts = {'gpu_only': 48, 'lpddr5_pim_bank': 2}`
+- `energy_nj.total = 2.738e11`
+- `throughput_tokps = 80.77`
+
+This setting is useful because it shows that the Azure trace can enter guarded-admission mode, but it is not a good operating point:
+
+- `slo_e2e_miss_rate = 1.0`
+
+So nearly every request still misses the E2E target.
+
+3. Tightening the SLOs further changes the route mix materially.
+
+For `azure_scale025_e900_t3_w150_r10`:
+
+- `bypassed_count = 5`
+- `held_count = 647`
+- `best_effort_count = 42`
+- `route_counts = {'gpu_only': 13, 'lpddr5_pim_bank': 37}`
+- `energy_nj.total = 3.336e11`
+- `throughput_tokps = 82.30`
+
+Relative to the `e1200/t5` case, the route mix shifts strongly away from `gpu_only`, and total energy increases. This confirms that route choice is not fixed; it responds to the workload and the SLO/queue context even though the route policy remains energy-aware.
+
+4. `azure_scale01_e900_t3_w150_r10` is the clearest Azure debug case for bypass.
+
+- `bypassed_count = 30`
+- `held_count = 554`
+- `best_effort_count = 35`
+- `queue_max_len = 12`
+- `queue_mean_wait_ms = 110.8`
+- `route_counts = {'gpu_only': 11, 'lpddr5_pim_bank': 39}`
+- `energy_nj.total = 3.361e11`
+- `throughput_tokps = 123.75`
+
+This case shows repeated multi-request bypass chains in the queue snapshots. For example:
+
+- `r7` bypasses `r3`, `r4`, `r5`, and `r6`
+- later `r9` bypasses `r3`, `r4`, `r5`, `r6`, and `r8`
+
+and later bursts show the same pattern again.
+
+So for Azure, this is the most useful default debug case when the goal is to visually inspect guarded bypass.
+
+### Important interpretation
+
+These Azure exploration settings are stress/debug settings, not tuned production settings.
+
+Across the three default cases:
+
+- E2E miss rates remain very high (`0.92` to `1.0`)
+- many requests are eventually admitted through best-effort
+- queue wait is large (`110` to `129 ms`)
+
+So the script is best understood as a tool for:
+
+- finding settings where guarded bypass is visible,
+- inspecting the interaction between SLO strictness and route mix,
+- debugging admission behavior on Azure,
+
+not as a source of final serving parameters.
+
+### Useful plot files
+
+Summary/debug files:
+
+- `cluster_outputs/azure_guarded_bypass_explore/summary_table.csv`
+
+Most useful plots for `azure_scale01_e900_t3_w150_r10`:
+
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale01_e900_t3_w150_r10_queue_snapshots.txt`
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale01_e900_t3_w150_r10_waiting_queue_slots.png`
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale01_e900_t3_w150_r10_request_execution_timeline.png`
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale01_e900_t3_w150_r10_route_mix.png`
+
+Useful comparison plots for the `scale=0.25` cases:
+
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale025_e1200_t5_w150_r10_route_mix.png`
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale025_e900_t3_w150_r10_route_mix.png`
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale025_e1200_t5_w150_r10_waiting_queue_slots.png`
+- `cluster_outputs/azure_guarded_bypass_explore_plots/azure_scale025_e900_t3_w150_r10_waiting_queue_slots.png`
+
+## Azure Energy-Guard Sweep Without Guarded Admission
+
+To isolate the effect of the route-energy threshold itself, the Azure sweep was also run with:
+
+- guarded admission disabled,
+- request SLO deadlines disabled,
+- full-energy ML routing enabled,
+- `latency_guarded_energy` as the route policy.
+
+This sweep uses:
+
+- Azure trace: `cluster_outputs/trace_cache/AzureLLMInferenceTrace_code.csv`
+- `limit = 100`
+- `arrival_time_scale = 0.25`
+- guard values:
+  - `0, 2, 5, 10, 20, 50, 100`
+
+Outputs are written to:
+
+- `cluster_outputs/azure_energy_guard_sweep_noguard`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots`
+
+The summary table is:
+
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_summary_table.csv`
+
+### Main result
+
+This sweep is much more informative than the guarded-admission versions for studying route-energy thresholding.
+
+The main pattern is:
+
+- `guard = 0, 2`
+  - `gpu_only = 0`
+  - `lpddr5_pim_bank = 100`
+  - `energy_nj.total = 6.804e11`
+- `guard = 5`
+  - `gpu_only = 5`
+  - `lpddr5_pim_bank = 95`
+  - `energy_nj.total = 6.742e11`
+- `guard = 10`
+  - `gpu_only = 51`
+  - `lpddr5_pim_bank = 49`
+  - `energy_nj.total = 5.999e11`
+- `guard = 20`
+  - `gpu_only = 58`
+  - `lpddr5_pim_bank = 42`
+  - `energy_nj.total = 5.905e11`
+- `guard = 50`
+  - `gpu_only = 69`
+  - `lpddr5_pim_bank = 31`
+  - `energy_nj.total = 5.800e11`
+- `guard = 100`
+  - `gpu_only = 52`
+  - `lpddr5_pim_bank = 48`
+  - `energy_nj.total = 6.015e11`
+
+So this run shows the intended behavior clearly:
+
+- very small guards behave like latency-first routing and stay almost entirely on `lpddr5_pim_bank`,
+- medium guards allow many more `gpu_only` selections,
+- total energy drops substantially,
+- but very large guards are not always better than medium ones.
+
+### Quantitative interpretation
+
+From `guard = 0` to `guard = 50`:
+
+- `gpu_only` increases from `0` to `69` requests,
+- total request energy drops by about `14.7%`,
+- decode energy per token drops by about `34.7%`.
+
+This is the cleanest demonstration so far that the energy guard is doing meaningful route shaping.
+
+The best point in this sweep is not “infinite guard”; it is the midrange:
+
+- around `10–50 ms`
+
+In this particular run, `50 ms` is the best observed point.
+
+At `100 ms`, the energy win partially reverses:
+
+- route mix shifts back toward a more balanced `gpu_only` / `lpddr5_pim_bank` split,
+- total energy increases relative to `50 ms`.
+
+So the energy-latency tradeoff is not monotonic forever. There is a useful guard region, not just a single “bigger is better” rule.
+
+### Latency and throughput
+
+The energy improvement does not come with a major throughput penalty in this sweep.
+
+Comparing `guard = 0` and `guard = 50`:
+
+- throughput is nearly unchanged:
+  - `46.22 tok/s -> 46.06 tok/s`
+- `TTFT p95` improves slightly:
+  - `3506 ms -> 3365 ms`
+- `E2E p95` improves slightly:
+  - `6436 ms -> 6393 ms`
+- `TBT p95` gets worse in absolute value:
+  - `2.88 ms -> 5.96 ms`
+
+So the sweep suggests:
+
+- meaningful energy savings,
+- almost no throughput loss,
+- slight TTFT/E2E improvement,
+- somewhat worse TBT tail.
+
+### Why queue plots are empty here
+
+In this sweep:
+
+- `ENABLE_SLO_GUARDED_ADMISSION = 0`
+
+So there is no admission queue. That is expected, and therefore:
+
+- `held_count = 0`
+- `bypassed_count = 0`
+- `best_effort_count = 0`
+- queue snapshot text files are empty
+
+This is correct for this experiment, because the goal is to isolate route-threshold behavior, not admission behavior.
+
+### Useful plots
+
+Most useful summary plots:
+
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_route_counts.png`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_route_fractions.png`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_energy_total.png`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_decode_energy_per_token.png`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_ttft_p95.png`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_e2e_p95.png`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_tbt_p95.png`
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_throughput_tokps.png`
+
+Summary table:
+
+- `cluster_outputs/azure_energy_guard_sweep_noguard_plots/azure_energy_guard_sweep_noguard_summary_table.csv`
+
+The queue/admission plots are intentionally uninformative in this mode and should not be used as the primary evidence for this sweep.
+
+## Azure `admission_max_total_harm_ms` Sweep
+
+We also ran an isolated sweep over `admission_max_total_harm_ms` on the Azure debug slice.
+
+Setup:
+
+- Azure trace:
+  - `cluster_outputs/trace_cache/AzureLLMInferenceTrace_code.csv`
+- `cost_model = ml`
+- `route_policy = latency_guarded_energy`
+- `energy_latency_guard_ms = 0`
+- `limit = 50`
+- `arrival_time_scale = 0.25`
+- `slo_e2e_ms = 900`
+- `slo_tbt_ms = 3`
+- guarded admission enabled
+- self-harm disabled:
+  - `admission_check_own_slo = False`
+- to make `admission_max_total_harm_ms` the active gate, the other harm gates were relaxed:
+  - `admission_max_harmed_requests = 999`
+  - `admission_max_single_harm_ms = 99999`
+- fixed queueing controls:
+  - `admission_max_wait_ms = 150`
+  - `admission_retry_interval_ms = 10`
+
+Outputs:
+
+- summary table:
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_summary_table.csv`
+- key plots:
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_admission_counts.png`
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_queue_pressure.png`
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_ttft_p95.png`
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_e2e_p95.png`
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_tbt_p95.png`
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_throughput_tokps.png`
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_route_counts.png`
+  - `cluster_outputs/azure_admission_total_harm_sweep_plots/azure_admission_total_harm_sweep_route_fractions.png`
+
+Queue-snapshot text files now also record:
+
+- whether the admitted request chose:
+  - `gpu`
+  - `gpu+pim`
+- the exact chosen route id
+- the route-decision reason
+
+Examples:
+
+- `cluster_outputs/azure_admission_total_harm_sweep_plots/harm0_queue_snapshots.txt`
+- `cluster_outputs/azure_admission_total_harm_sweep_plots/harm25_queue_snapshots.txt`
+
+Main findings:
+
+- this sweep was meaningful only after relaxing:
+  - `admission_max_harmed_requests`
+  - `admission_max_single_harm_ms`
+- otherwise the stronger gates dominated first and `admission_max_total_harm_ms` appeared to do nothing
+
+Observed regimes:
+
+- `admission_max_total_harm_ms = 0` or `5`
+  - route mix stayed mostly/all hybrid:
+    - `gpu_only = 0`
+    - `lpddr5_pim_bank = 50`
+  - throughput stayed higher:
+    - about `82.27 tok/s`
+  - tail latency stayed worse:
+    - `TTFT p95 ~= 3510 ms`
+    - `E2E p95 ~= 5219 ms`
+  - `TBT p95` stayed lower:
+    - about `2.88 ms`
+
+- `admission_max_total_harm_ms = 10, 25, 50, 100`
+  - route mix shifted to a GPU-heavier regime:
+    - `gpu_only = 28`
+    - `lpddr5_pim_bank = 22`
+  - throughput dropped slightly:
+    - about `80.54-80.62 tok/s`
+  - `TTFT p95` and `E2E p95` improved:
+    - `TTFT p95 ~= 3355-3396 ms`
+    - `E2E p95 ~= 5107-5108 ms`
+  - `TBT p95` became worse:
+    - about `5.96 ms`
+
+- `admission_max_total_harm_ms = 200`
+  - the system moved back toward the hybrid-heavy regime:
+    - `gpu_only = 1`
+    - `lpddr5_pim_bank = 49`
+  - throughput rose back to about `82.26 tok/s`
+  - `TTFT p95` / `E2E p95` also moved back toward the looser-hybrid behavior
+
+Interpretation:
+
+- tighter total-harm budgets favor higher aggregate throughput but worse request latency tails
+- moderate total-harm budgets favor better `TTFT` / `E2E` tails but lower throughput
+- the route mix shift is indirect:
+  - `energy_latency_guard_ms = 0`, so this is not an energy-preference experiment
+  - instead, changing the admission budget changes the active set and queue state
+  - that changes which route is predicted to finish first at admission time
+
+Why higher GPU fraction can have better latency but worse throughput:
+
+- `gpu_only` removes some hybrid/PIM coordination and wait overhead, so individual requests can finish earlier
+- but it also pushes more work onto the GPU and reduces cross-resource overlap
+- as a result:
+  - per-request latency can improve
+  - total token throughput can still decrease
+
+So this sweep exposed a clear latency/throughput tradeoff:
+
+- more GPU-heavy routing:
+  - better `TTFT` / `E2E`
+  - worse throughput
+  - worse `TBT`
+- more hybrid-heavy routing:
+  - better throughput
+  - worse `TTFT` / `E2E`
+  - better `TBT`
+
+One important caveat:
+
+- all cases in this sweep still had:
+  - `slo_e2e_miss_rate = 1.0`
+
+So this is useful as a mechanism study for admission/routing interaction, not as a final operating point.
+
+## Static Route-Energy Grid Diagnostic
+
+To explain why the Azure energy-guard sweeps often became more GPU-heavy as the scheduler became more energy-conscious, we added a static route-energy diagnostic over a `(Lin, Lout)` grid using the full-energy ML models.
+
+Outputs:
+
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_meta.json`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_grid.csv`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_comparison.csv`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_winner_counts.csv`
+
+Energy plots:
+
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_prefill_by_route.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_prefill_diff_hybrid_minus_gpu.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_prefill_winner_map.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_decode_total_by_route.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_decode_total_diff_hybrid_minus_gpu.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_decode_total_winner_map.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_total_by_route.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_total_diff_hybrid_minus_gpu.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_total_winner_map.png`
+
+Azure-distribution overlays:
+
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_azure_distribution_counts.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_azure_distribution_fraction.png`
+- `cluster_outputs/route_energy_grid_full_energy_ml/route_energy_grid_full_energy_ml_total_winner_with_azure_counts.png`
+
+Grid setup from the meta file:
+
+- `bs = 1`
+- common comparison bounds:
+  - `Lin in [2, 6144]`
+  - `Lout in [2, 208]`
+- sampled grid:
+  - `Lin = [2, 6, 20, 62, 197, 620, 1951, 6144]`
+  - `Lout = [2, 5, 13, 32, 82, 208]`
+
+### Raw grid winners
+
+From `route_energy_grid_full_energy_ml_winner_counts.csv`:
+
+- prefill energy:
+  - `gpu lower = 12`
+  - `gpu+pim lower = 6`
+  - `tie = 30`
+- decode total energy:
+  - `gpu lower = 23`
+  - `gpu+pim lower = 25`
+- total request energy:
+  - `gpu lower = 20`
+  - `gpu+pim lower = 28`
+
+So the static grid does **not** say:
+
+- GPU always wins
+- GPU+PIM always wins
+
+Instead:
+
+- prefill is often tied
+- decode is mixed
+- total request energy slightly favors `gpu+pim` on the unweighted grid
+
+### Azure workload distribution on the grid
+
+The Azure trace is not uniformly spread over the grid. The highest-density cells are:
+
+- `(Lin=1951, Lout=13)`:
+  - about `20.2%`
+- `(Lin=620, Lout=13)`:
+  - about `10.7%`
+- `(Lin=1951, Lout=5)`:
+  - about `9.2%`
+- `(Lin=6144, Lout=13)`:
+  - about `9.0%`
+- `(Lin=1951, Lout=32)`:
+  - about `7.3%`
+
+So this Azure slice is concentrated in:
+
+- medium-to-large `Lin`
+- small `Lout`
+
+That is important, because the route winner depends strongly on where the workload sits in the grid.
+
+### Azure-weighted winners
+
+When the winner map is weighted by the Azure trace distribution on the grid:
+
+- prefill energy:
+  - `gpu+pim` lower on about `41.3%`
+  - `gpu` lower on about `39.8%`
+  - `tie` on about `18.9%`
+
+- decode total energy:
+  - `gpu` lower on about `81.5%`
+  - `gpu+pim` lower on about `18.5%`
+
+- total request energy:
+  - `gpu` lower on about `52.1%`
+  - `gpu+pim` lower on about `47.9%`
+
+This is the main result of the diagnostic:
+
+- for the Azure workload distribution, `gpu_only` is slightly favored in total request energy
+- and strongly favored in decode total energy
+
+So the earlier energy-guard sweeps were not contradicting the cost model.
+
+### Why the “energy-aware” sweep became more GPU-heavy
+
+A simple intuition might be:
+
+- PIM should always be more energy-efficient than GPU
+
+But that is not what the current routing objective is using.
+
+The route policy uses:
+
+- full request energy
+- under the current cost model
+- not a device-level heuristic like “PIM is always lower power”
+
+For this Azure workload:
+
+- `Lout` is usually small
+- `Lin` is often large
+- the total request energy is therefore not dominated by very long decode
+
+As a result:
+
+- `lpddr5_pim_bank` is **not** universally lower-energy
+- on many of the high-density Azure cells, `gpu_only` is predicted to be lower in total request energy
+
+### Most important workload cells
+
+Examples from the most populated grid cells:
+
+- `(1951, 13)`:
+  - total-energy winner: `gpu+pim`
+- `(620, 13)`:
+  - total-energy winner: `gpu`
+- `(1951, 5)`:
+  - total-energy winner: `gpu+pim`
+- `(6144, 13)`:
+  - total-energy winner: `gpu`
+- `(1951, 32)`:
+  - total-energy winner: `gpu`
+
+So the dominant Azure cells are mixed, but enough high-density cells favor GPU that the Azure-weighted total tilts slightly toward `gpu_only`.
+
+### Static vs dynamic interpretation
+
+This diagnostic is static:
+
+- `bs = 1`
+- no queueing
+- no dynamic batching
+- no active-system state
+
+The replay route choice is dynamic:
+
+- incremental forecast
+- current system state
+- batching / contention effects
+- marginal total energy under that state
+
+So the replay can become more GPU-heavy than the static `52/48` Azure-weighted split.
+
+That is expected.
+
+### Bottom line
+
+What we can conclude is:
+
+- `lpddr5_pim_bank` is not universally lower-energy in the current full-energy ML model
+- for the Azure workload distribution, `gpu_only` is:
+  - slightly favored in total request energy
+  - strongly favored in decode total energy
+- that is consistent with the energy-guard sweeps moving toward more GPU as the scheduler becomes more energy-conscious
+
+So the “inverse” result in the energy sweeps is not a bug in the plotting or routing logic; it reflects the current learned energy surface plus the actual Azure workload distribution.
+
+## Replay Knob Reference
+
+This section collects the main replay/scheduling knobs that were used in the experiments above.
+
+### Workload / input knobs
+
+- `azure_trace`
+  - input trace path or URL
+- `limit`
+  - number of requests to replay
+- `arrival_time_scale`
+  - scales inter-arrival times
+  - smaller values make the trace denser
+- `cost_model`
+  - `table` or `ml`
+
+### Routing knobs
+
+- `route_policy`
+  - route-selection policy
+  - examples:
+    - `min_finish`
+    - `slack_then_finish`
+    - `latency_guarded_energy`
+- `energy_latency_guard_ms`
+  - for `latency_guarded_energy`
+  - all routes within `fastest_finish + energy_latency_guard_ms` are eligible
+  - among those, the lowest predicted marginal energy route is selected
+- `unsupported_policy`
+  - how unsupported/missing model points are handled
+  - typically `clip`
+
+### Decode / local scheduling knobs
+
+- `local_scheduling_policy`
+  - local executor policy
+  - main policy used here:
+    - `prefill_priority_fcfs_decode`
+- `fcfs_decode_prediction_mode`
+  - decode prediction mode
+  - examples:
+    - `legacy`
+    - `shadow`
+    - `incremental`
+- `enable_decode_batching`
+  - enables decode batching
+- `max_decode_batch_size`
+  - maximum decode batch size
+
+### Request-SLO knobs
+
+- `slo_e2e_ms`
+  - request end-to-end SLO target
+  - required for guarded admission because existing-request harm is measured against request deadlines
+- `slo_tbt_ms`
+  - token-by-token SLO target
+  - optional for guarded admission unless `admission_check_own_slo` is enabled
+
+These SLOs are used by:
+
+- guarded admission, when enabled
+- and optionally by route decision, when request deadlines are explicitly set in the run
+
+### Guarded-admission toggles
+
+- `enable_slo_guarded_admission`
+  - enables the deferred guarded-admission queue
+- `enable_predictive_admission`
+  - alternative admission mode
+  - not used together with `enable_slo_guarded_admission`
+
+### Core admission knobs
+
+- `admission_max_harmed_requests`
+  - how many existing requests may be harmed
+- `admission_max_total_harm_ms`
+  - total allowed added harm across existing requests
+- `admission_max_single_harm_ms`
+  - allowed harm to any one request
+- `admission_check_own_slo`
+  - optional boolean
+  - when enabled, guarded admission also checks the candidate request's own E2E/TBT SLOs
+  - default is `False`
+  - current default guarded behavior is therefore:
+    - check harm to existing requests
+    - do not block on the candidate's own E2E/TBT miss
+- `admission_max_own_miss_ms`
+  - how much the candidate may miss its own SLO and still be admitted
+  - only used when `admission_check_own_slo = True`
+- `admission_max_bypass_count`
+  - how many later requests may bypass a blocked one before forcing it
+- `admission_max_wait_ms`
+  - max time a blocked request may sit in the queue before best-effort
+- `admission_retry_interval_ms`
+  - how often queued requests are reevaluated
+- `admission_aging_harm_ms_per_ms`
+  - how quickly harm thresholds relax with waiting time
+- `admission_aging_harmed_requests_per_ms`
+  - how quickly harmed-request count tolerance relaxes
+
+### Practical interpretation of the admission knobs
+
+- stricter admission:
+  - smaller values for:
+    - `admission_max_harmed_requests`
+    - `admission_max_total_harm_ms`
+    - `admission_max_single_harm_ms`
+- stricter self-checking:
+  - enable `admission_check_own_slo`
+  - then smaller `admission_max_own_miss_ms`
+- more opportunistic bypass:
+  - larger `admission_max_bypass_count`
+- more patience before forced admission:
+  - larger `admission_max_wait_ms`
+- more frequent reevaluation:
+  - smaller `admission_retry_interval_ms`
+- stronger aging/relaxation:
+  - larger:
+    - `admission_aging_harm_ms_per_ms`
+    - `admission_aging_harmed_requests_per_ms`
+
+### Typical guarded-admission operating bundles
+
+Strict bundle:
+
+- `admission_max_harmed_requests = 0`
+- `admission_max_total_harm_ms = 0`
+- `admission_max_single_harm_ms = 0`
+- `admission_check_own_slo = False`
+- `admission_max_own_miss_ms = 0`
+- `admission_max_bypass_count = 5`
+- `admission_max_wait_ms = 150`
+- `admission_retry_interval_ms = 10`
+- `admission_aging_harm_ms_per_ms = 0.01`
+- `admission_aging_harmed_requests_per_ms = 0.001`
+
+Moderate bundle:
+
+- `admission_max_harmed_requests = 1`
+- `admission_max_total_harm_ms = 25`
+- `admission_max_single_harm_ms = 10`
+- `admission_check_own_slo = False`
+- `admission_max_own_miss_ms = 25`
+- `admission_max_bypass_count = 2`
+- `admission_max_wait_ms = 100`
+- `admission_retry_interval_ms = 25`
+- `admission_aging_harm_ms_per_ms = 0.02`
+- `admission_aging_harmed_requests_per_ms = 0.001`
+
+Loose bundle:
+
+- `admission_max_harmed_requests = 2`
+- `admission_max_total_harm_ms = 50`
+- `admission_max_single_harm_ms = 20`
+- `admission_check_own_slo = False`
+- `admission_max_own_miss_ms = 50`
+- `admission_max_bypass_count = 1`
+- `admission_max_wait_ms = 50`
+- `admission_retry_interval_ms = 25`
+- `admission_aging_harm_ms_per_ms = 0.05`
+- `admission_aging_harmed_requests_per_ms = 0.002`
+
+### Output / debug knobs
+
+- `requests_csv`
+  - per-request replay output
+- `summary_json`
+  - replay summary output
+- `debug_events_csv`
+  - detailed debug-event log used by:
+    - `plot_replay_results.py`
+    - `plot_debug_admission.py`
+
+### Summary Table
+
+| Knob | Category | Meaning |
+| --- | --- | --- |
+| `azure_trace` | Workload | Input trace path or URL |
+| `limit` | Workload | Number of requests to replay |
+| `arrival_time_scale` | Workload | Scales inter-arrival times; smaller means denser arrivals |
+| `cost_model` | Workload | Cost backend: `table` or `ml` |
+| `route_policy` | Routing | Route-selection policy |
+| `energy_latency_guard_ms` | Routing | Allowed finish-time slack for energy-aware routing |
+| `unsupported_policy` | Routing | How unsupported points are handled, typically `clip` |
+| `local_scheduling_policy` | Scheduling | Local executor policy, typically `prefill_priority_fcfs_decode` |
+| `fcfs_decode_prediction_mode` | Scheduling | Decode prediction mode: `legacy`, `shadow`, or `incremental` |
+| `enable_decode_batching` | Scheduling | Enables decode batching |
+| `max_decode_batch_size` | Scheduling | Maximum decode batch size |
+| `slo_e2e_ms` | Request SLO | End-to-end request SLO |
+| `slo_tbt_ms` | Request SLO | Token-by-token SLO |
+| `enable_slo_guarded_admission` | Admission | Enables deferred guarded-admission queue |
+| `enable_predictive_admission` | Admission | Enables predictive admission; not used with guarded admission |
+| `admission_max_harmed_requests` | Admission | Max number of existing requests that may be harmed |
+| `admission_max_total_harm_ms` | Admission | Max total added harm across existing requests |
+| `admission_max_single_harm_ms` | Admission | Max harm allowed to any one existing request |
+| `admission_check_own_slo` | Admission | Optional candidate self-SLO gate; default `False` |
+| `admission_max_own_miss_ms` | Admission | Max SLO miss allowed for the candidate itself when self-checking is enabled |
+| `admission_max_bypass_count` | Admission | How many later requests may bypass a blocked one |
+| `admission_max_wait_ms` | Admission | Max queue wait before forced best-effort admission |
+| `admission_retry_interval_ms` | Admission | How often queued requests are reevaluated |
+| `admission_aging_harm_ms_per_ms` | Admission | How quickly harm tolerance relaxes with wait time |
+| `admission_aging_harmed_requests_per_ms` | Admission | How quickly harmed-request-count tolerance relaxes with wait time |
+| `requests_csv` | Output | Per-request replay output |
+| `summary_json` | Output | Aggregate replay summary output |
+| `debug_events_csv` | Output | Detailed debug-event log used for replay/debug plots |

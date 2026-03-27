@@ -56,6 +56,15 @@ def _to_float(v: Any) -> Optional[float]:
     return out
 
 
+def _to_str(v: Any) -> str:
+    if _is_nan(v):
+        return ""
+    try:
+        return str(v).strip()
+    except Exception:
+        return ""
+
+
 def _safe_prefix(path: Path, override: Optional[str]) -> str:
     return override if override else path.stem
 
@@ -67,6 +76,16 @@ def _queue_str(queue: List[int]) -> str:
 def _color_for_request(request_id: int):
     cmap = plt.get_cmap("tab20")
     return cmap(request_id % 20)
+
+
+def _route_kind(route: Optional[str]) -> Optional[str]:
+    if not route:
+        return None
+    if route == "gpu_only":
+        return "gpu"
+    if "pim" in route:
+        return "gpu+pim"
+    return route
 
 
 def _parse_request_ids(value: Any) -> List[int]:
@@ -115,7 +134,10 @@ def reconstruct_queue_snapshots(events_df: pd.DataFrame) -> pd.DataFrame:
         rid = _to_int(row.get("request_id"))
         changed = False
         note = ""
-        reason = str(row.get("reason", "")).strip()
+        reason = _to_str(row.get("reason", ""))
+        decision_reason = _to_str(row.get("decision_reason", ""))
+        chosen_route = _to_str(row.get("chosen_route", ""))
+        chosen_route_kind = _route_kind(chosen_route if chosen_route else None)
         queue_wait_ms = _to_float(row.get("queue_wait_ms"))
 
         if event == "arrival_enqueued" and rid is not None:
@@ -128,6 +150,12 @@ def reconstruct_queue_snapshots(events_df: pd.DataFrame) -> pd.DataFrame:
                 queue.remove(rid)
                 changed = True
                 note = f"dequeue r{rid} ({event})"
+                if chosen_route_kind is not None:
+                    note += f" route={chosen_route_kind}"
+                    if chosen_route:
+                        note += f"[{chosen_route}]"
+                if decision_reason:
+                    note += f" decision={decision_reason}"
         elif event == "admission_hold" and rid is not None:
             changed = True
             note = f"hold r{rid}"
@@ -158,6 +186,9 @@ def reconstruct_queue_snapshots(events_df: pd.DataFrame) -> pd.DataFrame:
             "admitted_request_id": _to_int(row.get("admitted_request_id")),
             "bypass_count": _to_int(row.get("bypass_count")),
             "reason": reason if reason else None,
+            "decision_reason": decision_reason if decision_reason else None,
+            "chosen_route": chosen_route if chosen_route else None,
+            "chosen_route_kind": chosen_route_kind,
             "queue_wait_ms": queue_wait_ms,
             "waiting_admission_count": len(queue),
             "waiting_queue_order": json.dumps(queue),

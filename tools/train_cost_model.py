@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.trace_replay_sim import OutputCsvCostModel
+from src.trace_replay import OutputCsvCostModel
 
 
 FEATURE_NAMES = ["Lin", "Lout", "bs"]

@@ -13,8 +13,7 @@ if ROOT not in sys.path:
 from src.azure_trace import load_azure_llm_trace
 from src.learned_cost_model import LearnedCostModel
 from src.scheduler_policy import QueueAwareFinishTimePolicy
-from src.trace_replay_sim import (OutputCsvCostModel, ReplayConfig,
-                                  TraceReplaySimulator)
+from src.trace_replay import OutputCsvCostModel, ReplayConfig, TraceReplaySimulator
 
 
 DEFAULT_AZURE_TRACE = (
@@ -167,7 +166,13 @@ def main() -> int:
     p.add_argument("--admission-max-own-miss-ms",
                    type=float,
                    default=0.0,
-                   help="Maximum E2E miss allowed for the candidate request itself")
+                   help=("Maximum E2E miss allowed for the candidate request itself "
+                         "when --admission-check-own-slo is enabled"))
+    p.add_argument("--admission-check-own-slo",
+                   action="store_true",
+                   help=("When set, guarded admission also requires the candidate request "
+                         "to satisfy its own E2E/TBT SLOs. By default guarded admission "
+                         "only blocks admissions that would violate existing requests."))
     p.add_argument("--admission-max-bypass-count",
                    type=int,
                    default=0,
@@ -276,13 +281,13 @@ def main() -> int:
     if args.enable_predictive_admission:
         if args.slo_e2e_ms is None:
             raise ValueError("--enable-predictive-admission requires --slo-e2e-ms")
-        if args.slo_tbt_ms is None:
-            raise ValueError("--enable-predictive-admission requires --slo-tbt-ms")
+        if args.admission_check_own_slo and args.slo_tbt_ms is None:
+            raise ValueError("--admission-check-own-slo requires --slo-tbt-ms when --enable-predictive-admission is set")
     if args.enable_slo_guarded_admission:
         if args.slo_e2e_ms is None:
             raise ValueError("--enable-slo-guarded-admission requires --slo-e2e-ms")
-        if args.slo_tbt_ms is None:
-            raise ValueError("--enable-slo-guarded-admission requires --slo-tbt-ms")
+        if args.admission_check_own_slo and args.slo_tbt_ms is None:
+            raise ValueError("--admission-check-own-slo requires --slo-tbt-ms when --enable-slo-guarded-admission is set")
     if args.local_scheduling_policy == "prefill_priority_fcfs_decode":
         if args.enable_predictive_admission:
             raise SystemExit("prefill_priority_fcfs_decode does not support --enable-predictive-admission")
@@ -342,6 +347,7 @@ def main() -> int:
                        admission_max_total_harm_ms=max(0.0, args.admission_max_total_harm_ms),
                        admission_max_single_harm_ms=max(0.0, args.admission_max_single_harm_ms),
                        admission_max_own_miss_ms=max(0.0, args.admission_max_own_miss_ms),
+                       admission_check_own_slo=args.admission_check_own_slo,
                        admission_max_bypass_count=max(0, args.admission_max_bypass_count),
                        admission_max_wait_ms=max(0.0, args.admission_max_wait_ms),
                        admission_aging_harm_ms_per_ms=max(0.0, args.admission_aging_harm_ms_per_ms),
