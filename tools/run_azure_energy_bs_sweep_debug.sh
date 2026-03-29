@@ -5,9 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-OUT_DIR="${OUT_DIR:-cluster_outputs/det_tiny_prefill_long_decode16_energy_guard_sweep}"
-PLOTS_DIR="${PLOTS_DIR:-cluster_outputs/det_tiny_prefill_long_decode16_energy_guard_sweep_plots}"
-TRACE_PATH="${TRACE_PATH:-cluster_outputs/debug_trace_deterministic_tiny_prefill_long_decode16.csv}"
+OUT_DIR="${OUT_DIR:-cluster_outputs/azure_energy_bs_sweep_debug}"
+PLOTS_DIR="${PLOTS_DIR:-cluster_outputs/azure_energy_bs_sweep_debug_plots}"
+TRACE_PATH="${TRACE_PATH:-cluster_outputs/trace_cache/AzureLLMInferenceTrace_code.csv}"
 COST_MODEL="${COST_MODEL:-ml}"
 GPU_MODEL="${GPU_MODEL:-cluster_outputs/cost_models_full_energy/gpu_only.pkl}"
 LPDDR_MODEL="${LPDDR_MODEL:-cluster_outputs/cost_models_full_energy/lpddr5_pim_bank.pkl}"
@@ -18,9 +18,9 @@ ENABLE_SLO_GUARDED_ADMISSION="${ENABLE_SLO_GUARDED_ADMISSION:-0}"
 SLO_E2E_MS="${SLO_E2E_MS:-900}"
 SLO_TBT_MS="${SLO_TBT_MS:-3}"
 SET_REQUEST_SLOS="${SET_REQUEST_SLOS:-1}"
-LIMIT="${LIMIT:-16}"
-ARRIVAL_SCALE="${ARRIVAL_SCALE:-1.0}"
-MAX_DECODE_BATCH_SIZE="${MAX_DECODE_BATCH_SIZE:-4}"
+LIMIT="${LIMIT:-50}"
+ARRIVAL_SCALE="${ARRIVAL_SCALE:-0.25}"
+ENERGY_LATENCY_GUARD_MS="${ENERGY_LATENCY_GUARD_MS:-20}"
 PLOT_MIN_REQUEST_ID="${PLOT_MIN_REQUEST_ID:-0}"
 PLOT_MAX_REQUEST_ID="${PLOT_MAX_REQUEST_ID:-$((LIMIT - 1))}"
 
@@ -38,26 +38,25 @@ ADMISSION_RETRY_INTERVAL_MS="${ADMISSION_RETRY_INTERVAL_MS:-10}"
 mkdir -p "${OUT_DIR}" "${PLOTS_DIR}"
 
 if (($# > 0)); then
-  GUARD_VALUES=("$@")
+  BS_VALUES=("$@")
 else
-  GUARD_VALUES=(5 10 20 30 40 50 75 100 150 200)
+  BS_VALUES=(1 2 4 8 16 32)
 fi
 
-for guard_ms in "${GUARD_VALUES[@]}"; do
-  guard_tag="${guard_ms//./p}"
-  summary_path="${OUT_DIR}/replay_summary_guard${guard_tag}.json"
-  requests_path="${OUT_DIR}/replay_requests_guard${guard_tag}.csv"
-  debug_path="${OUT_DIR}/debug_events_guard${guard_tag}.csv"
-  prefix="guard${guard_tag}"
+for bs in "${BS_VALUES[@]}"; do
+  summary_path="${OUT_DIR}/replay_summary_v5_energy_bs${bs}.json"
+  requests_path="${OUT_DIR}/replay_requests_v5_energy_bs${bs}.csv"
+  debug_path="${OUT_DIR}/debug_events_v5_energy_bs${bs}.csv"
+  prefix="bs${bs}"
 
-  echo "Running deterministic tiny-prefill energy-guard case: energy_latency_guard_ms=${guard_ms} cost_model=${COST_MODEL} guarded_admission=${ENABLE_SLO_GUARDED_ADMISSION} request_slos=${SET_REQUEST_SLOS} admission_check_own_slo=${ADMISSION_CHECK_OWN_SLO}"
+  echo "Running Azure energy batch-size case: max_decode_batch_size=${bs} energy_latency_guard_ms=${ENERGY_LATENCY_GUARD_MS} cost_model=${COST_MODEL} guarded_admission=${ENABLE_SLO_GUARDED_ADMISSION} request_slos=${SET_REQUEST_SLOS} admission_check_own_slo=${ADMISSION_CHECK_OWN_SLO}"
 
   cmd=(
     "${PYTHON_BIN}" tools/run_trace_replay.py
     --azure-trace "${TRACE_PATH}"
     --cost-model "${COST_MODEL}"
     --route-policy latency_guarded_energy
-    --energy-latency-guard-ms "${guard_ms}"
+    --energy-latency-guard-ms "${ENERGY_LATENCY_GUARD_MS}"
     --limit "${LIMIT}"
     --arrival-time-scale "${ARRIVAL_SCALE}"
     --routes gpu_only lpddr5_pim_bank
@@ -65,7 +64,7 @@ for guard_ms in "${GUARD_VALUES[@]}"; do
     --local-scheduling-policy prefill_priority_fcfs_decode
     --fcfs-decode-prediction-mode incremental
     --enable-decode-batching
-    --max-decode-batch-size "${MAX_DECODE_BATCH_SIZE}"
+    --max-decode-batch-size "${bs}"
     --requests-csv "${requests_path}"
     --summary-json "${summary_path}"
     --debug-events-csv "${debug_path}"
@@ -129,33 +128,32 @@ for guard_ms in "${GUARD_VALUES[@]}"; do
     --prefix "${prefix}"
 done
 
-"${PYTHON_BIN}" tools/plot_energy_guard_sweep.py \
+"${PYTHON_BIN}" tools/plot_v5_energy_bs_sweep_results.py \
   --summary-dir "${OUT_DIR}" \
   --out-dir "${PLOTS_DIR}" \
-  --prefix det_tiny_prefill_long_decode16_energy_guard_sweep
+  --prefix azure_energy_bs_sweep_debug
 
 OUT_DIR_FOR_PY="${OUT_DIR}" "${PYTHON_BIN}" - <<'PY'
 import json
 import os
 from pathlib import Path
 
-print("guard_ms,gpu_only,lpddr5_pim_bank,total_energy_nj,decode_energy_per_token_nj,bypassed_count,held_count,best_effort_count")
-for path in sorted(Path(os.environ["OUT_DIR_FOR_PY"]).glob("replay_summary_guard*.json")):
-    tag = path.stem.split("guard", 1)[1]
-    guard_ms = float(tag.replace("p", "."))
+print("max_bs,gpu_only,lpddr5_pim_bank,total_energy_nj,decode_energy_per_token_nj,throughput_tokps,ttft_p95,e2e_p95,tbt_p95")
+for path in sorted(Path(os.environ["OUT_DIR_FOR_PY"]).glob("replay_summary_v5_energy_bs*.json")):
+    bs = int(path.stem.split("bs")[-1])
     with path.open() as f:
         d = json.load(f)
     route_counts = d.get("route_counts", {})
-    admission = d.get("admission", {})
     print(
-        f"{guard_ms},"
+        f"{bs},"
         f"{route_counts.get('gpu_only', 0)},"
         f"{route_counts.get('lpddr5_pim_bank', 0)},"
         f"{d.get('energy_nj', {}).get('total')},"
         f"{d.get('decode_energy_nj_per_decode_token')},"
-        f"{admission.get('bypassed_count', 0)},"
-        f"{admission.get('held_count', 0)},"
-        f"{admission.get('best_effort_count', 0)}"
+        f"{d.get('throughput_tokps')},"
+        f"{d.get('ttft_ms', {}).get('p95')},"
+        f"{d.get('e2e_ms', {}).get('p95')},"
+        f"{d.get('tbt_ms', {}).get('p95')}"
     )
 PY
 

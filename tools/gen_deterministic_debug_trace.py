@@ -71,6 +71,50 @@ def _scenario_heavy_sparse16() -> List[Tuple[int, int, int]]:
     ]
 
 
+def _scenario_tiny_prefill_long_decode() -> List[Tuple[int, int, int]]:
+    # (arrival_ms, context_tokens, generated_tokens)
+    # Small-prefill / long-decode debug case:
+    # - context lengths stay small, so requests reach decode quickly
+    # - decode lengths are long, so batching and decode-route effects dominate
+    # - two bursts create overlap without making the trace too dense to inspect
+    return [
+        (0, 34, 224),
+        (2, 48, 208),
+        (4, 64, 192),
+        (6, 96, 176),
+        (40, 34, 160),
+        (50, 48, 144),
+        (60, 64, 128),
+        (70, 96, 112),
+    ]
+
+
+def _scenario_tiny_prefill_long_decode16() -> List[Tuple[int, int, int]]:
+    # (arrival_ms, context_tokens, generated_tokens)
+    # 16-request extension of tiny_prefill_long_decode:
+    # - first 8 arrive in a tight burst to build decode pressure early
+    # - later 8 arrive while decodes are still active
+    # - contexts remain small while outputs stay long to emphasize decode behavior
+    return [
+        (0, 34, 224),
+        (2, 48, 208),
+        (4, 64, 192),
+        (6, 96, 176),
+        (8, 34, 160),
+        (10, 48, 144),
+        (12, 64, 128),
+        (14, 96, 112),
+        (40, 34, 224),
+        (50, 48, 208),
+        (60, 64, 192),
+        (70, 96, 176),
+        (90, 34, 160),
+        (110, 48, 144),
+        (140, 64, 128),
+        (180, 96, 112),
+    ]
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Generate a deterministic request trace CSV compatible with run_trace_replay.py")
@@ -79,7 +123,13 @@ def main() -> int:
                    default=Path("cluster_outputs/debug_trace_deterministic.csv"),
                    help="Output CSV path")
     p.add_argument("--scenario",
-                   choices=["overlap", "heavy_sparse", "heavy_sparse16"],
+                   choices=[
+                       "overlap",
+                       "heavy_sparse",
+                       "heavy_sparse16",
+                       "tiny_prefill_long_decode",
+                       "tiny_prefill_long_decode16",
+                   ],
                    default="overlap",
                    help="Deterministic scenario preset")
     p.add_argument("--base-time",
@@ -94,6 +144,10 @@ def main() -> int:
         rows = _scenario_heavy_sparse()
     elif args.scenario == "heavy_sparse16":
         rows = _scenario_heavy_sparse16()
+    elif args.scenario == "tiny_prefill_long_decode":
+        rows = _scenario_tiny_prefill_long_decode()
+    elif args.scenario == "tiny_prefill_long_decode16":
+        rows = _scenario_tiny_prefill_long_decode16()
     else:
         raise ValueError(f"Unsupported scenario: {args.scenario}")
 
