@@ -115,6 +115,32 @@ def _scenario_tiny_prefill_long_decode16() -> List[Tuple[int, int, int]]:
     ]
 
 
+def _scenario_fixed_prefill_varied_long_decode16() -> List[Tuple[int, int, int]]:
+    # (arrival_ms, context_tokens, generated_tokens)
+    # 16-request decode-heavy case with a fixed, short prefill:
+    # - all requests use the same modest context length
+    # - generated lengths vary widely and stay long to emphasize decode effects
+    # - two bursts create overlap while keeping the trace readable
+    return [
+        (0, 64, 128),
+        (2, 64, 160),
+        (4, 64, 192),
+        (6, 64, 224),
+        (8, 64, 256),
+        (10, 64, 288),
+        (12, 64, 320),
+        (14, 64, 352),
+        (40, 64, 352),
+        (50, 64, 320),
+        (60, 64, 288),
+        (70, 64, 256),
+        (90, 64, 224),
+        (110, 64, 192),
+        (140, 64, 160),
+        (180, 64, 128),
+    ]
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Generate a deterministic request trace CSV compatible with run_trace_replay.py")
@@ -129,6 +155,7 @@ def main() -> int:
                        "heavy_sparse16",
                        "tiny_prefill_long_decode",
                        "tiny_prefill_long_decode16",
+                       "fixed_prefill_varied_long_decode16",
                    ],
                    default="overlap",
                    help="Deterministic scenario preset")
@@ -148,6 +175,8 @@ def main() -> int:
         rows = _scenario_tiny_prefill_long_decode()
     elif args.scenario == "tiny_prefill_long_decode16":
         rows = _scenario_tiny_prefill_long_decode16()
+    elif args.scenario == "fixed_prefill_varied_long_decode16":
+        rows = _scenario_fixed_prefill_varied_long_decode16()
     else:
         raise ValueError(f"Unsupported scenario: {args.scenario}")
 
