@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -47,14 +48,14 @@ class TraceReplaySimulator:
             raise ValueError("slo_guarded_admission requires prefill_priority_fcfs_decode")
         if self._uses_latency_guarded_energy_policy():
             if not self._is_prefill_priority_fcfs_decode():
-                raise ValueError("latency_guarded_energy requires prefill_priority_fcfs_decode")
+                raise ValueError("energy-aware route policies require prefill_priority_fcfs_decode")
             if not self._use_incremental_prediction_for_fcfs_decode():
-                raise ValueError("latency_guarded_energy requires fcfs_decode_prediction_mode=incremental")
+                raise ValueError("energy-aware route policies require fcfs_decode_prediction_mode=incremental")
             missing_routes = [route for route in self.route_order
                               if not self.cost_model.supports_decode_energy(route)]
             if missing_routes:
                 raise ValueError(
-                    "latency_guarded_energy requires decode_energy_nj support for all configured routes; "
+                    "energy-aware route policies require decode_energy_nj support for all configured routes; "
                     f"missing: {sorted(missing_routes)}")
 
         self.gpu_free_ms = 0.0
@@ -154,8 +155,10 @@ class TraceReplaySimulator:
                 row[k] = v
         self.debug_events.append(row)
 
-    def _route_candidate_debug_dict(self, cand: RouteCandidate) -> Dict[str, object]:
-        return {
+    def _route_candidate_debug_dict(self,
+                                    cand: RouteCandidate,
+                                    est: Optional[RequestServiceEstimate] = None) -> Dict[str, object]:
+        row = {
             "route": cand.route,
             "eligible": cand.eligible,
             "uses_pim": cand.uses_pim,
@@ -168,12 +171,61 @@ class TraceReplaySimulator:
             "deadline_ms": cand.deadline_ms,
             "slack_ms": cand.slack_ms,
             "candidate_mean_tbt_ms": cand.candidate_mean_tbt_ms,
+            "route_active_requests": cand.route_active_requests,
+            "route_waiting_prefill_count": cand.route_waiting_prefill_count,
+            "route_waiting_decode_count": cand.route_waiting_decode_count,
+            "route_pending_decode_tokens": cand.route_pending_decode_tokens,
             "harmed_count": cand.harmed_count,
             "total_harm_ms": cand.total_harm_ms,
             "max_single_harm_ms": cand.max_single_harm_ms,
             "own_miss_ms": cand.own_miss_ms,
             "reason": cand.reason,
         }
+        if est is not None:
+            decode_total_energy_nj = float(est.decode_energy_nj) * float(est.decode_tokens)
+            row.update({
+                "prefill_energy_nj": float(est.prefill_energy_nj),
+                "decode_energy_per_token_nj": float(est.decode_energy_nj),
+                "decode_tokens": float(est.decode_tokens),
+                "decode_total_energy_nj": decode_total_energy_nj,
+                "request_total_energy_nj": float(est.prefill_energy_nj) + decode_total_energy_nj,
+                "prefill_e2e_ms": float(est.prefill_e2e_ms),
+                "decode_e2e_ms_per_token": float(est.decode_e2e_ms),
+                "decode_total_e2e_ms": float(est.decode_e2e_ms) * float(est.decode_tokens),
+                "mapped_lin": int(est.mapping.mapped_lin),
+                "mapped_lout": int(est.mapping.mapped_lout),
+                "mapped_bs": int(est.mapping.mapped_bs),
+                "clipped_lin": bool(est.mapping.clipped_lin),
+                "clipped_lout": bool(est.mapping.clipped_lout),
+            })
+        return row
+
+    def _route_load_snapshot(self, route: str) -> Dict[str, int]:
+        waiting_prefill_count = 0
+        waiting_decode_count = 0
+        pending_decode_tokens = 0
+        for rr in self.requests:
+            if rr.route != route:
+                continue
+            if rr.state == "waiting_prefill":
+                waiting_prefill_count += 1
+            elif rr.state == "waiting_decode":
+                waiting_decode_count += 1
+                pending_decode_tokens += int(max(0, rr.remaining_decode_tokens))
+        return {
+            "route_active_requests": waiting_prefill_count + waiting_decode_count,
+            "route_waiting_prefill_count": waiting_prefill_count,
+            "route_waiting_decode_count": waiting_decode_count,
+            "route_pending_decode_tokens": pending_decode_tokens,
+        }
+
+    def _annotate_route_candidate(self, cand: RouteCandidate) -> RouteCandidate:
+        snapshot = self._route_load_snapshot(cand.route)
+        cand.route_active_requests = int(snapshot["route_active_requests"])
+        cand.route_waiting_prefill_count = int(snapshot["route_waiting_prefill_count"])
+        cand.route_waiting_decode_count = int(snapshot["route_waiting_decode_count"])
+        cand.route_pending_decode_tokens = int(snapshot["route_pending_decode_tokens"])
+        return cand
 
     def _resource_ready(self, gpu_ms: float, pim_ms: float) -> float:
         t = self.now_ms
@@ -207,7 +259,7 @@ class TraceReplaySimulator:
                                        bs=bs)
         if key not in self._estimate_cache:
             self.estimate_cache_misses += 1
-            self._estimate_cache[key] = self.cost_model.estimate_request(
+            est = self.cost_model.estimate_request(
                 route,
                 context_tokens=int(context_tokens),
                 generated_tokens=int(generated_tokens),
@@ -216,9 +268,41 @@ class TraceReplaySimulator:
                 lin_bucket=self.config.lin_bucket,
                 lout_bucket=self.config.lout_bucket,
             )
+            self._estimate_cache[key] = self._shared_gpu_prefill_estimate(
+                route=route,
+                context_tokens=int(context_tokens),
+                generated_tokens=int(generated_tokens),
+                bs=int(bs),
+                est=est,
+            )
         else:
             self.estimate_cache_hits += 1
         return self._estimate_cache[key]
+
+    def _shared_gpu_prefill_estimate(self,
+                                     route: str,
+                                     context_tokens: int,
+                                     generated_tokens: int,
+                                     bs: int,
+                                     est: Optional[RequestServiceEstimate]
+                                     ) -> Optional[RequestServiceEstimate]:
+        if (not self.config.share_gpu_prefill_across_routes or
+                est is None or
+                route == "gpu_only"):
+            return est
+        if "gpu_only" not in self.cost_model.routes():
+            return est
+        gpu_est = self._estimate_request_cached("gpu_only",
+                                                context_tokens=context_tokens,
+                                                generated_tokens=generated_tokens,
+                                                bs=bs)
+        if gpu_est is None:
+            return est
+        return replace(est,
+                       prefill_e2e_ms=float(gpu_est.prefill_e2e_ms),
+                       prefill_gpu_ms=float(gpu_est.prefill_gpu_ms),
+                       prefill_pim_ms=float(gpu_est.prefill_pim_ms),
+                       prefill_energy_nj=float(gpu_est.prefill_energy_nj))
 
     def _prefetch_request_estimates(self,
                                     requests: Iterable[object],
@@ -226,6 +310,9 @@ class TraceReplaySimulator:
         route_list = list(routes) if routes is not None else list(self.route_order)
         if not route_list:
             return
+        if self.config.share_gpu_prefill_across_routes and "gpu_only" in self.cost_model.routes():
+            if "gpu_only" not in route_list:
+                route_list.append("gpu_only")
         route_bs = {route: self._predicted_lookup_batch_size(route) for route in route_list}
         seen: set[Tuple[str, int, int, int, str, int, int]] = set()
         missing_by_route: Dict[str, List[Tuple[int, int, int]]] = {route: [] for route in route_list}
@@ -257,8 +344,17 @@ class TraceReplaySimulator:
                 lin_bucket=self.config.lin_bucket,
                 lout_bucket=self.config.lout_bucket,
             )
-            for key, est in zip(missing_keys_by_route[route], estimates):
-                self._estimate_cache[key] = est
+            for key, req_spec, est in zip(missing_keys_by_route[route],
+                                          missing_by_route[route],
+                                          estimates):
+                context_tokens, generated_tokens, bs = req_spec
+                self._estimate_cache[key] = self._shared_gpu_prefill_estimate(
+                    route=route,
+                    context_tokens=int(context_tokens),
+                    generated_tokens=int(generated_tokens),
+                    bs=int(bs),
+                    est=est,
+                )
                 self.estimate_prefetch_populated += 1
 
     def _prefetch_arrival_request_estimates(self):
@@ -756,6 +852,10 @@ class TraceReplaySimulator:
             "blocked_due_to_tbt_count": float(len(self.admission_tbt_blocked_request_ids)),
         }
         local_scheduling = {
+            "route_policy": getattr(self.policy, "route_policy", ""),
+            "energy_latency_guard_ms": float(getattr(self.policy, "energy_latency_guard_ms", math.nan)),
+            "route_load_balance_ms_per_active_request": float(
+                getattr(self.policy, "route_load_balance_ms_per_active_request", math.nan)),
             "local_scheduling_policy": self.config.local_scheduling_policy,
             "fcfs_decode_prediction_mode": self.config.fcfs_decode_prediction_mode,
             "prefill_guard_ms": (float(self.config.prefill_guard_ms)
@@ -781,6 +881,7 @@ class TraceReplaySimulator:
             "admission_max_wait_ms": float(self.config.admission_max_wait_ms),
             "admission_aging_harm_ms_per_ms": float(self.config.admission_aging_harm_ms_per_ms),
             "admission_aging_harmed_requests_per_ms": float(self.config.admission_aging_harmed_requests_per_ms),
+            "share_gpu_prefill_across_routes": float(self.config.share_gpu_prefill_across_routes),
             "prefill_guard_trigger_count": float(self.prefill_guard_trigger_count),
             "decode_limit_trigger_count": float(self.decode_limit_trigger_count),
         }

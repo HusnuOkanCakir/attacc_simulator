@@ -192,6 +192,10 @@ def main() -> int:
     p.add_argument("--sum-offload-to-pim",
                    action="store_true",
                    help="Interpret hybrid profiles as if sum/prefill stage is split across GPU+PIM")
+    p.add_argument("--share-gpu-prefill-across-routes",
+                   action="store_true",
+                   help=("Force all route candidates to reuse gpu_only prefill timing/energy; "
+                         "only decode-side estimates remain route-specific."))
 
     p.add_argument("--pim-wait-threshold-ms",
                    type=float,
@@ -232,6 +236,13 @@ def main() -> int:
                          "latency_guarded_energy. Among routes within this guard "
                          "of the fastest predicted finish, choose the lowest "
                          "incremental forecasted energy route."))
+    p.add_argument("--route-load-balance-ms-per-active-request",
+                   type=float,
+                   default=0.0,
+                   help=("Optional penalty added to a route's effective finish time "
+                         "for each currently active request already assigned to that "
+                         "route. This biases routing away from winner-take-all collapse "
+                         "without changing the raw predicted finish times."))
     p.add_argument("--no-prompt-priority",
                    action="store_true",
                    help="Disable prompt/prefill prioritization in local scheduling")
@@ -322,7 +333,9 @@ def main() -> int:
     policy = QueueAwareFinishTimePolicy(
         pim_wait_threshold_ms=args.pim_wait_threshold_ms,
         route_policy=args.route_policy,
-        energy_latency_guard_ms=max(0.0, args.energy_latency_guard_ms))
+        energy_latency_guard_ms=max(0.0, args.energy_latency_guard_ms),
+        route_load_balance_ms_per_active_request=max(
+            0.0, args.route_load_balance_ms_per_active_request))
     cfg = ReplayConfig(unsupported_policy=args.unsupported_policy,
                        lin_bucket=args.lin_bucket,
                        lout_bucket=args.lout_bucket,
@@ -355,6 +368,7 @@ def main() -> int:
                        prompt_priority=(not args.no_prompt_priority),
                        slo_e2e_ms=args.slo_e2e_ms,
                        slo_ttft_ms=args.slo_ttft_ms,
+                       share_gpu_prefill_across_routes=args.share_gpu_prefill_across_routes,
                        gpu_queue_alpha=args.gpu_queue_alpha,
                        pim_queue_alpha=args.pim_queue_alpha,
                        active_request_alpha=args.active_request_alpha,

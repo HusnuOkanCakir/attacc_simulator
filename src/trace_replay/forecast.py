@@ -615,7 +615,7 @@ def _evaluate_slo_guarded_route(self,
     else:
         reason = ""
 
-    return RouteCandidate(route=route,
+    cand = RouteCandidate(route=route,
                           eligible=eligible,
                           uses_pim=est.uses_pim,
                           predicted_finish_ms=finish,
@@ -637,6 +637,7 @@ def _evaluate_slo_guarded_route(self,
                           max_single_harm_ms=max_single_harm_ms,
                           own_miss_ms=own_miss_ms,
                           reason=reason)
+    return self._annotate_route_candidate(cand)
 
 def _heuristic_decode_candidate_from_replay_request(self,
                                                     rr: ReplayRequest,
@@ -905,15 +906,16 @@ def _predict_route_candidate(self,
                                         generated_tokens=req.generated_tokens,
                                         bs=self._predicted_lookup_batch_size(route))
     if est is None:
-        return (RouteCandidate(route=route,
-                               eligible=False,
-                               uses_pim=("pim" in route),
-                               predicted_finish_ms=math.inf,
-                               predicted_gpu_wait_ms=math.inf,
-                                predicted_pim_wait_ms=math.inf,
-                                deadline_ms=deadline_ms,
-                                slack_ms=None,
-                                reason="unsupported_length"), None)
+        cand = RouteCandidate(route=route,
+                              eligible=False,
+                              uses_pim=("pim" in route),
+                              predicted_finish_ms=math.inf,
+                              predicted_gpu_wait_ms=math.inf,
+                              predicted_pim_wait_ms=math.inf,
+                              deadline_ms=deadline_ms,
+                              slack_ms=None,
+                              reason="unsupported_length")
+        return self._annotate_route_candidate(cand), None
 
     if self._use_shadow_prediction_for_fcfs_decode():
         proj = self._project_prefill_priority_fcfs_decode_candidate(req, route, est)
@@ -933,7 +935,7 @@ def _predict_route_candidate(self,
                                   est.decode_energy_nj * est.decode_tokens),
                               deadline_ms=deadline_ms,
                               slack_ms=slack_ms)
-        return cand, est
+        return self._annotate_route_candidate(cand), est
     if self._use_incremental_prediction_for_fcfs_decode():
         if baseline_total_energy_nj is None or baseline_total_decode_energy_nj is None:
             baseline_total_energy_nj = 0.0 if baseline_total_energy_nj is None else baseline_total_energy_nj
@@ -966,7 +968,7 @@ def _predict_route_candidate(self,
                                   proj["candidate_incremental_decode_energy_nj"]),
                               deadline_ms=deadline_ms,
                               slack_ms=slack_ms)
-        return cand, est
+        return self._annotate_route_candidate(cand), est
     if self._use_heuristic_refresh_prediction_for_fcfs_decode():
         proj = self._project_prefill_priority_fcfs_decode_heuristic_candidate(req, route, est)
         finish = float(proj["candidate_finish_ms"])
@@ -981,7 +983,7 @@ def _predict_route_candidate(self,
                               predicted_pim_wait_ms=pred_pim_wait,
                               deadline_ms=deadline_ms,
                               slack_ms=slack_ms)
-        return cand, est
+        return self._annotate_route_candidate(cand), est
 
     # Aggregate admission time prediction (simple, no batching)
     prefill_start = self._predict_stage_start(req.arrival_ms, est.prefill_gpu_ms,
@@ -1031,7 +1033,7 @@ def _predict_route_candidate(self,
                           queue_pressure_ms=queue_pressure_ms,
                           deadline_ms=deadline_ms,
                           slack_ms=slack_ms)
-    return cand, est
+    return self._annotate_route_candidate(cand), est
 
 def _predict_decode_route_candidate(self,
                                     rr: ReplayRequest,
@@ -1042,15 +1044,16 @@ def _predict_decode_route_candidate(self,
                                         generated_tokens=rr.generated_tokens,
                                         bs=self._predicted_lookup_batch_size(route))
     if est is None:
-        return (RouteCandidate(route=route,
-                               eligible=False,
-                               uses_pim=("pim" in route),
-                               predicted_finish_ms=math.inf,
-                               predicted_gpu_wait_ms=math.inf,
-                               predicted_pim_wait_ms=math.inf,
-                               deadline_ms=rr.deadline_ms,
-                               slack_ms=None,
-                               reason="unsupported_length"), None)
+        cand = RouteCandidate(route=route,
+                              eligible=False,
+                              uses_pim=("pim" in route),
+                              predicted_finish_ms=math.inf,
+                              predicted_gpu_wait_ms=math.inf,
+                              predicted_pim_wait_ms=math.inf,
+                              deadline_ms=rr.deadline_ms,
+                              slack_ms=None,
+                              reason="unsupported_length")
+        return self._annotate_route_candidate(cand), None
 
     if self._use_heuristic_refresh_prediction_for_fcfs_decode():
         proj = self._project_prefill_priority_fcfs_decode_heuristic_decode_candidate(rr,
@@ -1075,7 +1078,7 @@ def _predict_decode_route_candidate(self,
                                   0.0, est.decode_energy_nj * rr.remaining_decode_tokens),
                               deadline_ms=rr.deadline_ms,
                               slack_ms=slack_ms)
-        return cand, est
+        return self._annotate_route_candidate(cand), est
 
     decode_gpu_total = est.decode_gpu_ms * rr.remaining_decode_tokens
     decode_pim_total = est.decode_pim_ms * rr.remaining_decode_tokens
@@ -1103,7 +1106,7 @@ def _predict_decode_route_candidate(self,
                               0.0, est.decode_energy_nj * rr.remaining_decode_tokens),
                           deadline_ms=rr.deadline_ms,
                           slack_ms=slack_ms)
-    return cand, est
+    return self._annotate_route_candidate(cand), est
 
 def _maybe_rebind_decode_route(self, rr: ReplayRequest, decision_time_ms: float):
     if not self.config.enable_decode_rebind:
@@ -1145,7 +1148,7 @@ def _maybe_rebind_decode_route(self, rr: ReplayRequest, decision_time_ms: float)
             rebound=False,
             reason=rr.decode_rebind_reason,
             improvement_ms=0.0,
-            route_candidates=[self._route_candidate_debug_dict(current_cand)],
+            route_candidates=[self._route_candidate_debug_dict(current_cand, current_est)],
         )
         return
 
@@ -1170,7 +1173,7 @@ def _maybe_rebind_decode_route(self, rr: ReplayRequest, decision_time_ms: float)
     else:
         rr.decode_rebind_reason = f"keep_route:{decision.reason}"
 
-    cand_debug = [self._route_candidate_debug_dict(c) for c in candidates]
+    cand_debug = [self._route_candidate_debug_dict(c, est_by_route.get(c.route)) for c in candidates]
     self._record_debug_event(
         "decode_rebind_decision",
         request_id=rr.request_id,

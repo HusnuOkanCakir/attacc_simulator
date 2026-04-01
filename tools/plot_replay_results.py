@@ -10,6 +10,8 @@ from typing import Iterable, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 
 def _format_bar_value(value: float) -> str:
@@ -333,6 +335,259 @@ def _parse_route_candidates(raw: object) -> list[dict]:
     return [x for x in parsed if isinstance(x, dict)]
 
 
+def _as_float(value: object) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return out
+
+
+def _build_route_selection_delta_df(df: pd.DataFrame,
+                                    events_df: pd.DataFrame) -> pd.DataFrame:
+    required_req_cols = {"request_id", "arrival_ms", "context_tokens", "generated_tokens", "route"}
+    required_evt_cols = {"event", "request_id"}
+    if not required_req_cols.issubset(df.columns) or not required_evt_cols.issubset(events_df.columns):
+        return pd.DataFrame()
+
+    req_df = df.copy()
+    req_df["request_id"] = pd.to_numeric(req_df["request_id"], errors="coerce")
+    req_df = req_df.dropna(subset=["request_id"]).copy()
+    req_df["request_id"] = req_df["request_id"].astype(int)
+    req_rows = req_df.set_index("request_id").to_dict(orient="index")
+
+    events = events_df.copy()
+    events["_row_order"] = range(len(events))
+    events["request_id"] = pd.to_numeric(events["request_id"], errors="coerce")
+    events["sim_now_ms"] = pd.to_numeric(events.get("sim_now_ms"), errors="coerce")
+    events = events.dropna(subset=["request_id"]).copy()
+    events["request_id"] = events["request_id"].astype(int)
+    events = events.sort_values(["sim_now_ms", "_row_order"], na_position="last")
+
+    latest_eval_candidates: dict[int, list[dict]] = {}
+    rows: list[dict[str, object]] = []
+
+    for _, row in events.iterrows():
+        request_id = int(row["request_id"])
+        event = str(row.get("event", ""))
+        if event == "admission_eval":
+            candidates = _parse_route_candidates(row.get("route_candidates"))
+            if candidates:
+                latest_eval_candidates[request_id] = candidates
+            continue
+        if event != "admit_route":
+            continue
+
+        candidates = _parse_route_candidates(row.get("route_candidates"))
+        source = "admit_route"
+        if not candidates:
+            candidates = latest_eval_candidates.get(request_id, [])
+            source = "admission_eval_fallback"
+        if not candidates:
+            continue
+
+        req = req_rows.get(request_id, {})
+        arrival_ms = _as_float(row.get("request_arrival_ms"))
+        if not np.isfinite(arrival_ms):
+            arrival_ms = _as_float(req.get("arrival_ms"))
+
+        cand_by_route = {str(c.get("route")): c for c in candidates}
+        gpu = cand_by_route.get("gpu_only", {})
+        hybrid = cand_by_route.get("lpddr5_pim_bank", {})
+
+        gpu_finish = _as_float(gpu.get("predicted_finish_ms"))
+        hybrid_finish = _as_float(hybrid.get("predicted_finish_ms"))
+        gpu_e2e = gpu_finish - arrival_ms if np.isfinite(gpu_finish) and np.isfinite(arrival_ms) else float("nan")
+        hybrid_e2e = hybrid_finish - arrival_ms if np.isfinite(hybrid_finish) and np.isfinite(arrival_ms) else float("nan")
+
+        gpu_prefill_energy = _as_float(gpu.get("prefill_energy_nj"))
+        hybrid_prefill_energy = _as_float(hybrid.get("prefill_energy_nj"))
+        gpu_decode_total_energy = _as_float(gpu.get("decode_total_energy_nj"))
+        hybrid_decode_total_energy = _as_float(hybrid.get("decode_total_energy_nj"))
+        gpu_total_energy = _as_float(gpu.get("request_total_energy_nj"))
+        hybrid_total_energy = _as_float(hybrid.get("request_total_energy_nj"))
+        gpu_incremental_energy = _as_float(gpu.get("predicted_incremental_energy_nj"))
+        hybrid_incremental_energy = _as_float(hybrid.get("predicted_incremental_energy_nj"))
+        gpu_incremental_decode_energy = _as_float(gpu.get("predicted_incremental_decode_energy_nj"))
+        hybrid_incremental_decode_energy = _as_float(hybrid.get("predicted_incremental_decode_energy_nj"))
+
+        gpu_scheduler_energy = gpu_incremental_energy
+        if not np.isfinite(gpu_scheduler_energy):
+            gpu_scheduler_energy = gpu_incremental_decode_energy
+        hybrid_scheduler_energy = hybrid_incremental_energy
+        if not np.isfinite(hybrid_scheduler_energy):
+            hybrid_scheduler_energy = hybrid_incremental_decode_energy
+
+        rows.append({
+            "request_id": request_id,
+            "arrival_ms": arrival_ms,
+            "context_tokens": req.get("context_tokens"),
+            "generated_tokens": req.get("generated_tokens"),
+            "chosen_route": row.get("chosen_route", req.get("route")),
+            "decision_reason": row.get("decision_reason", req.get("route_decision_reason")),
+            "candidate_source": source,
+            "gpu_predicted_finish_ms": gpu_finish,
+            "hybrid_predicted_finish_ms": hybrid_finish,
+            "gpu_predicted_e2e_ms": gpu_e2e,
+            "hybrid_predicted_e2e_ms": hybrid_e2e,
+            "finish_delta_hybrid_minus_gpu_ms": hybrid_finish - gpu_finish,
+            "e2e_delta_hybrid_minus_gpu_ms": hybrid_e2e - gpu_e2e,
+            "gpu_predicted_gpu_wait_ms": _as_float(gpu.get("predicted_gpu_wait_ms")),
+            "hybrid_predicted_gpu_wait_ms": _as_float(hybrid.get("predicted_gpu_wait_ms")),
+            "gpu_predicted_pim_wait_ms": _as_float(gpu.get("predicted_pim_wait_ms")),
+            "hybrid_predicted_pim_wait_ms": _as_float(hybrid.get("predicted_pim_wait_ms")),
+            "gpu_route_active_requests": _as_float(gpu.get("route_active_requests")),
+            "hybrid_route_active_requests": _as_float(hybrid.get("route_active_requests")),
+            "gpu_route_waiting_prefill_count": _as_float(gpu.get("route_waiting_prefill_count")),
+            "hybrid_route_waiting_prefill_count": _as_float(hybrid.get("route_waiting_prefill_count")),
+            "gpu_route_waiting_decode_count": _as_float(gpu.get("route_waiting_decode_count")),
+            "hybrid_route_waiting_decode_count": _as_float(hybrid.get("route_waiting_decode_count")),
+            "gpu_route_pending_decode_tokens": _as_float(gpu.get("route_pending_decode_tokens")),
+            "hybrid_route_pending_decode_tokens": _as_float(hybrid.get("route_pending_decode_tokens")),
+            "gpu_prefill_energy_nj": gpu_prefill_energy,
+            "hybrid_prefill_energy_nj": hybrid_prefill_energy,
+            "gpu_decode_total_energy_nj": gpu_decode_total_energy,
+            "hybrid_decode_total_energy_nj": hybrid_decode_total_energy,
+            "gpu_predicted_incremental_energy_nj": gpu_incremental_energy,
+            "hybrid_predicted_incremental_energy_nj": hybrid_incremental_energy,
+            "gpu_predicted_incremental_decode_energy_nj": gpu_incremental_decode_energy,
+            "hybrid_predicted_incremental_decode_energy_nj": hybrid_incremental_decode_energy,
+            "gpu_scheduler_energy_nj": gpu_scheduler_energy,
+            "hybrid_scheduler_energy_nj": hybrid_scheduler_energy,
+            "gpu_total_request_energy_nj": gpu_total_energy,
+            "hybrid_total_request_energy_nj": hybrid_total_energy,
+            "scheduler_energy_delta_hybrid_minus_gpu_nj": (
+                hybrid_scheduler_energy - gpu_scheduler_energy
+            ),
+            "prefill_energy_delta_hybrid_minus_gpu_nj": hybrid_prefill_energy - gpu_prefill_energy,
+            "decode_total_energy_delta_hybrid_minus_gpu_nj": (
+                hybrid_decode_total_energy - gpu_decode_total_energy
+            ),
+            "total_energy_delta_hybrid_minus_gpu_nj": hybrid_total_energy - gpu_total_energy,
+            "gpu_eligible": gpu.get("eligible"),
+            "hybrid_eligible": hybrid.get("eligible"),
+            "gpu_reason": gpu.get("reason"),
+            "hybrid_reason": hybrid.get("reason"),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("request_id").reset_index(drop=True)
+
+
+def _plot_route_selection_delta_scatter(route_df: pd.DataFrame,
+                                        out_path: Path,
+                                        energy_latency_guard_ms: Optional[float] = None,
+                                        route_policy: Optional[str] = None) -> None:
+    if route_df.empty:
+        return
+    tmp = route_df[["finish_delta_hybrid_minus_gpu_ms",
+                    "scheduler_energy_delta_hybrid_minus_gpu_nj",
+                    "chosen_route"]].dropna()
+    if tmp.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = {
+        "gpu_only": "tab:blue",
+        "lpddr5_pim_bank": "tab:orange",
+    }
+    for route, grp in tmp.groupby("chosen_route"):
+        ax.scatter(grp["finish_delta_hybrid_minus_gpu_ms"],
+                   grp["scheduler_energy_delta_hybrid_minus_gpu_nj"],
+                   s=30,
+                   alpha=0.8,
+                   color=colors.get(str(route), "tab:gray"),
+                   label=str(route))
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", markersize=8, label="chosen gpu_only"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", markersize=8, label="chosen lpddr5_pim_bank"),
+    ]
+    if energy_latency_guard_ms is not None and np.isfinite(energy_latency_guard_ms):
+        guard = max(0.0, float(energy_latency_guard_ms))
+        if guard > 0.0:
+            ax.axvline(-guard, color="tab:green", linestyle=":", linewidth=1.5)
+            ax.axvline(+guard, color="tab:green", linestyle=":", linewidth=1.5)
+            ax.axvspan(-guard, +guard, color="tab:green", alpha=0.08)
+            ylim = ax.get_ylim()
+            y_text = ylim[1] - 0.06 * (ylim[1] - ylim[0])
+            ax.text(0.0, y_text, f"energy-choice band |Δfinish| <= {guard:g} ms",
+                    ha="center", va="top", fontsize=9, color="tab:green")
+            legend_handles.append(Line2D([0], [0],
+                                         color="tab:green",
+                                         linestyle=":",
+                                         linewidth=1.5,
+                                         label=f"latency guard ±{guard:g} ms"))
+
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    x_pad = 0.04 * (xlim[1] - xlim[0])
+    y_pad = 0.05 * (ylim[1] - ylim[0])
+    label_box = dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85, edgecolor="none")
+    ax.text(xlim[0] + x_pad, ylim[1] - y_pad,
+            "Hybrid faster\nGPU lower energy",
+            ha="left", va="top", fontsize=8.5, color="tab:purple", bbox=label_box)
+    ax.text(xlim[1] - x_pad, ylim[1] - y_pad,
+            "GPU wins both",
+            ha="right", va="top", fontsize=8.5, color="tab:blue", bbox=label_box)
+    ax.text(xlim[0] + x_pad, ylim[0] + y_pad,
+            "Hybrid wins both",
+            ha="left", va="bottom", fontsize=8.5, color="tab:orange", bbox=label_box)
+    ax.text(xlim[1] - x_pad, ylim[0] + y_pad,
+            "GPU faster\nHybrid lower energy",
+            ha="right", va="bottom", fontsize=8.5, color="tab:green", bbox=label_box)
+
+    ax.set_xlabel("Finish delta: hybrid - gpu (ms)")
+    ax.set_ylabel("Scheduler energy delta: hybrid - gpu (nJ)")
+    ax.set_title("Route Selection: Predicted Time / Scheduler-Energy Delta Per Request")
+    ax.grid(True, alpha=0.3)
+    ax.legend(handles=legend_handles, loc="best")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _plot_route_selection_delta_by_request(route_df: pd.DataFrame, out_path: Path) -> None:
+    if route_df.empty:
+        return
+    tmp = route_df[["request_id",
+                    "finish_delta_hybrid_minus_gpu_ms",
+                    "scheduler_energy_delta_hybrid_minus_gpu_nj",
+                    "chosen_route"]].dropna(subset=["request_id"])
+    if tmp.empty:
+        return
+    colors = tmp["chosen_route"].map({
+        "gpu_only": "tab:blue",
+        "lpddr5_pim_bank": "tab:orange",
+    }).fillna("tab:gray")
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    axes[0].bar(tmp["request_id"], tmp["finish_delta_hybrid_minus_gpu_ms"], color=colors)
+    axes[0].axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+    axes[0].set_ylabel("hybrid - gpu finish (ms)")
+    axes[0].set_title("Route Selection Delta by Request")
+    axes[0].grid(True, axis="y", alpha=0.3)
+
+    axes[1].bar(tmp["request_id"], tmp["scheduler_energy_delta_hybrid_minus_gpu_nj"], color=colors)
+    axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+    axes[1].set_xlabel("request_id")
+    axes[1].set_ylabel("hybrid - gpu scheduler energy (nJ)")
+    axes[1].grid(True, axis="y", alpha=0.3)
+
+    legend_handles = [
+        Patch(facecolor="tab:blue", label="chosen gpu_only"),
+        Patch(facecolor="tab:orange", label="chosen lpddr5_pim_bank"),
+        Line2D([0], [0], color="black", linestyle="--", linewidth=1.0, label="zero delta"),
+    ]
+    axes[0].legend(handles=legend_handles, loc="best")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 def _plot_prediction_evolution(df: pd.DataFrame,
                                events_df: pd.DataFrame,
                                min_request_id: int,
@@ -468,6 +723,20 @@ def main() -> int:
     if args.summary_json and args.summary_json.exists():
         with args.summary_json.open() as f:
             summary = json.load(f)
+    energy_latency_guard_ms = None
+    route_policy = None
+    if summary is not None:
+        local = summary.get("local_scheduling", {})
+        if isinstance(local, dict):
+            value = local.get("route_policy")
+            if value is not None:
+                route_policy = str(value)
+            value = local.get("energy_latency_guard_ms")
+            if value is not None:
+                try:
+                    energy_latency_guard_ms = float(value)
+                except (TypeError, ValueError):
+                    energy_latency_guard_ms = None
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     prefix = _safe_prefix(args.requests_csv, args.prefix)
@@ -481,13 +750,27 @@ def main() -> int:
     _plot_slack_hist(df, args.out_dir / f"{prefix}_slack_hist.png")
     _plot_queue_pressure_hist(df, args.out_dir / f"{prefix}_queue_pressure_hist.png")
     _plot_queue_pressure_vs_e2e(df, args.out_dir / f"{prefix}_queue_pressure_vs_e2e.png")
-    if args.debug_events_csv and args.debug_events_csv.exists() and args.prediction_history_max_request_id is not None:
+    if args.debug_events_csv and args.debug_events_csv.exists():
         events_df = pd.read_csv(args.debug_events_csv, low_memory=False)
-        _plot_prediction_evolution(df,
-                                   events_df,
-                                   args.prediction_history_min_request_id,
-                                   args.prediction_history_max_request_id,
-                                   args.out_dir / f"{prefix}_prediction_evolution.png")
+        route_df = _build_route_selection_delta_df(df, events_df)
+        if not route_df.empty:
+            route_df.to_csv(args.out_dir / f"{prefix}_route_selection_deltas.csv", index=False)
+            _plot_route_selection_delta_scatter(
+                route_df,
+                args.out_dir / f"{prefix}_route_selection_delta_scatter.png",
+                energy_latency_guard_ms=energy_latency_guard_ms,
+                route_policy=route_policy,
+            )
+            _plot_route_selection_delta_by_request(
+                route_df,
+                args.out_dir / f"{prefix}_route_selection_delta_by_request.png",
+            )
+        if args.prediction_history_max_request_id is not None:
+            _plot_prediction_evolution(df,
+                                       events_df,
+                                       args.prediction_history_min_request_id,
+                                       args.prediction_history_max_request_id,
+                                       args.out_dir / f"{prefix}_prediction_evolution.png")
 
     print(f"Wrote plots to {args.out_dir}")
     return 0

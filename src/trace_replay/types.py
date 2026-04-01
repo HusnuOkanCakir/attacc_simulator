@@ -146,6 +146,7 @@ class ReplayConfig:
     prompt_priority: bool = True
     slo_e2e_ms: Optional[float] = None
     slo_ttft_ms: Optional[float] = None
+    share_gpu_prefill_across_routes: bool = False
     gpu_queue_alpha: float = 0.0
     pim_queue_alpha: float = 0.0
     active_request_alpha: float = 0.0

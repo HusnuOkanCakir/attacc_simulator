@@ -504,28 +504,30 @@ def _process_admission_queue(self):
                                                 generated_tokens=rr.generated_tokens,
                                                 bs=self._predicted_lookup_batch_size(route))
             if est is None:
-                route_candidates.append(RouteCandidate(route=route,
-                                                       eligible=False,
-                                                       uses_pim=("pim" in route),
-                                                       predicted_finish_ms=math.inf,
-                                                       predicted_gpu_wait_ms=math.inf,
-                                                       predicted_pim_wait_ms=math.inf,
-                                                       deadline_ms=rr.deadline_ms,
-                                                       slack_ms=None,
-                                                       reason="unsupported_length"))
+                cand = RouteCandidate(route=route,
+                                      eligible=False,
+                                      uses_pim=("pim" in route),
+                                      predicted_finish_ms=math.inf,
+                                      predicted_gpu_wait_ms=math.inf,
+                                      predicted_pim_wait_ms=math.inf,
+                                      deadline_ms=rr.deadline_ms,
+                                      slack_ms=None,
+                                      reason="unsupported_length")
+                route_candidates.append(self._annotate_route_candidate(cand))
                 continue
             proj = self._project_admission_candidate(rr, route, est)
             if bool(proj["timeout"]):
                 self.admission_shadow_timeout_count += 1
-                route_candidates.append(RouteCandidate(route=route,
-                                                       eligible=False,
-                                                       uses_pim=est.uses_pim,
-                                                       predicted_finish_ms=math.inf,
-                                                       predicted_gpu_wait_ms=math.inf,
-                                                       predicted_pim_wait_ms=math.inf,
-                                                       deadline_ms=rr.deadline_ms,
-                                                       slack_ms=None,
-                                                       reason="shadow_timeout"))
+                cand = RouteCandidate(route=route,
+                                      eligible=False,
+                                      uses_pim=est.uses_pim,
+                                      predicted_finish_ms=math.inf,
+                                      predicted_gpu_wait_ms=math.inf,
+                                      predicted_pim_wait_ms=math.inf,
+                                      deadline_ms=rr.deadline_ms,
+                                      slack_ms=None,
+                                      reason="shadow_timeout")
+                route_candidates.append(self._annotate_route_candidate(cand))
                 continue
 
             finish = float(proj["candidate_finish_ms"])
@@ -549,15 +551,16 @@ def _process_admission_queue(self):
             elif not existing_ok:
                 reason = "existing_slo_violation"
             slack_ms = None if rr.deadline_ms is None else (rr.deadline_ms - finish)
-            route_candidates.append(RouteCandidate(route=route,
-                                                   eligible=eligible,
-                                                   uses_pim=est.uses_pim,
-                                                   predicted_finish_ms=finish,
-                                                   predicted_gpu_wait_ms=pred_gpu_wait,
-                                                   predicted_pim_wait_ms=pred_pim_wait,
-                                                   deadline_ms=rr.deadline_ms,
-                                                   slack_ms=slack_ms,
-                                                   reason=reason))
+            cand = RouteCandidate(route=route,
+                                  eligible=eligible,
+                                  uses_pim=est.uses_pim,
+                                  predicted_finish_ms=finish,
+                                  predicted_gpu_wait_ms=pred_gpu_wait,
+                                  predicted_pim_wait_ms=pred_pim_wait,
+                                  deadline_ms=rr.deadline_ms,
+                                  slack_ms=slack_ms,
+                                  reason=reason)
+            route_candidates.append(self._annotate_route_candidate(cand))
             est_by_route[route] = est
 
         decision = self.policy.choose_route(route_candidates,
@@ -617,7 +620,8 @@ def _process_admission_queue(self):
             decision_reason=decision.reason,
             admission_attempts=rr.admission_attempts,
             next_retry_ms=rr.admission_next_retry_ms,
-            route_candidates=[self._route_candidate_debug_dict(c) for c in route_candidates],
+            route_candidates=[self._route_candidate_debug_dict(c, est_by_route.get(c.route))
+                              for c in route_candidates],
         )
         return
 
@@ -649,15 +653,16 @@ def _process_slo_guarded_admission_queue(self):
                                                     generated_tokens=rr.generated_tokens,
                                                     bs=self._predicted_lookup_batch_size(route))
                 if est is None:
-                    route_candidates.append(RouteCandidate(route=route,
-                                                           eligible=False,
-                                                           uses_pim=("pim" in route),
-                                                           predicted_finish_ms=math.inf,
-                                                           predicted_gpu_wait_ms=math.inf,
-                                                           predicted_pim_wait_ms=math.inf,
-                                                           deadline_ms=rr.deadline_ms,
-                                                           slack_ms=None,
-                                                           reason="unsupported_length"))
+                    cand = RouteCandidate(route=route,
+                                          eligible=False,
+                                          uses_pim=("pim" in route),
+                                          predicted_finish_ms=math.inf,
+                                          predicted_gpu_wait_ms=math.inf,
+                                          predicted_pim_wait_ms=math.inf,
+                                          deadline_ms=rr.deadline_ms,
+                                          slack_ms=None,
+                                          reason="unsupported_length")
+                    route_candidates.append(self._annotate_route_candidate(cand))
                     continue
                 cand = self._evaluate_slo_guarded_route(rr,
                                                         route,
@@ -674,7 +679,8 @@ def _process_slo_guarded_admission_queue(self):
                 request_id=rr.request_id,
                 request_arrival_ms=rr.arrival_ms,
                 admission_attempts=rr.admission_attempts,
-                route_candidates=[self._route_candidate_debug_dict(c) for c in route_candidates],
+                route_candidates=[self._route_candidate_debug_dict(c, est_by_route.get(c.route))
+                                  for c in route_candidates],
             )
 
             decision = self.policy.choose_route(route_candidates,
@@ -839,7 +845,7 @@ def _admit_arrivals_up_to_now(self):
         decision = self.policy.choose_route(candidates,
                                            now_ms=self.now_ms,
                                            deadline_ms=rr.deadline_ms)
-        cand_debug = [self._route_candidate_debug_dict(c) for c in candidates]
+        cand_debug = [self._route_candidate_debug_dict(c, est_by_route.get(c.route)) for c in candidates]
         if decision.dropped or decision.route is None or decision.route not in est_by_route:
             rr.state = "dropped"
             rr.dropped_reason = decision.reason

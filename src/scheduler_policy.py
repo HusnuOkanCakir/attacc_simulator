@@ -19,6 +19,10 @@ class RouteCandidate:
     deadline_ms: Optional[float] = None
     slack_ms: Optional[float] = None
     candidate_mean_tbt_ms: Optional[float] = None
+    route_active_requests: int = 0
+    route_waiting_prefill_count: int = 0
+    route_waiting_decode_count: int = 0
+    route_pending_decode_tokens: int = 0
     harmed_count: int = 0
     total_harm_ms: float = 0.0
     max_single_harm_ms: float = 0.0
@@ -52,13 +56,16 @@ class QueueAwareFinishTimePolicy:
                  pim_wait_threshold_ms: Optional[float] = None,
                  route_policy: str = "min_finish",
                  prefer_gpu_on_tie: bool = True,
-                 energy_latency_guard_ms: float = 5.0):
+                 energy_latency_guard_ms: float = 5.0,
+                 route_load_balance_ms_per_active_request: float = 0.0):
         if route_policy not in {"min_finish", "slack_then_finish", "latency_guarded_energy"}:
             raise ValueError(f"Unsupported route policy '{route_policy}'")
         self.pim_wait_threshold_ms = pim_wait_threshold_ms
         self.route_policy = route_policy
         self.prefer_gpu_on_tie = prefer_gpu_on_tie
         self.energy_latency_guard_ms = max(0.0, float(energy_latency_guard_ms))
+        self.route_load_balance_ms_per_active_request = max(
+            0.0, float(route_load_balance_ms_per_active_request))
 
     def choose_route(self,
                      candidates: List[RouteCandidate],
@@ -90,12 +97,16 @@ class QueueAwareFinishTimePolicy:
                                  dropped=True,
                                  reason="all_pim_routes_rejected_by_threshold")
 
+        def _effective_finish_ms(c: RouteCandidate) -> float:
+            return (float(c.predicted_finish_ms) +
+                    self.route_load_balance_ms_per_active_request * float(c.route_active_requests))
+
         def _finish_sort_key(c: RouteCandidate):
             # Tie-breaker: prefer GPU-only if requested (more predictable tail).
             tie_gpu_bias = 0
             if self.prefer_gpu_on_tie:
                 tie_gpu_bias = 1 if c.uses_pim else 0
-            return (c.predicted_finish_ms, tie_gpu_bias, c.route)
+            return (_effective_finish_ms(c), c.predicted_finish_ms, tie_gpu_bias, c.route)
 
         if self.route_policy == "min_finish":
             best = min(filtered, key=_finish_sort_key)
@@ -135,10 +146,10 @@ class QueueAwareFinishTimePolicy:
             return (energy, *_finish_sort_key(c))
 
         def _choose_guarded_energy(cands: List[RouteCandidate], reason: str) -> RouteDecision:
-            fastest_finish_ms = min(c.predicted_finish_ms for c in cands)
+            fastest_finish_ms = min(_effective_finish_ms(c) for c in cands)
             guarded = [
                 c for c in cands
-                if c.predicted_finish_ms <= fastest_finish_ms + self.energy_latency_guard_ms + 1e-9
+                if _effective_finish_ms(c) <= fastest_finish_ms + self.energy_latency_guard_ms + 1e-9
             ]
             best = min(guarded, key=_energy_sort_key)
             return RouteDecision(route=best.route,

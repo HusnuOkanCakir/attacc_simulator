@@ -23,6 +23,8 @@ STATE_COLORS = {
 MAX_FIGURE_HEIGHT_IN = 40.0
 TIMELINE_IN_PER_REQUEST = 0.015
 QUEUE_SLOT_IN_PER_LEVEL = 0.3
+DEFAULT_TIMELINE_WIDTH_IN = 12.0
+DEFAULT_TIMELINE_DPI = 120
 
 
 def _is_nan(v: Any) -> bool:
@@ -281,13 +283,19 @@ def plot_waiting_queue_slots(snapshots_df: pd.DataFrame, out_path: Path) -> None
     plt.close(fig)
 
 
-def plot_request_state_timeline(requests_df: pd.DataFrame, out_path: Path) -> None:
+def plot_request_state_timeline(requests_df: pd.DataFrame,
+                                out_path: Path,
+                                *,
+                                width_in: float = DEFAULT_TIMELINE_WIDTH_IN,
+                                in_per_request: float = TIMELINE_IN_PER_REQUEST,
+                                dpi: int = DEFAULT_TIMELINE_DPI,
+                                max_height_in: float = MAX_FIGURE_HEIGHT_IN) -> None:
     required = {"request_id", "arrival_ms", "admission_time_ms", "ttft_ms", "e2e_ms", "route"}
     if not required.issubset(requests_df.columns):
         return
     df = requests_df.copy().sort_values(["arrival_ms", "request_id"])
-    fig_h = min(MAX_FIGURE_HEIGHT_IN, max(4, TIMELINE_IN_PER_REQUEST * len(df) + 1.5))
-    fig, ax = plt.subplots(figsize=(12, fig_h))
+    fig_h = min(max_height_in, max(4, in_per_request * len(df) + 1.5))
+    fig, ax = plt.subplots(figsize=(width_in, fig_h))
     annotate_rows = len(df) <= 300
 
     yticks = []
@@ -334,7 +342,7 @@ def plot_request_state_timeline(requests_df: pd.DataFrame, out_path: Path) -> No
     ax.set_yticklabels(ylabels[::tick_step], fontsize=8 if len(yticks) <= 200 else 6)
     ax.grid(True, axis="x", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
 
 
@@ -362,14 +370,19 @@ def _build_running_segments(events_df: pd.DataFrame) -> Dict[int, Dict[str, List
 
 def plot_request_execution_timeline(requests_df: pd.DataFrame,
                                     events_df: pd.DataFrame,
-                                    out_path: Path) -> None:
+                                    out_path: Path,
+                                    *,
+                                    width_in: float = DEFAULT_TIMELINE_WIDTH_IN,
+                                    in_per_request: float = TIMELINE_IN_PER_REQUEST,
+                                    dpi: int = DEFAULT_TIMELINE_DPI,
+                                    max_height_in: float = MAX_FIGURE_HEIGHT_IN) -> None:
     required = {"request_id", "arrival_ms", "admission_time_ms", "ttft_ms", "e2e_ms", "route"}
     if not required.issubset(requests_df.columns):
         return
     df = requests_df.copy().sort_values(["arrival_ms", "request_id"])
     running_segments = _build_running_segments(events_df)
-    fig_h = min(MAX_FIGURE_HEIGHT_IN, max(4, TIMELINE_IN_PER_REQUEST * len(df) + 1.5))
-    fig, ax = plt.subplots(figsize=(12, fig_h))
+    fig_h = min(max_height_in, max(4, in_per_request * len(df) + 1.5))
+    fig, ax = plt.subplots(figsize=(width_in, fig_h))
     annotate_rows = len(df) <= 300
 
     yticks = []
@@ -455,7 +468,7 @@ def plot_request_execution_timeline(requests_df: pd.DataFrame,
     ax.set_yticklabels(ylabels[::tick_step], fontsize=8 if len(yticks) <= 200 else 6)
     ax.grid(True, axis="x", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
 
 
@@ -475,6 +488,22 @@ def main() -> int:
     p.add_argument("--requests-csv", type=Path, default=None, help="Optional per-request CSV for state timeline")
     p.add_argument("--out-dir", type=Path, default=Path("cluster_outputs/replay_plots"), help="Output directory")
     p.add_argument("--prefix", type=str, default=None, help="Output prefix")
+    p.add_argument("--timeline-width-in",
+                   type=float,
+                   default=DEFAULT_TIMELINE_WIDTH_IN,
+                   help="Figure width in inches for request timeline plots")
+    p.add_argument("--timeline-in-per-request",
+                   type=float,
+                   default=TIMELINE_IN_PER_REQUEST,
+                   help="Figure height budget in inches per request for request timeline plots")
+    p.add_argument("--timeline-dpi",
+                   type=int,
+                   default=DEFAULT_TIMELINE_DPI,
+                   help="Raster DPI for request timeline plots")
+    p.add_argument("--timeline-max-height-in",
+                   type=float,
+                   default=MAX_FIGURE_HEIGHT_IN,
+                   help="Maximum figure height in inches for request timeline plots")
     args = p.parse_args()
 
     if not args.events_csv.exists():
@@ -494,10 +523,21 @@ def main() -> int:
 
     if args.requests_csv is not None and args.requests_csv.exists():
         requests_df = pd.read_csv(args.requests_csv)
-        plot_request_state_timeline(requests_df, args.out_dir / f"{prefix}_request_timeline.png")
+        plot_request_state_timeline(
+            requests_df,
+            args.out_dir / f"{prefix}_request_timeline.png",
+            width_in=max(1.0, float(args.timeline_width_in)),
+            in_per_request=max(0.001, float(args.timeline_in_per_request)),
+            dpi=max(1, int(args.timeline_dpi)),
+            max_height_in=max(1.0, float(args.timeline_max_height_in)),
+        )
         plot_request_execution_timeline(requests_df,
                                         events_df,
-                                        args.out_dir / f"{prefix}_request_execution_timeline.png")
+                                        args.out_dir / f"{prefix}_request_execution_timeline.png",
+                                        width_in=max(1.0, float(args.timeline_width_in)),
+                                        in_per_request=max(0.001, float(args.timeline_in_per_request)),
+                                        dpi=max(1, int(args.timeline_dpi)),
+                                        max_height_in=max(1.0, float(args.timeline_max_height_in)))
 
     print(f"Wrote queue snapshots: {snapshots_csv}")
     print(f"Wrote queue timeline text: {snapshots_txt}")
