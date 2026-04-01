@@ -1,0 +1,23 @@
+flowchart TD
+    A[Start run] --> B[Set now_ms to first arrival or 0]
+    B --> C{Admission queue enabled?}
+    C -->|Yes| D[Enqueue arrivals up to now_ms]
+    D --> E[Process guarded admission queue]
+    C -->|No| F[Admit arrivals immediately]
+    E --> G[Choose next task]
+    F --> G
+
+    G --> H{Task available?}
+    H -->|No| I[Find next arrival or admission retry]
+    I --> J{Any future event?}
+    J -->|No| K[Finish run]
+    J -->|Yes| L[Advance now_ms to next event]
+    L --> C
+
+    H -->|Yes| M{Earlier arrival/retry before task start?}
+    M -->|Yes| N[Yield to earlier event]
+    N --> C
+    M -->|No| O[Dispatch task]
+    O --> P[Reserve GPU/PIM resources]
+    P --> Q[Complete task and update request states]
+    Q --> C

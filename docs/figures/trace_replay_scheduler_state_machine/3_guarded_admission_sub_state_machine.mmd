@@ -1,0 +1,18 @@
+flowchart TD
+    A[Request arrives] --> B[Create ReplayRequest]
+    B --> C[State = waiting_admission]
+    C --> D[Evaluate all routes]
+    D --> E{Any eligible route?}
+
+    E -->|Yes| F[Policy choose_route]
+    F --> G[admit_route\nstate = waiting_prefill]
+
+    E -->|No| H{max_wait_ms or max_bypass_count hit?}
+    H -->|Yes| I{Any route estimate exists?}
+    I -->|No| J[admit_drop\nstate = dropped]
+    I -->|Yes| K[admission_best_effort\nstate = waiting_prefill\nis_lost = true]
+
+    H -->|No| L[admission_hold]
+    L --> M[Record reject reason / harm stats]
+    M --> N[Set admission_next_retry_ms]
+    N --> C

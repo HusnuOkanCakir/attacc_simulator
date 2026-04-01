@@ -1,0 +1,18 @@
+flowchart TD
+    A[Need next task] --> B{local_scheduling_policy}
+
+    B -->|fcfs_strict| C[Pick fcfs_active_request]
+    C --> D{Request state}
+    D -->|waiting_prefill| E[Single-request prefill task]
+    D -->|waiting_decode| F[Single-request decode task]
+
+    B -->|prefill_priority_fcfs_decode| G{Any waiting prefill?}
+    G -->|Yes| H[Pick oldest prefill request]
+    H --> I[Single-request prefill task]
+    G -->|No| J[Build FCFS-prefix decode batch\nhead plus same-route ready prefix]
+
+    B -->|general prompt-priority path| K[Build all prefill candidates]
+    K --> L[Build all decode candidates]
+    L --> M{Prefill guard or decode limit triggered?}
+    M -->|Yes| N[Force a prefill task]
+    M -->|No| O[Choose min earliest_start_ms, phase priority, ready_ms, request_id]

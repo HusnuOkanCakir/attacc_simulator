@@ -1,0 +1,21 @@
+stateDiagram-v2
+    [*] --> new
+
+    new --> waiting_admission: guarded admission enabled\narrival enqueued
+    new --> waiting_prefill: immediate admit_route
+    new --> dropped: admit_drop / no feasible route
+
+    waiting_admission --> waiting_admission: admission_hold\nset next_retry_ms
+    waiting_admission --> waiting_admission: admission_bypass\nlater request admitted first
+    waiting_admission --> waiting_prefill: admit_route
+    waiting_admission --> waiting_prefill: admission_best_effort\nforced_best_effort=true
+    waiting_admission --> dropped: admit_drop\nno route even for best effort
+
+    waiting_prefill --> waiting_decode: prefill task completes\nremaining_decode_tokens > 0
+    waiting_prefill --> done: prefill task completes\nremaining_decode_tokens == 0
+
+    waiting_decode --> waiting_decode: decode task completes\nremaining_decode_tokens > 0
+    waiting_decode --> done: decode task completes\nremaining_decode_tokens == 0
+
+    done --> [*]
+    dropped --> [*]

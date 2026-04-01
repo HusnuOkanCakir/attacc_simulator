@@ -1,0 +1,7 @@
+flowchart TD
+    A[Prefill finished on PIM route] --> B[Predict decode on current route]
+    B --> C[Predict decode on gpu_only]
+    C --> D[Policy choose_route]
+    D --> E{gpu_only wins by more than decode_rebind_margin_ms?}
+    E -->|Yes| F[Switch route to gpu_only]
+    E -->|No| G[Keep current route]
