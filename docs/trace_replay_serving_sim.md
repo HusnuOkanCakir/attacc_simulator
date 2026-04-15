@@ -3479,3 +3479,118 @@ Loose bundle:
 | `requests_csv` | Output | Per-request replay output |
 | `summary_json` | Output | Aggregate replay summary output |
 | `debug_events_csv` | Output | Detailed debug-event log used for replay/debug plots |
+
+## Realtime Ramulator Serving Parity
+
+`src/trace_replay` remains the analytic replay simulator. It predicts service with the cost tables and never issues real PIM commands into Ramulator.
+
+`ramulator2/src/frontend/impl/serving` now mirrors the same control-plane surface for the realtime path:
+
+- batching
+  - prefill batching
+  - decode batching
+  - prefill guard
+  - decode batch cap with waiting prefills
+  - max consecutive decode batches
+- local scheduling
+  - `priority`
+  - `fcfs_strict`
+  - `prefill_priority_fcfs_decode`
+- route selection
+  - `min_finish`
+  - `slack_then_finish`
+  - `latency_guarded_energy`
+- admission
+  - immediate admission
+  - predictive waiting-admission queue
+  - SLO-guarded admission queue
+  - default `admission_check_own_slo = false`
+- decode rebind
+  - hybrid-to-GPU rebind after prefill and before the first decode token
+- reporting
+  - expanded per-request CSV
+  - expanded summary JSON/YAML
+
+The important remaining difference is the data plane:
+
+- `trace_replay`
+  - purely analytic execution
+- realtime Ramulator serving
+  - analytic control plane
+  - real Ramulator-backed PIM execution for hybrid decode
+  - current hybrid batched decode is modeled as one logical batch task with serialized per-request PIM template subjobs
+
+This phase does not yet include:
+
+- runtime command generation
+- virtual-memory-aware admission
+- runtime virtual-to-physical allocation policy
+- dynamic physical address placement
+
+## Command Summary
+
+### Conv Trace Guarded Admission Run
+
+```bash
+conda run -n lerobot python tools/run_trace_replay.py \
+  --azure-trace https://raw.githubusercontent.com/Azure/AzurePublicDataset/master/data/AzureLLMInferenceTrace_conv.csv \
+  --cost-model ml \
+  --route-policy latency_guarded_energy \
+  --energy-latency-guard-ms 20 \
+  --slo-e2e-ms 900 \
+  --slo-tbt-ms 200 \
+  --limit 50 \
+  --arrival-time-scale 0.1 \
+  --ml-profile gpu_only=cluster_outputs/cost_models_full_energy/gpu_only.pkl \
+  --ml-profile lpddr5_pim_bank=cluster_outputs/cost_models_full_energy/lpddr5_pim_bank.pkl \
+  --routes gpu_only lpddr5_pim_bank \
+  --unsupported-policy clip \
+  --local-scheduling-policy prefill_priority_fcfs_decode \
+  --fcfs-decode-prediction-mode incremental \
+  --enable-decode-batching \
+  --max-decode-batch-size 4 \
+  --enable-slo-guarded-admission \
+  --admission-max-harmed-requests 2 \
+  --admission-max-total-harm-ms 50 \
+  --admission-max-single-harm-ms 20 \
+  --admission-max-bypass-count 5 \
+  --admission-max-wait-ms 150 \
+  --admission-aging-harm-ms-per-ms 0.01 \
+  --admission-aging-harmed-requests-per-ms 0.001 \
+  --admission-retry-interval-ms 10 \
+  --requests-csv cluster_outputs/replay_requests_conv_trace_guarded_existing_harm_loose.csv \
+  --summary-json cluster_outputs/replay_summary_conv_trace_guarded_existing_harm_loose.json \
+  --debug-events-csv cluster_outputs/debug_events_conv_trace_guarded_existing_harm_loose.csv
+```
+
+### Regular Replay Plots
+
+```bash
+python tools/plot_replay_results.py \
+  --requests-csv cluster_outputs/replay_requests_conv_trace_guarded_existing_harm_loose.csv \
+  --summary-json cluster_outputs/replay_summary_conv_trace_guarded_existing_harm_loose.json \
+  --debug-events-csv cluster_outputs/debug_events_conv_trace_guarded_existing_harm_loose.csv \
+  --prediction-history-min-request-id 0 \
+  --prediction-history-max-request-id 49 \
+  --out-dir cluster_outputs/conv_trace_guarded_existing_harm_loose_plots \
+  --prefix conv_trace_guarded_existing_harm_loose
+```
+
+### Debug / Timeline Plots
+
+```bash
+python tools/plot_debug_admission.py \
+  --events-csv cluster_outputs/debug_events_conv_trace_guarded_existing_harm_loose.csv \
+  --requests-csv cluster_outputs/replay_requests_conv_trace_guarded_existing_harm_loose.csv \
+  --out-dir cluster_outputs/conv_trace_guarded_existing_harm_loose_plots \
+  --prefix conv_trace_guarded_existing_harm_loose
+```
+
+### Route Decision Explanations
+
+```bash
+python tools/explain_route_selection_deltas.py \
+  --route-delta-csv cluster_outputs/conv_trace_guarded_existing_harm_loose_plots/conv_trace_guarded_existing_harm_loose_route_selection_deltas.csv \
+  --summary-json cluster_outputs/replay_summary_conv_trace_guarded_existing_harm_loose.json \
+  --out cluster_outputs/conv_trace_guarded_existing_harm_loose_plots/conv_trace_guarded_existing_harm_loose_route_selection_explanations.txt
+```

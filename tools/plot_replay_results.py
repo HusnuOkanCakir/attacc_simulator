@@ -40,6 +40,38 @@ def _safe_prefix(path: Path, prefix: Optional[str]) -> str:
     return path.stem
 
 
+def _linear_diag_limits(x: pd.Series, y: pd.Series) -> tuple[float, float]:
+    vals = np.concatenate([
+        pd.to_numeric(x, errors="coerce").to_numpy(dtype=float),
+        pd.to_numeric(y, errors="coerce").to_numpy(dtype=float),
+    ])
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0, 1.0
+    lo = float(vals.min())
+    hi = float(vals.max())
+    if np.isclose(lo, hi, rtol=1e-9, atol=1e-9):
+        pad = max(1e-3, abs(lo) * 0.02)
+        return lo - pad, hi + pad
+    pad = max((hi - lo) * 0.05, abs(hi) * 1e-6, 1e-6)
+    return lo - pad, hi + pad
+
+
+def _log_diag_limits(x: pd.Series, y: pd.Series) -> tuple[float, float]:
+    vals = np.concatenate([
+        pd.to_numeric(x, errors="coerce").to_numpy(dtype=float),
+        pd.to_numeric(y, errors="coerce").to_numpy(dtype=float),
+    ])
+    vals = vals[np.isfinite(vals) & (vals > 0.0)]
+    if vals.size == 0:
+        return 1e-3, 1.0
+    lo = float(vals.min())
+    hi = float(vals.max())
+    if np.isclose(lo, hi, rtol=1e-6, atol=0.0):
+        return lo / 1.2, hi * 1.2
+    return lo / 1.05, hi * 1.05
+
+
 def _plot_latency_ecdf(df: pd.DataFrame, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     plotted = False
@@ -125,12 +157,14 @@ def _plot_predicted_vs_actual(df: pd.DataFrame, out_path: Path) -> None:
                        label="lost")
     else:
         ax.scatter(tmp["predicted_e2e_ms"], tmp["e2e_ms"], s=10, alpha=0.35)
-    lo = min(tmp["predicted_e2e_ms"].min(), tmp["e2e_ms"].min())
-    hi = max(tmp["predicted_e2e_ms"].max(), tmp["e2e_ms"].max())
+    lo, hi = _linear_diag_limits(tmp["predicted_e2e_ms"], tmp["e2e_ms"])
     ax.plot([lo, hi], [lo, hi], "--", color="black", linewidth=1.5, label="ideal")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
     ax.set_xlabel("Predicted E2E (ms)")
     ax.set_ylabel("Actual E2E (ms)")
     ax.set_title("Predicted E2E vs Actual E2E")
+    ax.ticklabel_format(style="plain", useOffset=False, axis="both")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -167,12 +201,14 @@ def _plot_predicted_finish_vs_actual_finish(df: pd.DataFrame, out_path: Path) ->
                        label="lost")
     else:
         ax.scatter(tmp[pred_col], tmp["actual_finish_ms"], s=10, alpha=0.35)
-    lo = min(tmp[pred_col].min(), tmp["actual_finish_ms"].min())
-    hi = max(tmp[pred_col].max(), tmp["actual_finish_ms"].max())
+    lo, hi = _linear_diag_limits(tmp[pred_col], tmp["actual_finish_ms"])
     ax.plot([lo, hi], [lo, hi], "--", color="black", linewidth=1.5, label="ideal")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
     ax.set_xlabel("Predicted Finish (ms)")
     ax.set_ylabel("Actual Finish (ms)")
     ax.set_title("Predicted Finish vs Actual Finish")
+    ax.ticklabel_format(style="plain", useOffset=False, axis="both")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -213,11 +249,12 @@ def _plot_predicted_vs_actual_loglog(df: pd.DataFrame, out_path: Path) -> None:
                        label="lost")
     else:
         ax.scatter(tmp["predicted_e2e_ms"], tmp["e2e_ms"], s=10, alpha=0.35)
-    lo = min(tmp["predicted_e2e_ms"].min(), tmp["e2e_ms"].min())
-    hi = max(tmp["predicted_e2e_ms"].max(), tmp["e2e_ms"].max())
+    lo, hi = _log_diag_limits(tmp["predicted_e2e_ms"], tmp["e2e_ms"])
     ax.plot([lo, hi], [lo, hi], "--", color="black", linewidth=1.5, label="ideal")
     ax.set_xscale("log")
     ax.set_yscale("log")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
     ax.set_xlabel("Predicted E2E (ms, log)")
     ax.set_ylabel("Actual E2E (ms, log)")
     ax.set_title("Predicted E2E vs Actual E2E (Log-Log)")
@@ -481,7 +518,8 @@ def _plot_route_selection_delta_scatter(route_df: pd.DataFrame,
                                         route_policy: Optional[str] = None) -> None:
     if route_df.empty:
         return
-    tmp = route_df[["finish_delta_hybrid_minus_gpu_ms",
+    tmp = route_df[["request_id",
+                    "finish_delta_hybrid_minus_gpu_ms",
                     "scheduler_energy_delta_hybrid_minus_gpu_nj",
                     "chosen_route"]].dropna()
     if tmp.empty:
@@ -498,6 +536,15 @@ def _plot_route_selection_delta_scatter(route_df: pd.DataFrame,
                    alpha=0.8,
                    color=colors.get(str(route), "tab:gray"),
                    label=str(route))
+        for _, point in grp.iterrows():
+            ax.text(point["finish_delta_hybrid_minus_gpu_ms"],
+                    point["scheduler_energy_delta_hybrid_minus_gpu_nj"],
+                    f"{int(point['request_id'])}",
+                    fontsize=5.5,
+                    alpha=0.75,
+                    color=colors.get(str(route), "tab:gray"),
+                    ha="left",
+                    va="bottom")
     ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
 

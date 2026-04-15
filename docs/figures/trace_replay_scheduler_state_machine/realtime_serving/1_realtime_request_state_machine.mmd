@@ -1,0 +1,23 @@
+stateDiagram-v2
+    [*] --> new
+
+    new --> waiting_admission: guarded / predictive admission enabled\nenqueue_arrivals_up_to_now()
+    new --> waiting_prefill: immediate admit_arrivals_up_to_now()\nor admit_waiting_request()
+    new --> dropped: no feasible route\nor forced drop
+
+    waiting_admission --> waiting_admission: admission_hold / admission_bypass\nset admission_next_retry_clk
+    waiting_admission --> waiting_prefill: admit_waiting_request()
+    waiting_admission --> waiting_prefill: forced best effort\nadmission_forced_best_effort=true
+    waiting_admission --> dropped: no feasible route\neven for best effort
+
+    waiting_prefill --> running_prefill: start_task(prefill)
+    running_prefill --> waiting_decode: maybe_complete_active_task()\nremaining_decode_tokens > 0
+    running_prefill --> done: maybe_complete_active_task()\nremaining_decode_tokens == 0
+
+    waiting_decode --> waiting_decode: maybe_rebind_decode_route()\noptional route change before first decode
+    waiting_decode --> running_decode: start_task(decode)
+    running_decode --> waiting_decode: maybe_complete_active_task()\nremaining_decode_tokens > 0
+    running_decode --> done: maybe_complete_active_task()\nremaining_decode_tokens == 0
+
+    done --> [*]
+    dropped --> [*]

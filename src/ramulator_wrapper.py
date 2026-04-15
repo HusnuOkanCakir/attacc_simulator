@@ -52,11 +52,15 @@ class Ramulator:
         self.df = pd.DataFrame()
         self.ramulator_dir = ramulator_dir
         self.output_log = output_log
+        self.modelinfos = modelinfos
         if os.path.exists(output_log):
             self.df = pd.read_csv(output_log)
         self.num_hbm = num_hbm
         self.nhead = modelinfos['num_heads']
         self.dhead = modelinfos['dhead']
+        self.num_layers = modelinfos.get('ndec', 1)
+        dtype = modelinfos.get('dtype')
+        self.dtype_bytes = 2 if dtype in (DataType.W16A16, DataType.W16A8) else 1
         self.fast_mode = fast_mode
         self.pim_config = pim_config or {}
 
@@ -217,11 +221,35 @@ class Ramulator:
         with open(yaml_file, 'w') as f:
             f.write(line)
 
+    def _online_frontend_impl_name(self, online_frontend: str) -> str:
+        if online_frontend == "realtime":
+            return "RealtimeServingFrontend"
+        if online_frontend == "alternating":
+            return "AlternatingServingFrontend"
+        raise ValueError(
+            f"Unsupported online frontend {online_frontend}; expected realtime or alternating"
+        )
+
     def make_online_yaml_file(self,
                               yaml_file,
                               requests_csv,
                               requests_out_csv,
+                              kv_placement_csv,
+                              allocator_pressure_csv,
                               template_dir,
+                              hybrid_command_source,
+                              generator_backend,
+                              generator_dhead,
+                              generator_heads_per_hbm,
+                              generator_dtype_bytes,
+                              generator_num_layers,
+                              generator_channel_count,
+                              translation_max_addr,
+                              translation_pagesize_kb,
+                              kv_pool_bytes,
+                              score_pool_bytes,
+                              context_pool_bytes,
+                              scratch_pool_bytes,
                               cost_gpu_csv,
                               cost_hybrid_csv,
                               route_policy,
@@ -232,13 +260,78 @@ class Ramulator:
                               lout_bucket=1,
                               batch_size=1,
                               gpu_route_name="gpu_only",
-                              hybrid_route_name="lpddr5_pim_bank"):
+                              hybrid_route_name="lpddr5_pim_bank",
+                              enable_prefill_batching=False,
+                              max_prefill_batch_size=1,
+                              enable_decode_batching=False,
+                              max_decode_batch_size=1,
+                              prefill_guard_ms=-1.0,
+                              max_consecutive_decode_batches=0,
+                              decode_batch_cap_with_prefill=0,
+                              local_scheduling_policy="prefill_priority_fcfs_decode",
+                              fcfs_decode_prediction_mode="incremental",
+                              enable_decode_rebind=False,
+                              decode_rebind_margin_ms=0.0,
+                              enable_predictive_admission=False,
+                              enable_slo_guarded_admission=False,
+                              slo_tbt_ms=-1.0,
+                              slo_e2e_ms=-1.0,
+                              slo_ttft_ms=-1.0,
+                              admission_shadow_max_steps=10000,
+                              admission_retry_interval_ms=0.0,
+                              admission_max_harmed_requests=0,
+                              admission_max_total_harm_ms=0.0,
+                              admission_max_single_harm_ms=0.0,
+                              admission_max_own_miss_ms=0.0,
+                              admission_check_own_slo=False,
+                              admission_max_bypass_count=0,
+                              admission_max_wait_ms=0.0,
+                              admission_aging_harm_ms_per_ms=0.0,
+                              admission_aging_harmed_requests_per_ms=0.0,
+                              share_gpu_prefill_across_routes=False,
+                              gpu_queue_alpha=0.0,
+                              pim_queue_alpha=0.0,
+                              active_request_alpha=0.0,
+                              decode_token_alpha=0.0,
+                              prompt_priority=True,
+                              prefer_gpu_on_tie=True,
+                              energy_latency_guard_ms=5.0,
+                              route_load_balance_ms_per_active_request=0.0,
+                              capture_debug_events=False,
+                              debug_log_path="log/online_serving/frontend_debug.log",
+                              online_frontend="realtime"):
+        self._validate_online_serving_config(route_policy=route_policy,
+                                             batch_size=batch_size,
+                                             local_scheduling_policy=local_scheduling_policy,
+                                             fcfs_decode_prediction_mode=fcfs_decode_prediction_mode,
+                                             enable_predictive_admission=enable_predictive_admission,
+                                             enable_slo_guarded_admission=enable_slo_guarded_admission,
+                                             enable_prefill_batching=enable_prefill_batching,
+                                             slo_tbt_ms=slo_tbt_ms,
+                                             slo_e2e_ms=slo_e2e_ms,
+                                             online_frontend=online_frontend)
+        frontend_impl = self._online_frontend_impl_name(online_frontend)
         line = ""
         line += "Frontend:\n"
-        line += "  impl: OnlineServingFrontend\n"
+        line += f"  impl: {frontend_impl}\n"
         line += "  requests_csv: {}\n".format(requests_csv)
         line += "  requests_out_csv: {}\n".format(requests_out_csv)
+        line += "  kv_placement_csv: {}\n".format(kv_placement_csv)
+        line += "  allocator_pressure_csv: {}\n".format(allocator_pressure_csv)
+        line += "  hybrid_command_source: {}\n".format(hybrid_command_source)
         line += "  template_dir: {}\n".format(template_dir)
+        line += "  generator_backend: {}\n".format(generator_backend)
+        line += "  generator_dhead: {}\n".format(int(generator_dhead))
+        line += "  generator_heads_per_hbm: {}\n".format(int(generator_heads_per_hbm))
+        line += "  generator_dtype_bytes: {}\n".format(int(generator_dtype_bytes))
+        line += "  generator_num_layers: {}\n".format(int(generator_num_layers))
+        line += "  generator_channel_count: {}\n".format(int(generator_channel_count))
+        line += "  translation_max_addr: {}\n".format(int(translation_max_addr))
+        line += "  translation_pagesize_KB: {}\n".format(int(translation_pagesize_kb))
+        line += "  kv_pool_bytes: {}\n".format(int(kv_pool_bytes))
+        line += "  score_pool_bytes: {}\n".format(int(score_pool_bytes))
+        line += "  context_pool_bytes: {}\n".format(int(context_pool_bytes))
+        line += "  scratch_pool_bytes: {}\n".format(int(scratch_pool_bytes))
         line += "  cost_gpu_csv: {}\n".format(cost_gpu_csv)
         line += "  cost_hybrid_csv: {}\n".format(cost_hybrid_csv)
         line += "  gpu_route_name: {}\n".format(gpu_route_name)
@@ -250,7 +343,52 @@ class Ramulator:
         line += "  lin_bucket: {}\n".format(int(lin_bucket))
         line += "  lout_bucket: {}\n".format(int(lout_bucket))
         line += "  batch_size: {}\n".format(int(batch_size))
+        line += "  enable_prefill_batching: {}\n".format(str(bool(enable_prefill_batching)).lower())
+        line += "  max_prefill_batch_size: {}\n".format(int(max_prefill_batch_size))
+        line += "  enable_decode_batching: {}\n".format(str(bool(enable_decode_batching)).lower())
+        line += "  max_decode_batch_size: {}\n".format(int(max_decode_batch_size))
+        line += "  prefill_guard_ms: {}\n".format(float(prefill_guard_ms))
+        line += "  max_consecutive_decode_batches: {}\n".format(int(max_consecutive_decode_batches))
+        line += "  decode_batch_cap_with_prefill: {}\n".format(int(decode_batch_cap_with_prefill))
+        line += "  local_scheduling_policy: {}\n".format(local_scheduling_policy)
+        line += "  fcfs_decode_prediction_mode: {}\n".format(fcfs_decode_prediction_mode)
+        line += "  enable_decode_rebind: {}\n".format(str(bool(enable_decode_rebind)).lower())
+        line += "  decode_rebind_margin_ms: {}\n".format(float(decode_rebind_margin_ms))
+        line += "  enable_predictive_admission: {}\n".format(str(bool(enable_predictive_admission)).lower())
+        line += "  enable_slo_guarded_admission: {}\n".format(str(bool(enable_slo_guarded_admission)).lower())
+        line += "  slo_tbt_ms: {}\n".format(float(slo_tbt_ms))
+        line += "  slo_e2e_ms: {}\n".format(float(slo_e2e_ms))
+        line += "  slo_ttft_ms: {}\n".format(float(slo_ttft_ms))
+        line += "  admission_shadow_max_steps: {}\n".format(int(admission_shadow_max_steps))
+        line += "  admission_retry_interval_ms: {}\n".format(float(admission_retry_interval_ms))
+        line += "  admission_max_harmed_requests: {}\n".format(int(admission_max_harmed_requests))
+        line += "  admission_max_total_harm_ms: {}\n".format(float(admission_max_total_harm_ms))
+        line += "  admission_max_single_harm_ms: {}\n".format(float(admission_max_single_harm_ms))
+        line += "  admission_max_own_miss_ms: {}\n".format(float(admission_max_own_miss_ms))
+        line += "  admission_check_own_slo: {}\n".format(str(bool(admission_check_own_slo)).lower())
+        line += "  admission_max_bypass_count: {}\n".format(int(admission_max_bypass_count))
+        line += "  admission_max_wait_ms: {}\n".format(float(admission_max_wait_ms))
+        line += "  admission_aging_harm_ms_per_ms: {}\n".format(float(admission_aging_harm_ms_per_ms))
+        line += "  admission_aging_harmed_requests_per_ms: {}\n".format(float(admission_aging_harmed_requests_per_ms))
+        line += "  share_gpu_prefill_across_routes: {}\n".format(str(bool(share_gpu_prefill_across_routes)).lower())
+        line += "  gpu_queue_alpha: {}\n".format(float(gpu_queue_alpha))
+        line += "  pim_queue_alpha: {}\n".format(float(pim_queue_alpha))
+        line += "  active_request_alpha: {}\n".format(float(active_request_alpha))
+        line += "  decode_token_alpha: {}\n".format(float(decode_token_alpha))
+        line += "  prompt_priority: {}\n".format(str(bool(prompt_priority)).lower())
+        line += "  prefer_gpu_on_tie: {}\n".format(str(bool(prefer_gpu_on_tie)).lower())
+        line += "  energy_latency_guard_ms: {}\n".format(float(energy_latency_guard_ms))
+        line += "  route_load_balance_ms_per_active_request: {}\n".format(
+            float(route_load_balance_ms_per_active_request))
+        line += "  capture_debug_events: {}\n".format(str(bool(capture_debug_events)).lower())
+        line += "  debug_log_path: {}\n".format(debug_log_path)
         line += "  clock_ratio: 1\n"
+        if hybrid_command_source == "runtime_generated":
+            line += "\n"
+            line += "  Translation:\n"
+            line += "    impl: AttAccServingTranslation\n"
+            line += "    max_addr: {}\n".format(int(translation_max_addr))
+            line += "    pagesize_KB: {}\n".format(int(translation_pagesize_kb))
         line += "\n"
         line += "MemorySystem:\n"
         line += "  impl: PIMDRAM\n"
@@ -278,6 +416,54 @@ class Ramulator:
         line += "    impl: {}\n".format(self.addr_mapper_impl)
         with open(yaml_file, 'w') as f:
             f.write(line)
+
+    def _validate_online_serving_config(self,
+                                        route_policy,
+                                        batch_size,
+                                        local_scheduling_policy="prefill_priority_fcfs_decode",
+                                        fcfs_decode_prediction_mode="incremental",
+                                        enable_predictive_admission=False,
+                                        enable_slo_guarded_admission=False,
+                                        enable_prefill_batching=False,
+                                        slo_tbt_ms=-1.0,
+                                        slo_e2e_ms=-1.0,
+                                        online_frontend="realtime"):
+        frontend_impl = self._online_frontend_impl_name(online_frontend)
+        if online_frontend != "realtime":
+            if route_policy != "min_finish":
+                raise ValueError(
+                    f"{frontend_impl} only supports route_policy=min_finish, got {route_policy}"
+                )
+            if int(batch_size) != 1:
+                raise ValueError(
+                    f"{frontend_impl} only supports batch_size=1, got {batch_size}"
+                )
+            return
+
+        if local_scheduling_policy == "prefill_priority_fcfs_decode":
+            if enable_slo_guarded_admission and fcfs_decode_prediction_mode != "incremental":
+                raise ValueError("slo_guarded_admission requires fcfs_decode_prediction_mode=incremental")
+        else:
+            if fcfs_decode_prediction_mode != "shadow":
+                raise ValueError("fcfs_decode_prediction_mode only applies to prefill_priority_fcfs_decode")
+            if enable_slo_guarded_admission:
+                raise ValueError("slo_guarded_admission requires prefill_priority_fcfs_decode")
+
+        if enable_predictive_admission and enable_slo_guarded_admission:
+            raise ValueError("predictive admission and slo_guarded_admission are mutually exclusive")
+
+        if route_policy == "slack_then_finish" and float(slo_e2e_ms) < 0.0:
+            raise ValueError("slack_then_finish requires slo_e2e_ms")
+        if route_policy == "latency_guarded_energy":
+            if local_scheduling_policy != "prefill_priority_fcfs_decode":
+                raise ValueError("latency_guarded_energy requires prefill_priority_fcfs_decode")
+            if fcfs_decode_prediction_mode != "incremental":
+                raise ValueError("latency_guarded_energy requires fcfs_decode_prediction_mode=incremental")
+        if enable_slo_guarded_admission:
+            if float(slo_e2e_ms) < 0.0:
+                raise ValueError("slo_guarded_admission requires slo_e2e_ms")
+            if float(slo_tbt_ms) < 0.0:
+                raise ValueError("slo_guarded_admission requires slo_tbt_ms")
 
     def update_log_file(self, log):
         columns = self.LOG_COLUMNS
@@ -480,28 +666,130 @@ class Ramulator:
                            template_dir,
                            cost_gpu_csv,
                            cost_hybrid_csv,
+                           hybrid_command_source="template_replay",
+                           generator_backend=None,
+                           generator_dhead=None,
+                           generator_heads_per_hbm=None,
+                           generator_dtype_bytes=None,
+                           generator_num_layers=None,
+                           generator_channel_count=None,
+                           translation_max_addr=None,
+                           translation_pagesize_kb=4,
+                           kv_pool_bytes=None,
+                           score_pool_bytes=None,
+                           context_pool_bytes=None,
+                           scratch_pool_bytes=None,
                            route_policy="min_finish",
                            pim_wait_threshold_ms=1.0,
                            unsupported_policy="clip",
                            output_summary_json="cluster_outputs/online_serving_summary.json",
                            output_requests_csv="cluster_outputs/online_serving_requests.csv",
+                           output_kv_placement_csv="",
+                           output_allocator_pressure_csv="",
                            yaml_file="ramulator2/online_serving.yaml",
                            arrival_time_scale=1.0,
                            lin_bucket=1,
                            lout_bucket=1,
                            batch_size=1,
                            gpu_route_name="gpu_only",
-                           hybrid_route_name="lpddr5_pim_bank"):
+                           hybrid_route_name="lpddr5_pim_bank",
+                           enable_prefill_batching=False,
+                           max_prefill_batch_size=1,
+                           enable_decode_batching=False,
+                           max_decode_batch_size=1,
+                           prefill_guard_ms=-1.0,
+                           max_consecutive_decode_batches=0,
+                           decode_batch_cap_with_prefill=0,
+                           local_scheduling_policy="prefill_priority_fcfs_decode",
+                           fcfs_decode_prediction_mode="incremental",
+                           enable_decode_rebind=False,
+                           decode_rebind_margin_ms=0.0,
+                           enable_predictive_admission=False,
+                           enable_slo_guarded_admission=False,
+                           slo_tbt_ms=-1.0,
+                           slo_e2e_ms=-1.0,
+                           slo_ttft_ms=-1.0,
+                           admission_shadow_max_steps=10000,
+                           admission_retry_interval_ms=0.0,
+                           admission_max_harmed_requests=0,
+                           admission_max_total_harm_ms=0.0,
+                           admission_max_single_harm_ms=0.0,
+                           admission_max_own_miss_ms=0.0,
+                           admission_check_own_slo=False,
+                           admission_max_bypass_count=0,
+                           admission_max_wait_ms=0.0,
+                           admission_aging_harm_ms_per_ms=0.0,
+                           admission_aging_harmed_requests_per_ms=0.0,
+                           share_gpu_prefill_across_routes=False,
+                           gpu_queue_alpha=0.0,
+                           pim_queue_alpha=0.0,
+                           active_request_alpha=0.0,
+                           decode_token_alpha=0.0,
+                           prompt_priority=True,
+                           prefer_gpu_on_tie=True,
+                           energy_latency_guard_ms=5.0,
+                           route_load_balance_ms_per_active_request=0.0,
+                           capture_debug_events=False,
+                           debug_log_path="log/online_serving/frontend_debug.log",
+                           online_frontend="realtime"):
+        self._validate_online_serving_config(route_policy=route_policy,
+                                             batch_size=batch_size,
+                                             local_scheduling_policy=local_scheduling_policy,
+                                             fcfs_decode_prediction_mode=fcfs_decode_prediction_mode,
+                                             enable_predictive_admission=enable_predictive_admission,
+                                             enable_slo_guarded_admission=enable_slo_guarded_admission,
+                                             enable_prefill_batching=enable_prefill_batching,
+                                             slo_tbt_ms=slo_tbt_ms,
+                                             slo_e2e_ms=slo_e2e_ms,
+                                             online_frontend=online_frontend)
         Path(os.path.dirname(output_summary_json) or ".").mkdir(
             parents=True, exist_ok=True)
         Path(os.path.dirname(output_requests_csv) or ".").mkdir(
             parents=True, exist_ok=True)
+        if output_kv_placement_csv:
+            Path(os.path.dirname(output_kv_placement_csv) or ".").mkdir(
+                parents=True, exist_ok=True)
+        if output_allocator_pressure_csv:
+            Path(os.path.dirname(output_allocator_pressure_csv) or ".").mkdir(
+                parents=True, exist_ok=True)
+
+        generator_backend = generator_backend or "lpddr5_bank"
+        generator_dhead = int(generator_dhead or self.dhead)
+        generator_heads_per_hbm = int(generator_heads_per_hbm or math.ceil(self.nhead / self.num_hbm))
+        generator_dtype_bytes = int(generator_dtype_bytes or self.dtype_bytes)
+        generator_num_layers = int(generator_num_layers or self.num_layers)
+        generator_channel_count = int(generator_channel_count or self.channel_count)
+        translation_max_addr = int(translation_max_addr or (2 * 1024 * 1024 * 1024))
+        if not kv_pool_bytes:
+            kv_pool_bytes = int(translation_max_addr * 0.70)
+        remaining_bytes = max(0, translation_max_addr - int(kv_pool_bytes))
+        default_aux_pool = remaining_bytes // 3 if remaining_bytes > 0 else 0
+        score_pool_bytes = int(score_pool_bytes if score_pool_bytes else default_aux_pool)
+        context_pool_bytes = int(context_pool_bytes if context_pool_bytes else default_aux_pool)
+        scratch_pool_bytes = int(
+            scratch_pool_bytes if scratch_pool_bytes
+            else max(0, remaining_bytes - score_pool_bytes - context_pool_bytes))
 
         self.make_online_yaml_file(
             yaml_file=yaml_file,
             requests_csv=requests_csv,
             requests_out_csv=output_requests_csv,
+            kv_placement_csv=output_kv_placement_csv,
+            allocator_pressure_csv=output_allocator_pressure_csv,
             template_dir=template_dir,
+            hybrid_command_source=hybrid_command_source,
+            generator_backend=generator_backend,
+            generator_dhead=generator_dhead,
+            generator_heads_per_hbm=generator_heads_per_hbm,
+            generator_dtype_bytes=generator_dtype_bytes,
+            generator_num_layers=generator_num_layers,
+            generator_channel_count=generator_channel_count,
+            translation_max_addr=translation_max_addr,
+            translation_pagesize_kb=translation_pagesize_kb,
+            kv_pool_bytes=kv_pool_bytes,
+            score_pool_bytes=score_pool_bytes,
+            context_pool_bytes=context_pool_bytes,
+            scratch_pool_bytes=scratch_pool_bytes,
             cost_gpu_csv=cost_gpu_csv,
             cost_hybrid_csv=cost_hybrid_csv,
             route_policy=route_policy,
@@ -512,7 +800,46 @@ class Ramulator:
             lout_bucket=lout_bucket,
             batch_size=batch_size,
             gpu_route_name=gpu_route_name,
-            hybrid_route_name=hybrid_route_name)
+            hybrid_route_name=hybrid_route_name,
+            enable_prefill_batching=enable_prefill_batching,
+            max_prefill_batch_size=max_prefill_batch_size,
+            enable_decode_batching=enable_decode_batching,
+            max_decode_batch_size=max_decode_batch_size,
+            prefill_guard_ms=prefill_guard_ms,
+            max_consecutive_decode_batches=max_consecutive_decode_batches,
+            decode_batch_cap_with_prefill=decode_batch_cap_with_prefill,
+            local_scheduling_policy=local_scheduling_policy,
+            fcfs_decode_prediction_mode=fcfs_decode_prediction_mode,
+            enable_decode_rebind=enable_decode_rebind,
+            decode_rebind_margin_ms=decode_rebind_margin_ms,
+            enable_predictive_admission=enable_predictive_admission,
+            enable_slo_guarded_admission=enable_slo_guarded_admission,
+            slo_tbt_ms=slo_tbt_ms,
+            slo_e2e_ms=slo_e2e_ms,
+            slo_ttft_ms=slo_ttft_ms,
+            admission_shadow_max_steps=admission_shadow_max_steps,
+            admission_retry_interval_ms=admission_retry_interval_ms,
+            admission_max_harmed_requests=admission_max_harmed_requests,
+            admission_max_total_harm_ms=admission_max_total_harm_ms,
+            admission_max_single_harm_ms=admission_max_single_harm_ms,
+            admission_max_own_miss_ms=admission_max_own_miss_ms,
+            admission_check_own_slo=admission_check_own_slo,
+            admission_max_bypass_count=admission_max_bypass_count,
+            admission_max_wait_ms=admission_max_wait_ms,
+            admission_aging_harm_ms_per_ms=admission_aging_harm_ms_per_ms,
+            admission_aging_harmed_requests_per_ms=admission_aging_harmed_requests_per_ms,
+            share_gpu_prefill_across_routes=share_gpu_prefill_across_routes,
+            gpu_queue_alpha=gpu_queue_alpha,
+            pim_queue_alpha=pim_queue_alpha,
+            active_request_alpha=active_request_alpha,
+            decode_token_alpha=decode_token_alpha,
+            prompt_priority=prompt_priority,
+            prefer_gpu_on_tie=prefer_gpu_on_tie,
+            energy_latency_guard_ms=energy_latency_guard_ms,
+            route_load_balance_ms_per_active_request=route_load_balance_ms_per_active_request,
+            capture_debug_events=capture_debug_events,
+            debug_log_path=debug_log_path,
+            online_frontend=online_frontend)
 
         ramulator_file = self._resolve_ramulator_binary()
         run_cmd = f"{ramulator_file} -f {yaml_file}"
