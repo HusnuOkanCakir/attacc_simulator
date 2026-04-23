@@ -132,6 +132,15 @@ class HBM3PIMController final : public IDRAMController, public Implementation {
             pending.push_back(*req_it);
           } else if (req_it->type_id == Request::Type::Write) {
             // TODO: Add code to update statistics
+            if (req_it->callback) {
+              req_it->depart = m_clk;
+              req_it->callback(*req_it);
+            }
+          } else {
+            if (req_it->callback) {
+              req_it->depart = m_clk;
+              req_it->callback(*req_it);
+            }
           }
           buffer->remove(req_it);
         } else {
@@ -148,7 +157,9 @@ class HBM3PIMController final : public IDRAMController, public Implementation {
       ReqBuffer::iterator sec_req_it;
       ReqBuffer* sec_buffer = nullptr;
       bool sec_request_found = false;
-      sec_request_found = schedule_sec_request(sec_req_it, buffer, req_it->command);
+      if (request_found) {
+        sec_request_found = schedule_sec_request(sec_req_it, sec_buffer, req_it->command);
+      }
       for (auto plugin : m_plugins) {
         plugin->update(sec_request_found, sec_req_it);
       }
@@ -160,13 +171,22 @@ class HBM3PIMController final : public IDRAMController, public Implementation {
             sec_req_it->depart = m_clk + m_dram->m_read_latency;
             pending.push_back(*sec_req_it);
           } else if (sec_req_it->type_id == Request::Type::Write) {
+            if (sec_req_it->callback) {
+              sec_req_it->depart = m_clk;
+              sec_req_it->callback(*sec_req_it);
+            }
+          } else {
+            if (sec_req_it->callback) {
+              sec_req_it->depart = m_clk;
+              sec_req_it->callback(*sec_req_it);
+            }
           }
-          buffer->remove(sec_req_it);
+          sec_buffer->remove(sec_req_it);
         } else {
           if (!is_pim) {
             if (m_dram->m_command_meta(sec_req_it->command).is_opening) {
               m_active_buffer.enqueue(*sec_req_it);
-              buffer->remove(sec_req_it);
+              sec_buffer->remove(sec_req_it);
             }
           }
         }

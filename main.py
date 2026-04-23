@@ -261,7 +261,7 @@ def main():
     parser.add_argument("--online-frontend",
                         type=str,
                         default="realtime",
-                        choices=["realtime", "alternating"],
+                        choices=["realtime", "alternating", "serving1_5"],
                         help="Online serving frontend implementation.")
     parser.add_argument("--requests-csv",
                         type=str,

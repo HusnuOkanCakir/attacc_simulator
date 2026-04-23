@@ -226,8 +226,10 @@ class Ramulator:
             return "RealtimeServingFrontend"
         if online_frontend == "alternating":
             return "AlternatingServingFrontend"
+        if online_frontend == "serving1_5":
+            return "Serving1_5Frontend"
         raise ValueError(
-            f"Unsupported online frontend {online_frontend}; expected realtime or alternating"
+            f"Unsupported online frontend {online_frontend}; expected realtime, alternating, or serving1_5"
         )
 
     def make_online_yaml_file(self,
@@ -243,6 +245,7 @@ class Ramulator:
                               generator_heads_per_hbm,
                               generator_dtype_bytes,
                               generator_num_layers,
+                              generator_num_heads,
                               generator_channel_count,
                               translation_max_addr,
                               translation_pagesize_kb,
@@ -325,6 +328,7 @@ class Ramulator:
         line += "  generator_heads_per_hbm: {}\n".format(int(generator_heads_per_hbm))
         line += "  generator_dtype_bytes: {}\n".format(int(generator_dtype_bytes))
         line += "  generator_num_layers: {}\n".format(int(generator_num_layers))
+        line += "  generator_num_heads: {}\n".format(int(generator_num_heads))
         line += "  generator_channel_count: {}\n".format(int(generator_channel_count))
         line += "  translation_max_addr: {}\n".format(int(translation_max_addr))
         line += "  translation_pagesize_KB: {}\n".format(int(translation_pagesize_kb))
@@ -383,10 +387,14 @@ class Ramulator:
         line += "  capture_debug_events: {}\n".format(str(bool(capture_debug_events)).lower())
         line += "  debug_log_path: {}\n".format(debug_log_path)
         line += "  clock_ratio: 1\n"
-        if hybrid_command_source == "runtime_generated":
+        needs_translation = hybrid_command_source == "runtime_generated" or online_frontend == "serving1_5"
+        if needs_translation:
             line += "\n"
             line += "  Translation:\n"
-            line += "    impl: AttAccServingTranslation\n"
+            if online_frontend == "serving1_5":
+                line += "    impl: Serving1_5Translation\n"
+            else:
+                line += "    impl: AttAccServingTranslation\n"
             line += "    max_addr: {}\n".format(int(translation_max_addr))
             line += "    pagesize_KB: {}\n".format(int(translation_pagesize_kb))
         line += "\n"
@@ -429,7 +437,7 @@ class Ramulator:
                                         slo_e2e_ms=-1.0,
                                         online_frontend="realtime"):
         frontend_impl = self._online_frontend_impl_name(online_frontend)
-        if online_frontend != "realtime":
+        if online_frontend == "alternating":
             if route_policy != "min_finish":
                 raise ValueError(
                     f"{frontend_impl} only supports route_policy=min_finish, got {route_policy}"
@@ -437,6 +445,12 @@ class Ramulator:
             if int(batch_size) != 1:
                 raise ValueError(
                     f"{frontend_impl} only supports batch_size=1, got {batch_size}"
+                )
+            return
+        if online_frontend == "serving1_5":
+            if route_policy not in ("min_finish", "latency_guarded_energy"):
+                raise ValueError(
+                    f"{frontend_impl} only supports route_policy=min_finish or latency_guarded_energy, got {route_policy}"
                 )
             return
 
@@ -672,6 +686,7 @@ class Ramulator:
                            generator_heads_per_hbm=None,
                            generator_dtype_bytes=None,
                            generator_num_layers=None,
+                           generator_num_heads=None,
                            generator_channel_count=None,
                            translation_max_addr=None,
                            translation_pagesize_kb=4,
@@ -758,6 +773,7 @@ class Ramulator:
         generator_heads_per_hbm = int(generator_heads_per_hbm or math.ceil(self.nhead / self.num_hbm))
         generator_dtype_bytes = int(generator_dtype_bytes or self.dtype_bytes)
         generator_num_layers = int(generator_num_layers or self.num_layers)
+        generator_num_heads = int(generator_num_heads or self.nhead)
         generator_channel_count = int(generator_channel_count or self.channel_count)
         translation_max_addr = int(translation_max_addr or (2 * 1024 * 1024 * 1024))
         if not kv_pool_bytes:
@@ -783,6 +799,7 @@ class Ramulator:
             generator_heads_per_hbm=generator_heads_per_hbm,
             generator_dtype_bytes=generator_dtype_bytes,
             generator_num_layers=generator_num_layers,
+            generator_num_heads=generator_num_heads,
             generator_channel_count=generator_channel_count,
             translation_max_addr=translation_max_addr,
             translation_pagesize_kb=translation_pagesize_kb,
