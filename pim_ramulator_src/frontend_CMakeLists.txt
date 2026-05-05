@@ -1,0 +1,78 @@
+add_library(ramulator-frontend OBJECT)
+
+target_sources(
+  ramulator-frontend PRIVATE
+  frontend.h
+
+  impl/memory_trace/loadstore_trace.cpp
+  impl/memory_trace/pim_loadstore_trace.cpp
+  impl/serving/types.h
+  impl/serving/layout_planner.h
+  impl/serving/layout_planner.cpp
+  impl/serving/address_space.h
+  impl/serving/address_space.cpp
+  impl/serving/allocator.h
+  impl/serving/allocator.cpp
+  impl/serving/serving_allocator_facade.h
+  impl/serving/serving_allocator_facade.cpp
+  impl/serving/pim_allocator.h
+  impl/serving/pim_allocator.cpp
+  impl/serving/command_generator.h
+  impl/serving/command_generator_internal.h
+  impl/serving/command_generator.cpp
+  impl/serving/command_generator_stream.cpp
+  impl/serving/command_generator_builder.cpp
+  impl/serving/trace_loader.h
+  impl/serving/trace_loader.cpp
+  impl/serving/inputs.h
+  impl/serving/inputs.cpp
+  impl/serving/inputs_internal.h
+  impl/serving/cost_inputs.cpp
+  impl/serving/predictor.h
+  impl/serving/predictor.cpp
+  impl/serving/pim_executor.h
+  impl/serving/pim_executor.cpp
+  impl/serving/runtime.h
+  impl/serving/runtime.cpp
+  impl/serving/runtime_forecast.cpp
+  impl/serving/runtime_debug.cpp
+  impl/serving/runtime_reporting.cpp
+  impl/serving/realtime_serving_frontend.cpp
+  impl/serving1_5/types.h
+  impl/serving1_5/csv_loader.h
+  impl/serving1_5/csv_loader.cpp
+  impl/serving1_5/cost_table.h
+  impl/serving1_5/cost_table.cpp
+  impl/serving1_5/pim_allocator.h
+  impl/serving1_5/pim_allocator.cpp
+  impl/serving1_5/pim_commands.h
+  impl/serving1_5/pim_commands.cpp
+  impl/serving1_5/scheduler.h
+  impl/serving1_5/scheduler.cpp
+  impl/serving1_5/frontend.cpp
+  impl/serving_online/types.h
+  impl/serving_online/csv_loader.h
+  impl/serving_online/csv_loader.cpp
+  impl/serving_online/cost_table.h
+  impl/serving_online/cost_table.cpp
+  impl/serving_online/ml_cost_model.cpp
+  impl/serving_online/pim_allocator.h
+  impl/serving_online/pim_allocator.cpp
+  impl/serving_online/pim_commands.h
+  impl/serving_online/pim_commands.cpp
+  impl/serving_online/scheduler.h
+  impl/serving_online/scheduler.cpp
+  impl/serving_online/frontend.cpp
+  impl/simple_online_serving/types.h
+  impl/simple_online_serving/parser.h
+  impl/simple_online_serving/parser.cpp
+  impl/simple_online_serving/runtime.h
+  impl/simple_online_serving/runtime.cpp
+  impl/simple_online_serving/simple_online_serving_frontend.cpp
+)
+
+target_link_libraries(
+  ramulator
+  PRIVATE
+  ramulator-frontend
+)

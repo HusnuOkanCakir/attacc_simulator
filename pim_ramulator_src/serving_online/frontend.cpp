@@ -109,6 +109,8 @@ class Runtime {
     if (!cfg.cost_pim_csv.empty() && cfg.cost_pim_csv != cfg.cost_gpu_csv) {
       m_cost_table.load(cfg.cost_pim_csv);
     }
+    if (!cfg.cost_gpu_model.empty())    m_cost_table.load_ml(cfg.cost_gpu_model);
+    if (!cfg.cost_hybrid_model.empty()) m_cost_table.load_ml(cfg.cost_hybrid_model);
 
     // Build KV allocator.
     PimAllocator::Config alloc_cfg;
@@ -575,6 +577,8 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
                               .default_val("cluster_outputs/serving_online_requests.csv");
     cfg.cost_gpu_csv    = param<std::string>("cost_gpu_csv").required();
     cfg.cost_pim_csv    = param<std::string>("cost_hybrid_csv").required();
+    cfg.cost_gpu_model    = param<std::string>("cost_gpu_model").default_val("");
+    cfg.cost_hybrid_model = param<std::string>("cost_hybrid_model").default_val("");
 
     // Route names
     cfg.gpu_route_name  = param<std::string>("gpu_route_name").default_val("gpu_only");
@@ -592,6 +596,7 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
     cfg.max_decode_batch_size          = param<int>("max_decode_batch_size").default_val(8);
     cfg.prompt_priority                = param<bool>("prompt_priority").default_val(true);
     cfg.max_consecutive_decode_batches = param<int>("max_consecutive_decode_batches").default_val(4);
+    cfg.max_active_requests            = param<int>("max_active_requests").default_val(0);
 
     // Admission
     cfg.admission_max_wait_ms       = param<float>("admission_max_wait_ms").default_val(0.0f);
@@ -610,6 +615,7 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
                                             .default_val(1.0f);
     cfg.predictive_hold_ms             = param<float>("predictive_hold_ms").default_val(50.0f);
     cfg.kv_tail_trim_max_per_request   = param<int>("kv_tail_trim_max_per_request").default_val(8);
+    cfg.kv_tail_trim_multiplier        = param<int>("kv_tail_trim_multiplier").default_val(1);
 
     // Arrival
     cfg.arrival_time_scale = param<float>("arrival_time_scale").default_val(1.0f);

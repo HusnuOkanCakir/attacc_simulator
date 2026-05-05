@@ -29,6 +29,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "frontend/impl/serving_online/cost_table.h"
@@ -196,6 +197,24 @@ class Scheduler {
   std::vector<SourceRequest>  m_arrivals;
   size_t                      m_arrival_idx = 0;
   std::vector<RuntimeRequest> m_requests;
+
+  // Effective cap on concurrent active (non-terminal) requests in m_requests.
+  // 0 = unlimited. Set in initialize() from cfg.max_active_requests, with the
+  // auto-default applied when cfg.max_active_requests <= 0.
+  int m_active_cap   = 0;
+  int m_active_count = 0;   // requests currently in non-terminal state
+
+  // Per-state indices into m_requests. Kept in sync via set_state(); all
+  // scheduler hot paths iterate only the relevant index instead of scanning
+  // all of m_requests (which grows monotonically as requests complete and
+  // accumulate in Done/Dropped state).
+  std::unordered_set<int> m_waiting_admission;
+  std::unordered_set<int> m_waiting_prefill;
+  std::unordered_set<int> m_waiting_decode;
+
+  // Centralized state transition. Updates m_requests[idx].state AND keeps the
+  // per-state indices in sync. ALWAYS use this helper for state transitions.
+  void set_state(int idx, ReqState new_state);
 
   int m_consecutive_decode = 0;
 

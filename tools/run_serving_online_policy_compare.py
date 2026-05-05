@@ -48,12 +48,18 @@ REQUESTS_CSV    = REQUESTS_CSV_DEFAULT
 ARRIVAL_SCALE   = 0.1
 COST_GPU_CSV    = "cluster_outputs/cost_tables_full_energy/gpu_only.csv"
 COST_HYBRID_CSV = "cluster_outputs/cost_tables_full_energy/lpddr5_pim_bank.csv"
+COST_GPU_MODEL    = ""  # non-empty → ML tree inference overrides nearest-neighbor
+COST_HYBRID_MODEL = ""
+DEBUG_LOG         = False  # write per-translation debug log (slow; off by default)
+MAX_ACTIVE        = 0      # 0 = unlimited (legacy); >0 caps concurrent active requests
 
 POLICY_COLORS = {
     "guaranteed_no_evict": "#1f77b4",
     "max_util_full":       "#d62728",
     "max_util_tail":       "#2ca02c",
     "max_util_tail_pred":  "#9467bd",
+    "max_util_tail_x4":    "#ff7f0e",
+    "max_util_tail_x8":    "#8c564b",
 }
 
 # Per-label knobs passed into the YAML template.
@@ -79,6 +85,18 @@ POLICY_SETTINGS = {
         predictive_pressure_threshold=1.0,
         predictive_hold_ms=50.0,
     ),
+    "max_util_tail_x4": dict(
+        kv_scheduler_policy="max_utilization",
+        kv_decode_chunk_tokens=32,
+        kv_evict_granularity="tail",
+        kv_tail_trim_multiplier=4,
+    ),
+    "max_util_tail_x8": dict(
+        kv_scheduler_policy="max_utilization",
+        kv_decode_chunk_tokens=32,
+        kv_evict_granularity="tail",
+        kv_tail_trim_multiplier=8,
+    ),
 }
 
 # ── YAML ──────────────────────────────────────────────────────────────────────
@@ -86,7 +104,7 @@ POLICY_SETTINGS = {
 def yaml_text(label: str, run_dir: Path) -> str:
     """Render the YAML for one run. label selects the scheduler policy."""
     out_csv   = run_dir.relative_to(REPO) / "requests_out.csv"
-    debug_log = run_dir.relative_to(REPO) / "debug.log"
+    debug_log = (run_dir.relative_to(REPO) / "debug.log") if DEBUG_LOG else ""
 
     settings = POLICY_SETTINGS[label]
     lines = []
@@ -97,6 +115,12 @@ def yaml_text(label: str, run_dir: Path) -> str:
             lines.append(f"  {key}: {value}")
     policy_lines = "\n".join(lines) + "\n"
 
+    ml_lines = ""
+    if COST_GPU_MODEL:
+        ml_lines += f"  cost_gpu_model: {COST_GPU_MODEL}\n"
+    if COST_HYBRID_MODEL:
+        ml_lines += f"  cost_hybrid_model: {COST_HYBRID_MODEL}\n"
+
     return f"""Frontend:
   impl: ServingOnlineFrontend
   clock_ratio: 1
@@ -104,6 +128,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
   requests_csv: {REQUESTS_CSV}
   cost_gpu_csv: {COST_GPU_CSV}
   cost_hybrid_csv: {COST_HYBRID_CSV}
+{ml_lines}
 
   requests_out_csv: {out_csv}
   debug_log_path: {debug_log}
@@ -117,6 +142,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
   max_decode_batch_size: 8
   prompt_priority: true
   max_consecutive_decode_batches: 4
+  max_active_requests: {MAX_ACTIVE}
 
   admission_max_wait_ms: 150.0
   admission_retry_interval_ms: 10.0
@@ -417,6 +443,25 @@ def main() -> None:
     ap.add_argument("--arrival-scale", type=float, default=0.1,
                     help="arrival_time_scale passed to the simulator. "
                          "< 1.0 speeds up arrivals. Default: 0.1.")
+    ap.add_argument("--max-active", type=int, default=0,
+                    help="Cap on concurrent active requests in the scheduler. "
+                         "0 = unlimited (legacy). Recommended: 4× max_decode_batch_size = 32. "
+                         "Bounds per-tick scan cost; required for large N to avoid O(n²) blowup.")
+    ap.add_argument("--policies", nargs="+",
+                    choices=["guaranteed_no_evict", "max_util_full",
+                             "max_util_tail", "max_util_tail_pred",
+                             "max_util_tail_x4", "max_util_tail_x8"],
+                    default=None,
+                    help="Subset of policies to run/plot. Default: all four.")
+    ap.add_argument("--dense", action="store_true",
+                    help="Use dense ML-predicted cost tables (*_dense.csv) instead "
+                         "of the sparse originals. Generate with tools/gen_dense_cost_table.py.")
+    ap.add_argument("--ml", action="store_true",
+                    help="Use ML tree-ensemble models (.bin) for cost estimation instead "
+                         "of nearest-neighbor CSV lookup. Requires the .bin files generated "
+                         "by tools/export_cost_model_trees.py.")
+    ap.add_argument("--debug-log", action="store_true",
+                    help="Write per-translation debug.log for each run (very slow; off by default).")
     args = ap.parse_args()
 
     # Resolve requests CSV — create a slice if needed.
@@ -435,8 +480,24 @@ def main() -> None:
             print(f"[csv] created {slice_csv.relative_to(REPO)}")
         REQUESTS_CSV = str(slice_csv.relative_to(REPO))
     ARRIVAL_SCALE = args.arrival_scale
+    if args.dense:
+        global COST_GPU_CSV, COST_HYBRID_CSV
+        COST_GPU_CSV    = "cluster_outputs/cost_tables_full_energy/gpu_only_dense.csv"
+        COST_HYBRID_CSV = "cluster_outputs/cost_tables_full_energy/lpddr5_pim_bank_dense.csv"
+    if args.ml:
+        global COST_GPU_MODEL, COST_HYBRID_MODEL
+        COST_GPU_MODEL    = "cluster_outputs/cost_models_full_energy/gpu_only_trees.bin"
+        COST_HYBRID_MODEL = "cluster_outputs/cost_models_full_energy/lpddr5_pim_bank_trees.bin"
+    if args.debug_log:
+        global DEBUG_LOG
+        DEBUG_LOG = True
+    if args.max_active > 0:
+        global MAX_ACTIVE
+        MAX_ACTIVE = args.max_active
     print(f"[csv]           {REQUESTS_CSV}  ({n} requests)")
+    print(f"[max_active]    {MAX_ACTIVE} (0 = unlimited)")
     print(f"[arrival_scale] {ARRIVAL_SCALE}")
+    print(f"[cost_tables]   gpu={COST_GPU_CSV}  hybrid={COST_HYBRID_CSV}")
 
     if args.run_dir is None:
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -448,12 +509,16 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    runs = [
-        ("guaranteed_no_evict", "guaranteed_no_evict"),
-        ("max_util_full",       "max_util_full"),
-        ("max_util_tail",       "max_util_tail"),
-        ("max_util_tail_pred",  "max_util_tail_pred"),
+    all_runs = [
+        ("guaranteed_no_evict",  "guaranteed_no_evict"),
+        ("max_util_full",        "max_util_full"),
+        ("max_util_tail",        "max_util_tail"),
+        ("max_util_tail_pred",   "max_util_tail_pred"),
+        ("max_util_tail_x4",     "max_util_tail_x4"),
+        ("max_util_tail_x8",     "max_util_tail_x8"),
     ]
+    selected = set(args.policies) if args.policies else {lbl for lbl, _ in all_runs}
+    runs = [(lbl, sub) for lbl, sub in all_runs if lbl in selected]
 
     (run_dir / "run_info.txt").write_text(
         f"run_dir={run_dir}\n"

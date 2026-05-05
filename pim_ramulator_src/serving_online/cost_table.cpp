@@ -17,6 +17,7 @@
  */
 
 #include "frontend/impl/serving_online/cost_table.h"
+#include "frontend/impl/serving_online/ml_cost_model.h"
 
 #include <algorithm>
 #include <cctype>
@@ -55,6 +56,9 @@ std::string lower(std::string s) {
 }
 
 }  // namespace
+
+CostTable::CostTable()  = default;
+CostTable::~CostTable() = default;
 
 // ─── load() ─────────────────────────────────────────────────────────────────
 
@@ -195,12 +199,28 @@ void CostTable::load(const std::string& path) {
   }
 }
 
+// ─── load_ml() ───────────────────────────────────────────────────────────────
+
+void CostTable::load_ml(const std::string& bin_path) {
+  if (!m_ml) {
+    m_ml = std::make_unique<Ramulator::MlCostModel>(
+        Ramulator::MlCostModel::load(bin_path));
+  } else {
+    m_ml->merge(Ramulator::MlCostModel::load(bin_path));
+  }
+}
+
 // ─── estimate() ─────────────────────────────────────────────────────────────
 
 std::optional<CostEstimate> CostTable::estimate(const std::string& route,
                                                  int context_tokens,
                                                  int generated_tokens,
                                                  int bs) const {
+  // ML model takes priority over nearest-neighbor when loaded.
+  if (m_ml) {
+    return m_ml->estimate(route, context_tokens, generated_tokens, bs);
+  }
+
   auto it = m_points.find(route);
   if (it == m_points.end() || it->second.empty()) {
     return std::nullopt;

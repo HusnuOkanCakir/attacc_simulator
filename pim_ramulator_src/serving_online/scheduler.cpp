@@ -23,6 +23,30 @@ static std::string sfmt(const char* fmt_str, Args... args) {
 
 namespace Ramulator::ServingOnline {
 
+// ─── set_state() ─────────────────────────────────────────────────────────────
+// Centralized state transition. Removes the request from its current state's
+// index (if any) and inserts into the new state's index. Done/Dropped have no
+// index — terminal states never get scanned.
+
+void Scheduler::set_state(int idx, ReqState new_state) {
+  RuntimeRequest& r = m_requests[idx];
+  switch (r.state) {
+    case ReqState::WaitingAdmission: m_waiting_admission.erase(idx); break;
+    case ReqState::WaitingPrefill:   m_waiting_prefill.erase(idx);   break;
+    case ReqState::WaitingDecode:    m_waiting_decode.erase(idx);    break;
+    case ReqState::Done:
+    case ReqState::Dropped:                                          break;
+  }
+  r.state = new_state;
+  switch (new_state) {
+    case ReqState::WaitingAdmission: m_waiting_admission.insert(idx); break;
+    case ReqState::WaitingPrefill:   m_waiting_prefill.insert(idx);   break;
+    case ReqState::WaitingDecode:    m_waiting_decode.insert(idx);    break;
+    case ReqState::Done:
+    case ReqState::Dropped:                                           break;
+  }
+}
+
 // ─── initialize() ────────────────────────────────────────────────────────────
 
 void Scheduler::initialize(const ServingOnlineConfig& cfg,
@@ -40,6 +64,16 @@ void Scheduler::initialize(const ServingOnlineConfig& cfg,
   m_preempt_count = m_tail_trim_count = m_full_evict_count = 0;
   m_tokens_recomputed = 0;
   m_predictive_holds = 0;
+  m_active_count = 0;
+  m_waiting_admission.clear();
+  m_waiting_prefill.clear();
+  m_waiting_decode.clear();
+  // Resolve effective active-set cap.
+  //   < 0  → unlimited (legacy behavior, no cap, all arrivals enter immediately)
+  //   = 0  → unlimited (default keeps legacy behavior; explicit positive value
+  //          activates the cap)
+  //   > 0  → use that as the cap
+  m_active_cap = (cfg.max_active_requests > 0) ? cfg.max_active_requests : 0;
 }
 
 // ─── all_done() ──────────────────────────────────────────────────────────────
@@ -47,11 +81,10 @@ void Scheduler::initialize(const ServingOnlineConfig& cfg,
 bool Scheduler::all_done() const {
   // All arrivals must have been enqueued.
   if (m_arrival_idx < m_arrivals.size()) return false;
-  // Every request must be in a terminal state.
-  for (const auto& r : m_requests) {
-    if (r.state != ReqState::Done && r.state != ReqState::Dropped) return false;
-  }
-  return true;
+  // No request may be in a non-terminal state.
+  return m_waiting_admission.empty()
+      && m_waiting_prefill.empty()
+      && m_waiting_decode.empty();
 }
 
 // ─── tick() ──────────────────────────────────────────────────────────────────
@@ -69,6 +102,13 @@ std::optional<ActiveTask> Scheduler::tick(double now_ms,
 void Scheduler::enqueue_arrivals(double now_ms) {
   while (m_arrival_idx < m_arrivals.size() &&
          m_arrivals[m_arrival_idx].arrival_ms <= now_ms) {
+    // Bounded active set: stop promoting once we've hit the cap. Remaining
+    // arrivals stay in m_arrivals[] at zero per-tick cost; they get pulled in
+    // on the next slot-opening (Done/Dropped) → enqueue_arrivals call. Keying
+    // on now_ms (not the trace arrival time) preserves arrival_ms semantics:
+    // queue wait shows up naturally as bigger TTFT/E2E.
+    if (m_active_cap > 0 && m_active_count >= m_active_cap) break;
+
     const auto& src = m_arrivals[m_arrival_idx++];
     RuntimeRequest rr;
     rr.id               = src.id;
@@ -83,7 +123,10 @@ void Scheduler::enqueue_arrivals(double now_ms) {
     dlog(sfmt("[%10.3fms] ARRIVE    req=%3d  ctx=%5d  gen=%4d  deadline=%.1fms",
               src.arrival_ms, src.id, src.context_tokens, src.generated_tokens,
               rr.deadline_ms < 0 ? -1.0 : rr.deadline_ms));
+    const int new_idx = static_cast<int>(m_requests.size());
     m_requests.push_back(std::move(rr));
+    m_active_count++;
+    m_waiting_admission.insert(new_idx);   // request enters in WaitingAdmission
   }
 }
 
@@ -128,14 +171,17 @@ uint64_t Scheduler::kv_admission_bytes_per_side(const RuntimeRequest& req) const
 }
 
 uint64_t Scheduler::projected_in_flight_kv_bytes() const {
+  // Iterate the WaitingPrefill ∪ WaitingDecode indices instead of all of
+  // m_requests. With bounded active set this is O(K) regardless of total N.
   uint64_t sum = 0;
-  for (const auto& r : m_requests) {
-    if (r.state != ReqState::WaitingPrefill &&
-        r.state != ReqState::WaitingDecode) continue;
-    if (!r.svc.uses_pim) continue;  // GPU-only in-flights don't use KV
+  auto add = [&](int idx) {
+    const auto& r = m_requests[idx];
+    if (!r.svc.uses_pim) return;          // GPU-only in-flights don't use KV
     const int max_ctx = r.context_tokens + std::max(0, r.generated_tokens - 1);
     sum += 2ull * kv_bytes_for_ctx(max_ctx);
-  }
+  };
+  for (int i : m_waiting_prefill) add(i);
+  for (int i : m_waiting_decode)  add(i);
   return sum;
 }
 
@@ -239,21 +285,26 @@ std::string Scheduler::choose_route(int context_tokens, int generated_tokens,
 
 void Scheduler::process_admission(double now_ms, double gpu_free_ms,
                                    double pim_free_ms) {
-  // Sort eligible candidates by (arrival_ms, id) — FCFS.
-  std::vector<RuntimeRequest*> waiting;
-  for (auto& r : m_requests) {
-    if (r.state == ReqState::WaitingAdmission &&
-        r.admission_next_retry_ms <= now_ms) {
-      waiting.push_back(&r);
-    }
+  if (m_waiting_admission.empty()) return;   // fast no-op when nothing to admit
+
+  // Sort eligible candidates by (arrival_ms, id) — FCFS. Carry the index so
+  // we can erase from m_waiting_admission when a state transition fires.
+  std::vector<int> waiting;
+  waiting.reserve(m_waiting_admission.size());
+  for (int idx : m_waiting_admission) {
+    auto& r = m_requests[idx];
+    if (r.admission_next_retry_ms <= now_ms) waiting.push_back(idx);
   }
   std::sort(waiting.begin(), waiting.end(),
-            [](const RuntimeRequest* a, const RuntimeRequest* b) {
-              if (a->arrival_ms != b->arrival_ms) return a->arrival_ms < b->arrival_ms;
-              return a->id < b->id;
+            [&](int a, int b) {
+              const auto& ra = m_requests[a];
+              const auto& rb = m_requests[b];
+              if (ra.arrival_ms != rb.arrival_ms) return ra.arrival_ms < rb.arrival_ms;
+              return ra.id < rb.id;
             });
 
-  for (RuntimeRequest* req : waiting) {
+  for (int wait_idx : waiting) {
+    RuntimeRequest* req = &m_requests[wait_idx];
     req->admission_attempts++;
 
     // Choose the best route.
@@ -275,9 +326,10 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
         }
         if (route.empty()) {
           // No cost data for any route — drop the request.
-          req->state          = ReqState::Dropped;
+          set_state(wait_idx, ReqState::Dropped);
           req->dropped_reason = "no_route_for_best_effort";
           m_dropped_count++;
+          m_active_count--;
           continue;
         }
         req->is_lost = true;
@@ -357,7 +409,7 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
                       m_cfg.kv_oom_hold_limit_ms,
                       m_cfg.gpu_route_name.c_str()));
             req->admission_last_reject_reason = "kv_oom_fallback_gpu";
-            req->state              = ReqState::WaitingPrefill;
+            set_state(wait_idx, ReqState::WaitingPrefill);
             req->route              = m_cfg.gpu_route_name;
             req->svc                = gpu_ref;
             req->remaining_decode   = gpu_ref.decode_tokens;
@@ -398,7 +450,7 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
               req->context_tokens, req->generated_tokens,
               req->admission_attempts,
               req->is_lost ? "  [SLO_MISS]" : ""));
-    req->state              = ReqState::WaitingPrefill;
+    set_state(wait_idx, ReqState::WaitingPrefill);
     req->route              = route;
     req->svc                = est;
     req->remaining_decode   = est.decode_tokens;
@@ -422,13 +474,14 @@ void Scheduler::complete_task(const ActiveTask& task, double finish_ms) {
       req.first_token_ms  = finish_ms;
       req.ready_ms        = finish_ms;
       if (req.remaining_decode > 0) {
-        req.state = ReqState::WaitingDecode;
+        set_state(idx, ReqState::WaitingDecode);
         // max_utilization: grow KV to cover the first decode step's read.
         // No-op under guaranteed_no_evict (full reservation already in place).
         grow_kv_or_preempt(idx, finish_ms);
       } else {
-        req.state        = ReqState::Done;
+        set_state(idx, ReqState::Done);
         req.completion_ms = finish_ms;
+        m_active_count--;
         any_done = true;
       }
     }
@@ -442,12 +495,18 @@ void Scheduler::complete_task(const ActiveTask& task, double finish_ms) {
                                                    : req.prefill_end_ms);
       if (last_tok > 0.0) req.tbt_ms.push_back(finish_ms - last_tok);
 
+      // A batch-mate processed earlier in this loop may have evicted this
+      // request via grow_kv_or_preempt → preempt_lru. If so, skip completion:
+      // the request is already back in WaitingAdmission with its state clean.
+      if (req.state == ReqState::WaitingAdmission) continue;
+
       req.remaining_decode--;
       req.ready_ms = finish_ms;
 
       if (req.remaining_decode <= 0) {
-        req.state         = ReqState::Done;
+        set_state(idx, ReqState::Done);
         req.completion_ms = finish_ms;
+        m_active_count--;
         dlog(sfmt("[%10.3fms] DONE      req=%3d  e2e_ms=%.3f  ttft_ms=%.3f",
                   finish_ms, req.id,
                   finish_ms - req.arrival_ms,
@@ -466,7 +525,7 @@ void Scheduler::complete_task(const ActiveTask& task, double finish_ms) {
           any_done = true;
         }
       } else {
-        req.state = ReqState::WaitingDecode;
+        set_state(idx, ReqState::WaitingDecode);
         // max_utilization: grow KV for the next decode step's read.
         // If growth forces preemption of THIS request, state is reset to
         // WaitingAdmission and kv_bytes_reserved is zeroed by preempt_lru.
@@ -477,6 +536,9 @@ void Scheduler::complete_task(const ActiveTask& task, double finish_ms) {
 
   if (any_done) {
     wake_kv_held(finish_ms);
+    // Slot(s) just freed — pull more arrivals into the active set if any are
+    // ready. Cheap no-op when arrival queue is empty or cap is unlimited.
+    enqueue_arrivals(finish_ms);
   }
 }
 
@@ -484,11 +546,11 @@ void Scheduler::complete_task(const ActiveTask& task, double finish_ms) {
 
 void Scheduler::wake_kv_held(double now_ms) {
   int woke = 0;
-  for (auto& r : m_requests) {
-    if (r.state == ReqState::WaitingAdmission &&
-        (r.admission_last_reject_reason == "kv_oom" ||
-         r.admission_last_reject_reason == "kv_evicted")) {
-      // Reset retry clock so this request is reconsidered on the next tick.
+  // Iterate WaitingAdmission index instead of all of m_requests.
+  for (int idx : m_waiting_admission) {
+    auto& r = m_requests[idx];
+    if (r.admission_last_reject_reason == "kv_oom" ||
+        r.admission_last_reject_reason == "kv_evicted") {
       r.admission_next_retry_ms = now_ms;
       woke++;
     }
@@ -510,17 +572,19 @@ void Scheduler::wake_kv_held(double now_ms) {
 bool Scheduler::preempt_lru(int excluded_index, double now_ms) {
   int best = -1;
   double best_admit = -1.0;
-  for (int i = 0; i < static_cast<int>(m_requests.size()); ++i) {
-    if (i == excluded_index) continue;
+  // In-flight victims live in WaitingPrefill ∪ WaitingDecode. Iterate those
+  // indices instead of scanning all of m_requests.
+  auto consider = [&](int i) {
+    if (i == excluded_index) return;
     const auto& r = m_requests[i];
-    if (r.kv_bytes_reserved == 0) continue;
-    if (r.state != ReqState::WaitingPrefill &&
-        r.state != ReqState::WaitingDecode) continue;
+    if (r.kv_bytes_reserved == 0) return;
     if (r.admitted_ms > best_admit) {
       best_admit = r.admitted_ms;
       best       = i;
     }
-  }
+  };
+  for (int i : m_waiting_prefill) consider(i);
+  for (int i : m_waiting_decode)  consider(i);
   if (best < 0) return false;
 
   auto& v = m_requests[best];
@@ -536,7 +600,7 @@ bool Scheduler::preempt_lru(int excluded_index, double now_ms) {
             excluded_index >= 0 ? m_requests[excluded_index].id : -1,
             redone));
   v.kv_bytes_reserved            = 0;
-  v.state                        = ReqState::WaitingAdmission;
+  set_state(best, ReqState::WaitingAdmission);   // returns to admission queue
   v.route.clear();
   v.remaining_decode             = 0;
   v.admission_last_reject_reason = "kv_evicted";
@@ -565,13 +629,14 @@ bool Scheduler::preempt_tail_trim(int excluded_index,
   const int trim_cap = m_cfg.kv_tail_trim_max_per_request;
   int best = -1;
   double best_admit = -1.0;
-  for (int i = 0; i < static_cast<int>(m_requests.size()); ++i) {
+  // Tail-trim victims must be in WaitingDecode (they've completed at least one
+  // decode step). Iterate the index instead of scanning all of m_requests.
+  for (int i : m_waiting_decode) {
     if (i == excluded_index) continue;
     const auto& r = m_requests[i];
-    if (r.kv_bytes_reserved == 0)                        continue;
-    if (r.state != ReqState::WaitingDecode)              continue;
+    if (r.kv_bytes_reserved == 0) continue;
     const int completed = std::max(0, r.svc.decode_tokens - r.remaining_decode);
-    if (completed <= 0)                                  continue;
+    if (completed <= 0) continue;
     // Livelock guard: once a request has absorbed too many tail-trims since
     // its current admission, stop re-trimming it and let the caller escalate
     // to full evict. trim_cap == 0 disables the guard (legacy behavior).
@@ -588,7 +653,9 @@ bool Scheduler::preempt_tail_trim(int excluded_index,
   if (per_tok == 0) return false;
   const int      completed  = std::max(0, v.svc.decode_tokens - v.remaining_decode);
   const uint64_t need_tokens = (bytes_needed_per_side + per_tok - 1) / per_tok;
-  int trim = static_cast<int>(std::min<uint64_t>(need_tokens, static_cast<uint64_t>(completed)));
+  const uint64_t mult = static_cast<uint64_t>(std::max(1, m_cfg.kv_tail_trim_multiplier));
+  int trim = static_cast<int>(std::min<uint64_t>(
+      need_tokens * mult, static_cast<uint64_t>(completed)));
   if (trim <= 0) return false;
 
   const uint64_t bytes_per_side = static_cast<uint64_t>(trim) * per_tok;
@@ -720,19 +787,21 @@ std::optional<ActiveTask> Scheduler::pick_task(double now_ms,
 // ─── pick_prefill() ──────────────────────────────────────────────────────────
 
 std::optional<ActiveTask> Scheduler::pick_prefill(double now_ms) const {
-  const RuntimeRequest* best = nullptr;
-  for (const auto& r : m_requests) {
-    if (r.state != ReqState::WaitingPrefill) continue;
+  int best_idx = -1;
+  // Iterate WaitingPrefill index instead of all of m_requests.
+  for (int i : m_waiting_prefill) {
+    const auto& r = m_requests[i];
     if (r.ready_ms > now_ms) continue;
-    if (!best ||
-        r.ready_ms < best->ready_ms ||
-        (r.ready_ms == best->ready_ms && r.id < best->id)) {
-      best = &r;
+    if (best_idx < 0) { best_idx = i; continue; }
+    const auto& cur = m_requests[best_idx];
+    if (r.ready_ms < cur.ready_ms ||
+        (r.ready_ms == cur.ready_ms && r.id < cur.id)) {
+      best_idx = i;
     }
   }
-  if (!best) return std::nullopt;
-
-  int idx = static_cast<int>(best - m_requests.data());
+  if (best_idx < 0) return std::nullopt;
+  const RuntimeRequest* best = &m_requests[best_idx];
+  int idx = best_idx;
   ActiveTask t;
   t.phase            = "prefill";
   t.route            = best->route;
@@ -763,10 +832,10 @@ std::optional<ActiveTask> Scheduler::pick_decode_batch(double now_ms) const {
   std::vector<Cohort> cohorts;
   for (const std::string& route : {m_cfg.pim_route_name, m_cfg.gpu_route_name}) {
     // Collect and sort decode-ready requests for this route.
+    // Iterate WaitingDecode index — bounded by active set, not m_requests.size().
     std::vector<std::pair<double, int>> ready_reqs;  // (ready_ms, index)
-    for (int i = 0; i < static_cast<int>(m_requests.size()); ++i) {
+    for (int i : m_waiting_decode) {
       const auto& r = m_requests[i];
-      if (r.state != ReqState::WaitingDecode) continue;
       if (r.route != route) continue;
       if (r.ready_ms > now_ms) continue;
       ready_reqs.push_back({r.ready_ms, i});
@@ -845,20 +914,10 @@ std::optional<double> Scheduler::next_wakeup_ms() const {
     consider(m_arrivals[m_arrival_idx].arrival_ms);
   }
 
-  for (const auto& r : m_requests) {
-    switch (r.state) {
-      case ReqState::WaitingAdmission:
-        consider(r.admission_next_retry_ms);
-        break;
-      case ReqState::WaitingPrefill:
-      case ReqState::WaitingDecode:
-        consider(r.ready_ms);
-        break;
-      case ReqState::Done:
-      case ReqState::Dropped:
-        break;
-    }
-  }
+  // Iterate per-state indices instead of all of m_requests.
+  for (int i : m_waiting_admission) consider(m_requests[i].admission_next_retry_ms);
+  for (int i : m_waiting_prefill)   consider(m_requests[i].ready_ms);
+  for (int i : m_waiting_decode)    consider(m_requests[i].ready_ms);
 
   return next_ms;
 }

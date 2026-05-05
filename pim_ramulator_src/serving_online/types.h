@@ -162,6 +162,10 @@ struct ServingOnlineConfig {
   std::string csv_path;           // Azure LLM inference CSV
   std::string cost_gpu_csv;       // cost table for gpu_only route
   std::string cost_pim_csv;       // cost table for pim+gpu route
+  // Optional ML tree models (binary .bin from export_cost_model_trees.py).
+  // When set, ML inference replaces nearest-neighbor lookup for that route.
+  std::string cost_gpu_model;     // e.g. "cluster_outputs/cost_models_full_energy/gpu_only_trees.bin"
+  std::string cost_hybrid_model;  // e.g. "cluster_outputs/cost_models_full_energy/lpddr5_pim_bank_trees.bin"
 
   // Route names (must match what is in the cost CSVs)
   std::string gpu_route_name = "gpu_only";
@@ -179,6 +183,14 @@ struct ServingOnlineConfig {
   int    max_decode_batch_size          = 8;
   bool   prompt_priority                = true;  // always pick prefill first
   int    max_consecutive_decode_batches = 4;     // force prefill after this many decode batches
+
+  // Bounded active set: cap how many requests the scheduler reasons about at
+  // once. Arrivals beyond this stay in the FIFO arrival queue at zero per-tick
+  // cost until a slot opens (Done/Dropped). 0 = unlimited (legacy behavior, all
+  // arrivals enter immediately — O(N²) admission). Recommended: 4× the decode
+  // batch size, which keeps the active set wide enough to fill batches with
+  // route diversity while bounding per-tick scans to a small constant.
+  int    max_active_requests = 0;
 
   // Admission
   double admission_max_wait_ms      = 0.0;  // 0 = no timeout (hold forever until feasible)
@@ -235,6 +247,15 @@ struct ServingOnlineConfig {
   // kv_scheduler_policy == "max_utilization" and kv_evict_granularity ==
   // "tail".
   int kv_tail_trim_max_per_request = 8;
+
+  // kv_tail_trim_multiplier: how many times the immediate need to free per
+  //   tail-trim event. 1 = free exactly what the growing request needs (default,
+  //   current behavior). Higher values free more memory per event (e.g., 4 frees
+  //   4× the chunk size) so subsequent chunks don't immediately trigger another
+  //   OOM, trading more recomputation per event for far fewer total events.
+  //   Effective only under kv_scheduler_policy == "max_utilization" and
+  //   kv_evict_granularity == "tail".
+  int kv_tail_trim_multiplier = 1;
 
   // predictive_admission: oracle-based size-aware admission gate. When true,
   //   at admission time the scheduler projects the sum of remaining KV bytes

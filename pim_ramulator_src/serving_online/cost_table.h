@@ -19,12 +19,15 @@
 #ifndef RAMULATOR_FRONTEND_IMPL_SERVING_ONLINE_COST_TABLE_H
 #define RAMULATOR_FRONTEND_IMPL_SERVING_ONLINE_COST_TABLE_H
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "frontend/impl/serving_online/types.h"
+
+namespace Ramulator { class MlCostModel; }   // forward declaration
 
 namespace Ramulator::ServingOnline {
 
@@ -38,12 +41,22 @@ struct CostPoint {
 
 class CostTable {
  public:
+  CostTable();
+  ~CostTable();  // defined in cost_table.cpp where MlCostModel is complete
+
   /**
    * Load cost points from a CSV file.
    * Can be called multiple times; each call appends to existing data.
    * @throws std::runtime_error on file open or format errors.
    */
   void load(const std::string& path);
+
+  /**
+   * Load a HistGBR binary model (.bin) produced by export_cost_model_trees.py.
+   * When loaded, estimate() uses ML inference instead of nearest-neighbor.
+   * @throws std::runtime_error on file or format errors.
+   */
+  void load_ml(const std::string& bin_path);
 
   /**
    * Find the nearest cost point for (route, context_tokens, generated_tokens, bs)
@@ -65,6 +78,10 @@ class CostTable {
  private:
   // m_points[route] = vector of cost points (all points for that route).
   std::unordered_map<std::string, std::vector<CostPoint>> m_points;
+
+  // Optional ML model — when set, estimate() uses tree inference instead of
+  // nearest-neighbor. Loaded via load_ml().
+  std::unique_ptr<Ramulator::MlCostModel> m_ml;
 };
 
 }  // namespace Ramulator::ServingOnline
