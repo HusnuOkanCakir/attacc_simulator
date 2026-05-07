@@ -52,6 +52,39 @@ COST_GPU_MODEL    = ""  # non-empty → ML tree inference overrides nearest-neig
 COST_HYBRID_MODEL = ""
 DEBUG_LOG         = False  # write per-translation debug log (slow; off by default)
 MAX_ACTIVE        = 0      # 0 = unlimited (legacy); >0 caps concurrent active requests
+KV_POOL_BYTES     = 1503238553  # ~1.4 GiB; override via --kv-pool-gb
+SLO_E2E_MS        = 900.0   # E2E latency SLO; -1 = disabled
+SLO_TTFT_MS       = -1.0    # TTFT SLO; -1 = disabled
+KV_OOM_POLICY     = "hold"  # hold | fallback_gpu | hold_then_fallback
+KV_OOM_HOLD_LIMIT_MS = 50.0 # max hold time before GPU fallback (hold_then_fallback only)
+PIM_COMMAND_MODE  = "realistic"  # realistic | simple — diagnostic A/B knob
+PIM_CACHE_ENABLED = True         # cache PIM-decode drain cycles by shape (Lever 1)
+
+# Model architecture (filled from MODEL_PRESETS in main()).
+NUM_LAYERS           = 40
+NUM_HEADS            = 8
+D_HEAD               = 256
+DTYPE_BYTES          = 2
+VISION_PREFIX_TOKENS = 0
+
+# Per-model defaults: architecture + cost-table paths. Selected via --model.
+# CLI flags --n-layers / --n-heads / --d-head / --vision-prefix-tokens override
+# the preset for ablation runs. CLI flags --ml / --dense pick model-specific
+# alternatives derived from the preset paths.
+MODEL_PRESETS: dict[str, dict] = {
+    "pi0": dict(
+        num_layers=40, num_heads=8, d_head=256, dtype_bytes=2,
+        vision_prefix_tokens=0,
+        cost_dir_csv="cluster_outputs/cost_tables_full_energy",
+        cost_dir_models="cluster_outputs/cost_models_full_energy",
+    ),
+    "openvla": dict(
+        num_layers=32, num_heads=32, d_head=128, dtype_bytes=2,
+        vision_prefix_tokens=256,
+        cost_dir_csv="cluster_outputs/cost_tables_full_energy_openvla",
+        cost_dir_models="cluster_outputs/cost_models_full_energy_openvla",
+    ),
+}
 
 POLICY_COLORS = {
     "guaranteed_no_evict": "#1f77b4",
@@ -121,6 +154,14 @@ def yaml_text(label: str, run_dir: Path) -> str:
     if COST_HYBRID_MODEL:
         ml_lines += f"  cost_hybrid_model: {COST_HYBRID_MODEL}\n"
 
+    # Translation max_addr must be >= kv_pool_bytes (the allocator hands out
+    # physical addresses up to kv_pool_bytes). Round up to the next GiB.
+    MAX_ADDR = max(KV_POOL_BYTES, 1 << 31)
+    if MAX_ADDR & ((1 << 30) - 1):
+        MAX_ADDR = ((MAX_ADDR >> 30) + 1) << 30
+
+    PIM_CACHE_ENABLED_YAML = "true" if PIM_CACHE_ENABLED else "false"
+
     return f"""Frontend:
   impl: ServingOnlineFrontend
   clock_ratio: 1
@@ -146,26 +187,30 @@ def yaml_text(label: str, run_dir: Path) -> str:
 
   admission_max_wait_ms: 150.0
   admission_retry_interval_ms: 10.0
-  kv_oom_policy: hold
+  kv_oom_policy: {KV_OOM_POLICY}
+  kv_oom_hold_limit_ms: {KV_OOM_HOLD_LIMIT_MS}
 {policy_lines}
-  slo_e2e_ms: 900.0
-  slo_ttft_ms: -1.0
+  slo_e2e_ms: {SLO_E2E_MS}
+  slo_ttft_ms: {SLO_TTFT_MS}
 
   arrival_time_scale: {ARRIVAL_SCALE}
   arrival_limit: -1
 
-  kv_pool_bytes: 1503238553
+  kv_pool_bytes: {KV_POOL_BYTES}
 
-  generator_num_layers: 40
-  generator_num_heads: 8
-  generator_dhead: 256
-  generator_dtype_bytes: 2
+  generator_num_layers: {NUM_LAYERS}
+  generator_num_heads: {NUM_HEADS}
+  generator_dhead: {D_HEAD}
+  generator_dtype_bytes: {DTYPE_BYTES}
+  vision_prefix_tokens: {VISION_PREFIX_TOKENS}
+  pim_command_mode: {PIM_COMMAND_MODE}
+  pim_cache_enabled: {PIM_CACHE_ENABLED_YAML}
   generator_channel_count: 16
   translation_pagesize_KB: 4
 
   Translation:
     impl: ServingOnlineTranslation
-    max_addr: 2147483648
+    max_addr: {MAX_ADDR}
 
 MemorySystem:
   impl: PIMDRAM
@@ -447,6 +492,21 @@ def main() -> None:
                     help="Cap on concurrent active requests in the scheduler. "
                          "0 = unlimited (legacy). Recommended: 4× max_decode_batch_size = 32. "
                          "Bounds per-tick scan cost; required for large N to avoid O(n²) blowup.")
+    ap.add_argument("--model", choices=sorted(MODEL_PRESETS.keys()), default="pi0",
+                    help="Model preset selecting architecture (num_layers/num_heads/d_head) "
+                         "and the matching cost tables / ML models. Default: pi0.")
+    ap.add_argument("--n-layers", type=int, default=None,
+                    help="Override generator_num_layers from the model preset.")
+    ap.add_argument("--n-heads", type=int, default=None,
+                    help="Override generator_num_heads from the model preset.")
+    ap.add_argument("--d-head", type=int, default=None,
+                    help="Override generator_dhead from the model preset.")
+    ap.add_argument("--vision-prefix-tokens", type=int, default=None,
+                    help="Override vision_prefix_tokens from the model preset (e.g. 0 to "
+                         "treat OpenVLA as text-only for ablation).")
+    ap.add_argument("--kv-pool-gb", type=float, default=None,
+                    help="PIM KV pool size in GiB. Default: 1.4 GiB (matches Pi0 baseline). "
+                         "OpenVLA needs ~2× more per request, so 4 GiB recommended for n>=20.")
     ap.add_argument("--policies", nargs="+",
                     choices=["guaranteed_no_evict", "max_util_full",
                              "max_util_tail", "max_util_tail_pred",
@@ -460,8 +520,32 @@ def main() -> None:
                     help="Use ML tree-ensemble models (.bin) for cost estimation instead "
                          "of nearest-neighbor CSV lookup. Requires the .bin files generated "
                          "by tools/export_cost_model_trees.py.")
+    ap.add_argument("--slo-e2e-ms", type=float, default=None,
+                    help="E2E latency SLO in ms. Requests predicted to miss it may be rerouted "
+                         "to GPU. -1 disables. Default: 900.")
+    ap.add_argument("--slo-ttft-ms", type=float, default=None,
+                    help="TTFT (time-to-first-token) SLO in ms. -1 disables. Default: -1.")
+    ap.add_argument("--kv-oom-policy",
+                    choices=["hold", "fallback_gpu", "hold_then_fallback"], default=None,
+                    help="Behavior when PIM KV pool is full at admission. "
+                         "'hold': wait until memory frees (default). "
+                         "'fallback_gpu': immediately reroute to GPU. "
+                         "'hold_then_fallback': hold up to --kv-oom-hold-limit-ms then reroute.")
+    ap.add_argument("--kv-oom-hold-limit-ms", type=float, default=None,
+                    help="Max hold time before GPU fallback under hold_then_fallback. Default: 50.")
     ap.add_argument("--debug-log", action="store_true",
                     help="Write per-translation debug.log for each run (very slow; off by default).")
+    ap.add_argument("--pim-command-mode", choices=["realistic", "simple"], default=None,
+                    help="PIM command stream complexity. 'realistic' (default) emits the full "
+                         "per-block LPDDR5-PIM sequence (16K-86K cmds/decode-step). 'simple' emits "
+                         "only num_layers*num_heads*2 PIM_MAC_AB commands. Diagnostic A/B knob: "
+                         "compare wall-clock to bisect DRAM-tick vs frontend overhead.")
+    ap.add_argument("--no-pim-cache", action="store_true",
+                    help="Disable per-shape PIM-decode cycle cache. By default, repeated decode "
+                         "tasks with the same (route, ctx_bucket=ceil(ctx/32), batch_size) shape "
+                         "skip Ramulator and reuse the first inline-measured drain cycles. "
+                         "Disable for verification: cached vs uncached should produce identical "
+                         "TTFT/E2E (just much slower without).")
     args = ap.parse_args()
 
     # Resolve requests CSV — create a slice if needed.
@@ -480,24 +564,72 @@ def main() -> None:
             print(f"[csv] created {slice_csv.relative_to(REPO)}")
         REQUESTS_CSV = str(slice_csv.relative_to(REPO))
     ARRIVAL_SCALE = args.arrival_scale
+
+    # Apply model preset (architecture + cost-table directories), then let
+    # CLI flags override individual fields.
+    preset = MODEL_PRESETS[args.model]
+    global NUM_LAYERS, NUM_HEADS, D_HEAD, DTYPE_BYTES, VISION_PREFIX_TOKENS
+    NUM_LAYERS  = args.n_layers if args.n_layers is not None else preset["num_layers"]
+    NUM_HEADS   = args.n_heads  if args.n_heads  is not None else preset["num_heads"]
+    D_HEAD      = args.d_head   if args.d_head   is not None else preset["d_head"]
+    DTYPE_BYTES = preset["dtype_bytes"]
+    VISION_PREFIX_TOKENS = (args.vision_prefix_tokens
+                            if args.vision_prefix_tokens is not None
+                            else preset["vision_prefix_tokens"])
+
+    global COST_GPU_CSV, COST_HYBRID_CSV
+    csv_dir = preset["cost_dir_csv"]
     if args.dense:
-        global COST_GPU_CSV, COST_HYBRID_CSV
-        COST_GPU_CSV    = "cluster_outputs/cost_tables_full_energy/gpu_only_dense.csv"
-        COST_HYBRID_CSV = "cluster_outputs/cost_tables_full_energy/lpddr5_pim_bank_dense.csv"
+        COST_GPU_CSV    = f"{csv_dir}/gpu_only_dense.csv"
+        COST_HYBRID_CSV = f"{csv_dir}/lpddr5_pim_bank_dense.csv"
+    else:
+        COST_GPU_CSV    = f"{csv_dir}/gpu_only.csv"
+        COST_HYBRID_CSV = f"{csv_dir}/lpddr5_pim_bank.csv"
     if args.ml:
         global COST_GPU_MODEL, COST_HYBRID_MODEL
-        COST_GPU_MODEL    = "cluster_outputs/cost_models_full_energy/gpu_only_trees.bin"
-        COST_HYBRID_MODEL = "cluster_outputs/cost_models_full_energy/lpddr5_pim_bank_trees.bin"
+        model_dir = preset["cost_dir_models"]
+        COST_GPU_MODEL    = f"{model_dir}/gpu_only_trees.bin"
+        COST_HYBRID_MODEL = f"{model_dir}/lpddr5_pim_bank_trees.bin"
     if args.debug_log:
         global DEBUG_LOG
         DEBUG_LOG = True
     if args.max_active > 0:
         global MAX_ACTIVE
         MAX_ACTIVE = args.max_active
+    if args.kv_pool_gb is not None:
+        global KV_POOL_BYTES
+        KV_POOL_BYTES = int(args.kv_pool_gb * (1 << 30))
+    if args.slo_e2e_ms is not None:
+        global SLO_E2E_MS
+        SLO_E2E_MS = args.slo_e2e_ms
+    if args.slo_ttft_ms is not None:
+        global SLO_TTFT_MS
+        SLO_TTFT_MS = args.slo_ttft_ms
+    if args.kv_oom_policy is not None:
+        global KV_OOM_POLICY
+        KV_OOM_POLICY = args.kv_oom_policy
+    if args.kv_oom_hold_limit_ms is not None:
+        global KV_OOM_HOLD_LIMIT_MS
+        KV_OOM_HOLD_LIMIT_MS = args.kv_oom_hold_limit_ms
+    if args.pim_command_mode is not None:
+        global PIM_COMMAND_MODE
+        PIM_COMMAND_MODE = args.pim_command_mode
+    if args.no_pim_cache:
+        global PIM_CACHE_ENABLED
+        PIM_CACHE_ENABLED = False
     print(f"[csv]           {REQUESTS_CSV}  ({n} requests)")
+    print(f"[model]         {args.model}  layers={NUM_LAYERS} heads={NUM_HEADS} "
+          f"d_head={D_HEAD} dtype_bytes={DTYPE_BYTES} vision_prefix={VISION_PREFIX_TOKENS}")
     print(f"[max_active]    {MAX_ACTIVE} (0 = unlimited)")
+    print(f"[kv_pool]       {KV_POOL_BYTES} bytes ({KV_POOL_BYTES / (1<<30):.2f} GiB)")
     print(f"[arrival_scale] {ARRIVAL_SCALE}")
+    print(f"[slo]           e2e={SLO_E2E_MS}ms  ttft={SLO_TTFT_MS}ms")
+    print(f"[kv_oom]        policy={KV_OOM_POLICY}  hold_limit={KV_OOM_HOLD_LIMIT_MS}ms")
+    print(f"[pim_cmd_mode]  {PIM_COMMAND_MODE}")
+    print(f"[pim_cache]     {'enabled' if PIM_CACHE_ENABLED else 'disabled'}")
     print(f"[cost_tables]   gpu={COST_GPU_CSV}  hybrid={COST_HYBRID_CSV}")
+    if COST_GPU_MODEL:
+        print(f"[cost_models]   gpu={COST_GPU_MODEL}  hybrid={COST_HYBRID_MODEL}")
 
     if args.run_dir is None:
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -526,6 +658,12 @@ def main() -> None:
         f"requests_csv={REQUESTS_CSV}\n"
         f"cost_gpu_csv={COST_GPU_CSV}\n"
         f"cost_hybrid_csv={COST_HYBRID_CSV}\n"
+        f"model={args.model}\n"
+        f"num_layers={NUM_LAYERS}\n"
+        f"num_heads={NUM_HEADS}\n"
+        f"d_head={D_HEAD}\n"
+        f"dtype_bytes={DTYPE_BYTES}\n"
+        f"vision_prefix_tokens={VISION_PREFIX_TOKENS}\n"
         f"n_requests={n}\n"
         f"arrival_scale={ARRIVAL_SCALE}\n"
         + "".join(f"{lbl} -> {sub}\n" for lbl, sub in runs)
@@ -572,6 +710,26 @@ def main() -> None:
     canonical.parent.mkdir(parents=True, exist_ok=True)
     canonical.write_bytes(combined_png.read_bytes())
     print(f"[plot] {canonical.relative_to(REPO)}")
+
+    # ── Predicted-vs-actual plots (cost-model sanity check) ───────────────────
+    # Pulls the .pkl bundles next to the .bin files we already pointed at.
+    sys.path.insert(0, str(REPO / "tools"))
+    try:
+        from plot_predicted_vs_actual import plot_run_dir as _plot_pred_vs_actual  # noqa: E402
+    except ImportError:
+        _plot_pred_vs_actual = None
+    if _plot_pred_vs_actual is not None:
+        gpu_pkl    = REPO / preset["cost_dir_models"] / "gpu_only.pkl"
+        hybrid_pkl = REPO / preset["cost_dir_models"] / "lpddr5_pim_bank.pkl"
+        if gpu_pkl.exists() or hybrid_pkl.exists():
+            print("\n[predicted_vs_actual] generating per-policy plots ...")
+            import warnings as _warnings
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                _plot_pred_vs_actual(run_dir, gpu_pkl, hybrid_pkl,
+                                     vision_prefix_tokens=VISION_PREFIX_TOKENS)
+        else:
+            print("\n[predicted_vs_actual skip] no cost-model .pkl bundles found")
 
     # ── KV pool timeline plots ────────────────────────────────────────────────
     print("\n[timeline] generating KV pool occupancy plots ...")

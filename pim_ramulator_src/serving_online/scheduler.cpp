@@ -113,7 +113,10 @@ void Scheduler::enqueue_arrivals(double now_ms) {
     RuntimeRequest rr;
     rr.id               = src.id;
     rr.arrival_ms       = src.arrival_ms;
-    rr.context_tokens   = src.context_tokens;
+    // Vision-encoder prefix is added once, here, so every downstream
+    // path (cost-table lookup, KV reservation, command generation) sees
+    // the inflated context. 0 for text-only models (Pi0).
+    rr.context_tokens   = src.context_tokens + m_cfg.vision_prefix_tokens;
     rr.generated_tokens = src.generated_tokens;
     rr.ready_ms         = src.arrival_ms;
     rr.admission_next_retry_ms = src.arrival_ms;  // eligible immediately on arrival

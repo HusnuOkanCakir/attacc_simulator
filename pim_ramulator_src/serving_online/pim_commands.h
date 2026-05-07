@@ -1,24 +1,29 @@
 /**
  * serving_online/pim_commands.h
  *
- * Runtime LPDDR5 PIM command generator for pi0 attention decode steps.
+ * Runtime LPDDR5-PIM command generator for attention decode steps.
  *
- * For each decode token, pi0 attention performs (per layer, per head):
+ * For each decode token, attention performs (per layer, per head):
  *
- *   Score matmul:   Q[1x256] x K^T[Lx256] -> score[1xL]   (read K cache)
- *   Softmax:        score[1xL] -> prob[1xL]                (PIM softmax)
- *   Context matmul: prob[1xL] x V[Lx256]  -> ctx[1x256]   (read V cache)
+ *   Score matmul:   Q[1xD] x K^T[LxD] -> score[1xL]
+ *   Softmax:        score[1xL] -> prob[1xL]
+ *   Context matmul: prob[1xL] x V[LxD] -> ctx[1xD]
  *
- * This class generates coarse Request tiles for the above operations. Virtual
- * addresses are produced via PimAllocator::encode_va() and are translated to
- * physical addresses at issue time by the translation layer.
+ * Realistic command sequence per (layer, head), at cache-line block
+ * granularity (block = kLineBytes / dtype_bytes tokens):
  *
- * Command granularity:
- *   One Read per (layer, head) K row and one per V row. Absolute decode
- *   latency comes from the cost table; these Reads only exercise the bank
- *   scheduler for contention modelling. The callback on each Request
- *   decrements a caller-supplied counter so the frontend knows when all
- *   commands for a decode step have completed.
+ *   K-side:  for each block: PIM_WR_GB(K) -> PIM_MAC_AB(K)
+ *            PIM_MV_SB (collect partial scores)
+ *            PIM_SFM   (softmax)
+ *   V-side:  for each block: PIM_MV_GB(V) -> PIM_MAC_AB(V)
+ *            PIM_MV_SB (collect partial contexts)
+ *            PIM_BARRIER
+ *
+ * K/V data commands address PIM DRAM via PimAllocator::encode_va(); control
+ * commands use a synthesized control_addr() that lies outside the KV VA
+ * space (bit 63 unset) so the translation layer passes it through. Absolute
+ * decode latency still comes from the cost table; the realistic command
+ * stream drives the LPDDR5-PIM bank-state machine for contention modelling.
  */
 
 #ifndef RAMULATOR_FRONTEND_IMPL_SERVING_ONLINE_PIM_COMMANDS_H
@@ -35,11 +40,20 @@ namespace Ramulator::ServingOnline {
 
 class PimCommandGen {
  public:
+  // Mode selects per-decode-step command stream complexity. See
+  // ServingOnlineConfig::pim_command_mode for the semantics. Diagnostic
+  // toggle for bisecting wall-clock cost (DRAM-tick vs frontend overhead).
+  enum class Mode {
+    Realistic,   // full per-block sequence (default)
+    Simple,      // num_layers × num_heads × 2 PIM_MAC_AB only
+  };
+
   struct Params {
-    int num_layers  = 18;    // number of attention layers (pi0 = 18)
-    int num_heads   = 8;     // attention heads per layer (pi0 = 8)
-    int d_head      = 256;   // key/value head dimension in elements (pi0 = 256)
-    int dtype_bytes = 2;     // bytes per element: 2 = FP16
+    int  num_layers  = 18;    // number of attention layers (pi0 = 18)
+    int  num_heads   = 8;     // attention heads per layer (pi0 = 8)
+    int  d_head      = 256;   // key/value head dimension in elements (pi0 = 256)
+    int  dtype_bytes = 2;     // bytes per element: 2 = FP16
+    Mode mode        = Mode::Realistic;
   };
 
   /**
@@ -77,6 +91,13 @@ class PimCommandGen {
   int decode_step_count(int context_tokens) const;
 
  private:
+  // Synthesize a non-KV "control" address for PIM_MV_SB / PIM_SFM /
+  // PIM_BARRIER requests. Bit 63 is unset so the translation layer leaves
+  // it untouched. Layout: phase_tag<<28 | request_id<<8 | layer<<3 | head.
+  uint64_t control_addr(int request_id, int layer, int head, int phase_tag) const;
+
+  static constexpr int kLineBytes = 64;  // LPDDR5 burst size / cache-line bytes
+
   Params        m_p;
   PimAllocator* m_alloc;
   int           m_read_type_id;

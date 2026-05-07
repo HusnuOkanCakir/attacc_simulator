@@ -16,6 +16,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -25,6 +26,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -87,6 +89,41 @@ static double mean_or_neg1(const std::vector<double>& v) {
   return std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
 }
 
+// ─── PIM shape cache ─────────────────────────────────────────────────────────
+//
+// Per-shape DRAM-drain cycle cache. Each (route, ctx_bucket, batch_size)
+// shape is measured inline on first sighting; subsequent decode tasks with
+// the same shape reuse the cached cycle count and skip Ramulator entirely.
+
+static constexpr int kCacheBucketTokens = 32;  // = kLineBytes/dtype_bytes (FP16)
+
+struct PimShapeKey {
+  std::string route;
+  int         ctx_bucket;
+  int         batch_size;
+
+  bool operator==(const PimShapeKey& o) const {
+    return ctx_bucket == o.ctx_bucket
+        && batch_size == o.batch_size
+        && route      == o.route;
+  }
+};
+
+struct PimShapeKeyHash {
+  size_t operator()(const PimShapeKey& k) const {
+    size_t h = std::hash<std::string>{}(k.route);
+    h ^= std::hash<int>{}(k.ctx_bucket) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.batch_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct PimShapeStats {
+  Clk_t  drain_clk  = 0;   // simulated DRAM cycles to drain inline (first sighting)
+  size_t cmds_total = 0;   // command count at first sighting (sanity / logging)
+  size_t hits       = 0;   // cache-hit counter
+};
+
 // ─── Runtime ─────────────────────────────────────────────────────────────────
 //
 // Contains all simulation state. The outer IFrontEnd class delegates to this.
@@ -125,6 +162,11 @@ class Runtime {
     cmd_params.num_heads   = cfg.num_heads;
     cmd_params.d_head      = cfg.d_head;
     cmd_params.dtype_bytes = cfg.dtype_bytes;
+    if (cfg.pim_command_mode == "simple") {
+      cmd_params.mode = PimCommandGen::Mode::Simple;
+    } else {
+      cmd_params.mode = PimCommandGen::Mode::Realistic;
+    }
     m_command_gen = std::make_unique<PimCommandGen>(cmd_params, m_allocator.get());
 
     // Initialize scheduler.
@@ -140,7 +182,8 @@ class Runtime {
       m_debug_log << "# serving_online debug log\n"
                   << "# format: [wall_time_ms] EVENT  fields...\n"
                   << "# events: ARRIVE ADMIT KV_ALLOC KV_FREE KV_OOM_HOLD KV_OOM_FALLBACK "
-                     "KV_WAKE TASK_START TRANSLATE TASK_DONE DONE\n"
+                     "KV_WAKE TASK_START TRANSLATE TASK_DONE DONE PROGRESS TIMING "
+                     "CACHE_HIT CACHE_MISS CACHE_FILL PIM_CACHE_STATS\n"
                   << "#\n";
       // Forward scheduler events to the same log file.
       m_scheduler.set_log_fn([this](const std::string& line) {
@@ -173,11 +216,19 @@ class Runtime {
   void tick() {
     if (is_finished()) return;
 
+    maybe_log_progress();
+
     process_callbacks();
-    complete_active_task_if_ready();
+    {
+      auto t0 = wall_clock::now();
+      complete_active_task_if_ready();
+      m_t_complete += wall_clock::now() - t0;
+    }
 
     if (!m_active_task.has_value()) {
+      auto t0 = wall_clock::now();
       auto next = m_scheduler.tick(now_ms(), m_gpu_free_ms, m_pim_free_ms);
+      m_t_sched += wall_clock::now() - t0;
       if (next) {
         start_task(std::move(*next));
       } else if (auto wake = m_scheduler.next_wakeup_ms(); wake.has_value()) {
@@ -189,20 +240,28 @@ class Runtime {
     if (m_active_task.has_value()) {
       if (m_active_task->phase == "prefill") {
         fast_forward_to_ms(m_active_task->start_ms + m_active_task->e2e_ms);
+        auto t0 = wall_clock::now();
         complete_active_task_if_ready();
+        m_t_complete += wall_clock::now() - t0;
         return;
       }
       if (m_active_task->phase == "decode"
           && m_active_task->route != m_cfg.pim_route_name) {
         fast_forward_to_ms(m_active_task->start_ms + m_active_task->gpu_ms);
+        auto t0 = wall_clock::now();
         complete_active_task_if_ready();
+        m_t_complete += wall_clock::now() - t0;
         return;
       }
     }
 
     pump_active_pim();
     process_callbacks();
-    complete_active_task_if_ready();
+    {
+      auto t0 = wall_clock::now();
+      complete_active_task_if_ready();
+      m_t_complete += wall_clock::now() - t0;
+    }
 
     // Once all PIM reads for a PIM-decode task have been issued and drained,
     // the task is only gated on wall-clock gpu/pim time. Fast-forward instead
@@ -217,13 +276,41 @@ class Runtime {
                                       m_active_task->pim_ms,
                                       m_active_task->e2e_ms});
       fast_forward_to_ms(target);
+      auto t0 = wall_clock::now();
       complete_active_task_if_ready();
+      m_t_complete += wall_clock::now() - t0;
       return;
     }
 
     if (!is_finished()) {
       ++m_clk;
     }
+  }
+
+  // Phase 1: print one PROGRESS line per ~1s wall-clock, gated on debug log.
+  // Cheap: one steady_clock::now() + one comparison per tick.
+  void maybe_log_progress() {
+    if (!m_debug_log.is_open()) return;
+    const auto now = wall_clock::now();
+    using namespace std::chrono;
+    if (now - m_last_progress_wall < seconds(1)) return;
+    m_last_progress_wall = now;
+    const double wall_s = duration<double>(now - m_wall_start).count();
+    const double sim_s  = now_ms() / 1000.0;
+    const double ratio  = (wall_s > 1e-9) ? (sim_s / wall_s) : 0.0;
+    std::string task_str = "idle";
+    if (m_active_task.has_value()) {
+      task_str = m_active_task->phase + "/" + m_active_task->route;
+    }
+    dlog(sfmt("[%10.3fms] PROGRESS    cycle=%llu  task=%-30s  "
+              "cmds_total=%zu  cmds_sent=%zu  cmds_outstanding=%zu  "
+              "wall_elapsed=%.3fs  sim_per_wall=%.3fx",
+              now_ms(), (unsigned long long)m_clk,
+              task_str.c_str(),
+              m_pending_pim_requests.size(),
+              m_next_pim_request,
+              m_pim_outstanding,
+              wall_s, ratio));
   }
 
   // ── Status ────────────────────────────────────────────────────────────────
@@ -237,7 +324,39 @@ class Runtime {
 
   // ── Output ────────────────────────────────────────────────────────────────
 
-  void finalize() const {
+  // Emit a PIM_CACHE_STATS summary line plus a per-shape breakdown to the
+  // debug log. Called from finalize(). No-op if debug log is disabled or
+  // the cache is off.
+  void log_pim_cache_stats() {
+    if (!m_debug_log.is_open()) return;
+    if (!m_cfg.pim_cache_enabled) {
+      m_debug_log << "[          ] PIM_CACHE_STATS  enabled=false" << std::endl;
+      return;
+    }
+    const size_t total = m_pim_cache_total_hits + m_pim_cache_total_misses;
+    const double hit_rate = (total > 0)
+        ? (100.0 * static_cast<double>(m_pim_cache_total_hits) / total) : 0.0;
+    m_debug_log << sfmt("[          ] PIM_CACHE_STATS  enabled=true  hits=%zu  misses=%zu  "
+                        "hit_rate=%.2f%%  distinct_shapes=%zu",
+                        m_pim_cache_total_hits, m_pim_cache_total_misses,
+                        hit_rate, m_pim_shape_cache.size())
+                << std::endl;
+    for (const auto& [key, stats] : m_pim_shape_cache) {
+      const double drain_ms = (m_cycles_per_ms > 0.0)
+          ? (static_cast<double>(stats.drain_clk) / m_cycles_per_ms) : 0.0;
+      m_debug_log << sfmt("[          ]   SHAPE  route=%-20s  ctx_bucket=%4d  bs=%d  "
+                          "hits=%zu  drain_clk=%llu  drain_ms=%.3f  cmds=%zu",
+                          key.route.c_str(), key.ctx_bucket, key.batch_size,
+                          stats.hits,
+                          (unsigned long long)stats.drain_clk, drain_ms,
+                          stats.cmds_total)
+                  << std::endl;
+    }
+    m_debug_log.flush();
+  }
+
+  void finalize() {
+    log_pim_cache_stats();
     if (m_cfg.requests_out_csv.empty()) return;
 
     std::ofstream out(m_cfg.requests_out_csv);
@@ -314,6 +433,13 @@ class Runtime {
     emitter << YAML::Key << "gpu_free_ms"       << YAML::Value << m_gpu_free_ms;
     emitter << YAML::Key << "pim_free_ms"       << YAML::Value << m_pim_free_ms;
     emitter << YAML::Key << "requests_out_csv"  << YAML::Value << m_cfg.requests_out_csv;
+    // PIM shape-cache stats (Lever 1).
+    emitter << YAML::Key << "pim_cache_enabled"      << YAML::Value
+            << (m_cfg.pim_cache_enabled ? "true" : "false");
+    emitter << YAML::Key << "pim_cache_hits"         << YAML::Value << m_pim_cache_total_hits;
+    emitter << YAML::Key << "pim_cache_misses"       << YAML::Value << m_pim_cache_total_misses;
+    emitter << YAML::Key << "pim_cache_distinct_shapes" << YAML::Value
+            << m_pim_shape_cache.size();
     emitter << YAML::EndMap << YAML::Newline;
   }
 
@@ -378,14 +504,66 @@ class Runtime {
     m_completed_callback_events = 0;
     m_issue_done                = true;
 
-    // For PIM decode tasks: pre-generate all the LPDDR5 memory requests.
+    // Reset section timers and remember wall-clock start of this task so
+    // TASK_DONE can print a per-section breakdown.
+    m_t_cmd_gen = m_t_translate = m_t_send = m_t_sched = m_t_complete =
+        std::chrono::nanoseconds{0};
+    m_task_wall_start              = wall_clock::now();
+    m_clk_at_task_start            = m_clk;
+    m_active_task_was_cache_hit    = false;
+
+    // For PIM decode tasks: consult the per-shape cache before generating
+    // commands. On hit, fast-forward by max(cost_table, cached_drain) and
+    // skip Ramulator entirely. On miss, fall through to the inline path
+    // and capture drain_clk in complete_active_task_if_ready().
     if (task.phase == "decode" && task.route == m_cfg.pim_route_name) {
+      if (m_cfg.pim_cache_enabled) {
+        const PimShapeKey key{task.route,
+                              ctx_bucket(task.context_tokens),
+                              task.batch_size};
+        auto it = m_pim_shape_cache.find(key);
+        if (it != m_pim_shape_cache.end()) {
+          // Cache hit: skip command generation and Ramulator drain.
+          it->second.hits++;
+          m_pim_cache_total_hits++;
+          m_active_task_was_cache_hit = true;
+          if (m_debug_log.is_open()) {
+            const double drain_ms = (m_cycles_per_ms > 0.0)
+                ? (static_cast<double>(it->second.drain_clk) / m_cycles_per_ms)
+                : 0.0;
+            dlog(sfmt("[%10.3fms] CACHE_HIT   route=%-20s  ctx_bucket=%4d  bs=%d  "
+                      "ctx=%5d  drain_clk=%llu  drain_ms=%.3f  hits=%zu",
+                      start_ms, task.route.c_str(),
+                      key.ctx_bucket, key.batch_size,
+                      task.context_tokens,
+                      (unsigned long long)it->second.drain_clk,
+                      drain_ms, it->second.hits));
+          }
+          // Hit path: m_issue_done stays true, no commands pumped, no
+          // outstanding callbacks. complete_active_task_if_ready() will
+          // see pim_done=true immediately and finish the task on the
+          // existing fast-forward in tick().
+          m_active_task = std::move(task);
+          return;
+        }
+        // Cache miss: counted now; drain_clk recorded on completion.
+        m_pim_cache_total_misses++;
+        if (m_debug_log.is_open()) {
+          dlog(sfmt("[%10.3fms] CACHE_MISS  route=%-20s  ctx_bucket=%4d  bs=%d  "
+                    "ctx=%5d  (will measure inline)",
+                    start_ms, task.route.c_str(),
+                    key.ctx_bucket, key.batch_size,
+                    task.context_tokens));
+        }
+      }
       m_issue_done = false;
       for (const int idx : task.request_indices) {
         const auto& req = m_scheduler.requests()[idx];
         auto on_complete = [this](Request&) { m_completed_callback_events++; };
+        auto t0 = wall_clock::now();
         auto cmds = m_command_gen->decode_step(
             req.id, current_context_tokens(req), on_complete);
+        m_t_cmd_gen += wall_clock::now() - t0;
         m_pending_pim_requests.insert(m_pending_pim_requests.end(),
                                       std::make_move_iterator(cmds.begin()),
                                       std::make_move_iterator(cmds.end()));
@@ -435,8 +613,13 @@ class Runtime {
       const uint64_t orig_va = static_cast<uint64_t>(req.addr);
 
       // VA-to-PA translation (bit 63 indicates a KV virtual address).
-      if (m_translation != nullptr && !m_translation->translate(req)) {
-        throw std::runtime_error("ServingOnline runtime: request translation failed");
+      if (m_translation != nullptr) {
+        auto t0 = wall_clock::now();
+        const bool ok = m_translation->translate(req);
+        m_t_translate += wall_clock::now() - t0;
+        if (!ok) {
+          throw std::runtime_error("ServingOnline runtime: request translation failed");
+        }
       }
 
       if (m_debug_log.is_open() && m_translate_sample_count < 4) {
@@ -463,7 +646,13 @@ class Runtime {
         }
       }
 
-      if (!m_memory_system->send(req)) {
+      bool sent;
+      {
+        auto t0 = wall_clock::now();
+        sent = m_memory_system->send(req);
+        m_t_send += wall_clock::now() - t0;
+      }
+      if (!sent) {
         break;  // memory system full; retry next tick
       }
       if (req.callback) {
@@ -508,6 +697,46 @@ class Runtime {
       dlog(sfmt("[%10.3fms] TASK_DONE   phase=%-7s  route=%-20s  reqs=[%s]  duration_ms=%.3f",
                 now, m_active_task->phase.c_str(), m_active_task->route.c_str(),
                 reqs_str.c_str(), now - m_active_task->start_ms));
+      // Phase 2: per-section wall-clock breakdown for this task.
+      const double wall_total =
+          std::chrono::duration<double>(wall_clock::now() - m_task_wall_start).count();
+      const double t_cg = ns_to_s(m_t_cmd_gen);
+      const double t_tr = ns_to_s(m_t_translate);
+      const double t_sn = ns_to_s(m_t_send);
+      const double t_sc = ns_to_s(m_t_sched);
+      const double t_co = ns_to_s(m_t_complete);
+      const double t_un = std::max(0.0, wall_total - t_cg - t_tr - t_sn - t_sc - t_co);
+      dlog(sfmt("[%10.3fms]   TIMING    cmds=%zu  wall=%.3fs  "
+                "t_cmd_gen=%.3fs  t_translate=%.3fs  t_send=%.3fs  "
+                "t_sched=%.3fs  t_complete=%.3fs  t_unaccounted=%.3fs",
+                now,
+                m_pending_pim_requests.size(),
+                wall_total, t_cg, t_tr, t_sn, t_sc, t_co, t_un));
+    }
+
+    // Miss-path: record drain_clk for this PIM-decode shape so future tasks
+    // with the same (route, ctx_bucket, batch_size) hit the cache.
+    if (m_cfg.pim_cache_enabled
+        && m_active_task->phase == "decode"
+        && m_active_task->route == m_cfg.pim_route_name
+        && !m_active_task_was_cache_hit) {
+      const PimShapeKey key{m_active_task->route,
+                            ctx_bucket(m_active_task->context_tokens),
+                            m_active_task->batch_size};
+      const Clk_t drain_clk = (m_clk > m_clk_at_task_start)
+                              ? (m_clk - m_clk_at_task_start) : 0;
+      m_pim_shape_cache[key] = PimShapeStats{
+          drain_clk, m_pending_pim_requests.size(), 0};
+      if (m_debug_log.is_open()) {
+        const double drain_ms = (m_cycles_per_ms > 0.0)
+            ? (static_cast<double>(drain_clk) / m_cycles_per_ms) : 0.0;
+        dlog(sfmt("[%10.3fms]   CACHE_FILL  route=%-20s  ctx_bucket=%4d  bs=%d  "
+                  "drain_clk=%llu  drain_ms=%.3f  cmds=%zu",
+                  now, m_active_task->route.c_str(),
+                  key.ctx_bucket, key.batch_size,
+                  (unsigned long long)drain_clk, drain_ms,
+                  m_pending_pim_requests.size()));
+      }
     }
 
     m_scheduler.complete_task(*m_active_task, now);
@@ -548,6 +777,40 @@ class Runtime {
   // Debug log (null stream when disabled).
   std::ofstream m_debug_log;
   int m_translate_sample_count = 0;   // resets per task; cap TRANSLATE lines at 4
+
+  // ── PIM shape cache ────────────────────────────────────────────────────────
+  // Populated on cache miss in complete_active_task_if_ready(); consulted at
+  // the top of start_task() for PIM decode tasks. Set m_active_task_was_cache_hit
+  // so the miss-path knows whether to record drain_clk on completion.
+  std::unordered_map<PimShapeKey, PimShapeStats, PimShapeKeyHash> m_pim_shape_cache;
+  Clk_t  m_clk_at_task_start         = 0;
+  bool   m_active_task_was_cache_hit = false;
+  size_t m_pim_cache_total_hits      = 0;
+  size_t m_pim_cache_total_misses    = 0;
+
+  static int ctx_bucket(int context_tokens) {
+    return (context_tokens + kCacheBucketTokens - 1) / kCacheBucketTokens;
+  }
+
+  // ── Wall-clock instrumentation ─────────────────────────────────────────────
+  // Phase 1: periodic PROGRESS line every ~1 second of wall-clock during a
+  // long-running task. Phase 2: per-section accumulators printed at TASK_DONE
+  // so we can see whether time is going to cmd-gen / translate / send / sched
+  // / complete-checks vs the unaccounted tail (which is the Ramulator DRAM
+  // tick driven by the outer loop).
+  using wall_clock = std::chrono::steady_clock;
+  wall_clock::time_point m_wall_start         = wall_clock::now();
+  wall_clock::time_point m_last_progress_wall = wall_clock::now();
+  wall_clock::time_point m_task_wall_start    = wall_clock::now();
+  std::chrono::nanoseconds m_t_cmd_gen{0};
+  std::chrono::nanoseconds m_t_translate{0};
+  std::chrono::nanoseconds m_t_send{0};
+  std::chrono::nanoseconds m_t_sched{0};
+  std::chrono::nanoseconds m_t_complete{0};
+
+  static double ns_to_s(std::chrono::nanoseconds ns) {
+    return std::chrono::duration<double>(ns).count();
+  }
 
   void dlog(const std::string& line) {
     if (m_debug_log.is_open()) m_debug_log << line << '\n';
@@ -626,11 +889,23 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
     cfg.page_size_bytes = (param<Addr_t>("translation_pagesize_KB").default_val(4) << 10);
     cfg.num_channels    = param<int>("generator_channel_count").default_val(8);
 
-    // Pi0 model
+    // Model architecture (Pi0 defaults; OpenVLA: 32/32/128)
     cfg.num_layers  = param<int>("generator_num_layers").default_val(18);
     cfg.num_heads   = param<int>("generator_num_heads").default_val(8);
     cfg.d_head      = param<int>("generator_dhead").default_val(256);
     cfg.dtype_bytes = param<int>("generator_dtype_bytes").default_val(2);
+
+    // Vision-encoder prefix: pre-encoded image tokens added to every
+    // request's context at load time. 0 = text-only model (Pi0). 256 is
+    // typical for OpenVLA's SigLIP/DINO patch grid.
+    cfg.vision_prefix_tokens = param<int>("vision_prefix_tokens").default_val(0);
+
+    // PIM command stream complexity: "realistic" (default) or "simple".
+    cfg.pim_command_mode = param<std::string>("pim_command_mode").default_val("realistic");
+
+    // Per-shape PIM-decode cycle cache (Lever 1). True = skip Ramulator on
+    // repeated (route, ctx_bucket, batch_size) shapes.
+    cfg.pim_cache_enabled = param<bool>("pim_cache_enabled").default_val(true);
 
     // Debug log (empty string = disabled)
     cfg.debug_log_path = param<std::string>("debug_log_path").default_val("");
@@ -646,6 +921,11 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
         cfg.kv_oom_policy != "hold_then_fallback") {
       throw ConfigurationError(
           "ServingOnlineFrontend: kv_oom_policy must be 'hold', 'fallback_gpu', or 'hold_then_fallback'");
+    }
+    // Validate pim_command_mode.
+    if (cfg.pim_command_mode != "realistic" && cfg.pim_command_mode != "simple") {
+      throw ConfigurationError(
+          "ServingOnlineFrontend: pim_command_mode must be 'realistic' or 'simple'");
     }
     // Validate kv_scheduler_policy.
     if (cfg.kv_scheduler_policy != "guaranteed_no_evict" &&

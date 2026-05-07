@@ -276,11 +276,43 @@ struct ServingOnlineConfig {
   uint64_t page_size_bytes = 4096;
   int      num_channels    = 8;     // LPDDR5 channel count for KV interleaving
 
-  // Pi0 model parameters (used for KV size formula and command generation)
+  // Model architecture parameters (used for KV size formula and command
+  // generation). Defaults are Pi0; override via YAML for other models
+  // (e.g. OpenVLA-7B: 32 / 32 / 128).
   int num_layers  = 18;
   int num_heads   = 8;
   int d_head      = 256;
   int dtype_bytes = 2;   // 2 = FP16
+
+  // Vision-encoder prefix: number of pre-encoded image patch tokens that
+  // every request implicitly carries before its text context. Added to
+  // context_tokens at request load time so all downstream cost lookups,
+  // KV reservations, and command generation see the inflated context.
+  // 0 disables (Pi0). 256 is typical for OpenVLA's SigLIP/DINO encoder.
+  int vision_prefix_tokens = 0;
+
+  // PIM command stream complexity. Diagnostic A/B knob:
+  //   "realistic" (default) — full per-block sequence:
+  //                           (PIM_WR_GB+PIM_MAC_AB)×blocks K-side,
+  //                           PIM_MV_SB+PIM_SFM,
+  //                           (PIM_MV_GB+PIM_MAC_AB)×blocks V-side,
+  //                           PIM_MV_SB+PIM_BARRIER, per (layer, head).
+  //                           Total: num_layers × num_heads × (4*blocks + 4).
+  //   "simple"              — one PIM_MAC_AB per (layer, head) for K and one
+  //                           for V, no control commands. Total:
+  //                           num_layers × num_heads × 2. Useful for
+  //                           bisecting whether DRAM-tick cost or frontend
+  //                           overhead dominates wall-clock time.
+  std::string pim_command_mode = "realistic";
+
+  // Per-shape PIM-decode cycle cache. When true (default), the runtime
+  // measures the inline DRAM-drain cycle count the first time it sees a
+  // (route, ctx_bucket=ceil(ctx/32), batch_size) shape and reuses it for
+  // every subsequent decode task with the same shape — no Ramulator
+  // re-run on the hit path. Big speedup on long runs with repeated
+  // shapes (continuous batching, multi-step decode loops). False = always
+  // run inline (slower but useful for verification).
+  bool pim_cache_enabled = true;
 
   // Output files
   std::string requests_out_csv;   // per-request timing CSV (empty = skip)
