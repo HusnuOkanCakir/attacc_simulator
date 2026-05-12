@@ -119,6 +119,21 @@ class Scheduler {
                         int context_tokens, int generated_tokens,
                         double now_ms, double gpu_free_ms, double pim_free_ms) const;
 
+  struct PredictionEstimate {
+    double start_ms        = -1.0;  // predicted prefill start after queued work
+    double finish_ms       = -1.0;
+    double prefill_ms      = 0.0;
+    double decode_total_ms = 0.0;
+  };
+
+  // Backlog-aware route prediction used for admission decisions. It estimates
+  // the queued work already visible to the online scheduler before adding the
+  // candidate request. Future arrivals are intentionally not included.
+  std::optional<PredictionEstimate> predict_finish_detail(
+      const std::string& route,
+      int context_tokens, int generated_tokens,
+      double now_ms, double gpu_free_ms, double pim_free_ms) const;
+
   // Choose the best route among candidates using the configured policy.
   // Returns the route name, or "" if no eligible route exists.
   std::string choose_route(int context_tokens, int generated_tokens,

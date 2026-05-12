@@ -246,6 +246,10 @@ def make_model_config(name, dtype):
     model_table['OPT-66B'] = [64, 9216, 72, 128, 4, 1]
     # PI0 paligemma-only approximation (gemma_2b)
     model_table['PI0'] = [18, 2048, 8, 256, 8, 1]
+    # OpenVLA-7B uses Llama2-7B as the LLM backbone (identical to LLAMA-7B).
+    # Vision encoder is treated as a pre-encoded patch prefix at the simulator
+    # layer (vision_prefix_tokens), so cost-table-side params match Llama2-7B.
+    model_table['OPENVLA'] = [32, 4096, 32, 128, 8 / 3, 1]
 
     ndec, hdim, nheads, dhead, ff_scale, gqa_size = model_table[name]
     config = {

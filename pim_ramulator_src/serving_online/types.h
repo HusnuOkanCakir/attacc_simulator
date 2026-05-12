@@ -106,6 +106,16 @@ struct RuntimeRequest {
   // when a decode step runs out of KV pages. Reset back to -1 on preemption.
   double admitted_ms = -1.0;
 
+  // Admission-time scheduler prediction for the chosen route. These are
+  // absolute/relative times predicted before future arrivals and later decode
+  // batching are known, so they are useful for validating routing estimates
+  // against eventual completion under load.
+  double scheduler_predicted_start_ms        = -1.0;
+  double scheduler_predicted_finish_ms       = -1.0;
+  double scheduler_predicted_e2e_ms          = -1.0;
+  double scheduler_predicted_prefill_ms      = -1.0;
+  double scheduler_predicted_decode_total_ms = -1.0;
+
   // Number of times this request was preempted (evicted from in-flight back
   // to WaitingAdmission) under the max_utilization policy. Always 0 under
   // guaranteed_no_evict.
@@ -313,6 +323,13 @@ struct ServingOnlineConfig {
   // shapes (continuous batching, multi-step decode loops). False = always
   // run inline (slower but useful for verification).
   bool pim_cache_enabled = true;
+
+  // Cross-run persistence of the per-shape PIM-decode cycle cache. When
+  // non-empty, the runtime tries to load this file at init time
+  // (populating m_pim_shape_cache before any task runs) and rewrites it
+  // atomically at finalize(). Header records model+DRAM fingerprint; a
+  // mismatching file is rejected and the cache starts fresh.
+  std::string pim_cache_file;     // path or empty = disabled
 
   // Output files
   std::string requests_out_csv;   // per-request timing CSV (empty = skip)

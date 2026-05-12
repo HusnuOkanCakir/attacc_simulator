@@ -59,6 +59,7 @@ KV_OOM_POLICY     = "hold"  # hold | fallback_gpu | hold_then_fallback
 KV_OOM_HOLD_LIMIT_MS = 50.0 # max hold time before GPU fallback (hold_then_fallback only)
 PIM_COMMAND_MODE  = "realistic"  # realistic | simple — diagnostic A/B knob
 PIM_CACHE_ENABLED = True         # cache PIM-decode drain cycles by shape (Lever 1)
+PIM_CACHE_FILE    = ""           # persisted cache across runs (empty = disabled)
 
 # Model architecture (filled from MODEL_PRESETS in main()).
 NUM_LAYERS           = 40
@@ -205,6 +206,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
   vision_prefix_tokens: {VISION_PREFIX_TOKENS}
   pim_command_mode: {PIM_COMMAND_MODE}
   pim_cache_enabled: {PIM_CACHE_ENABLED_YAML}
+  pim_cache_file: "{PIM_CACHE_FILE}"
   generator_channel_count: 16
   translation_pagesize_KB: 4
 
@@ -546,6 +548,13 @@ def main() -> None:
                          "skip Ramulator and reuse the first inline-measured drain cycles. "
                          "Disable for verification: cached vs uncached should produce identical "
                          "TTFT/E2E (just much slower without).")
+    ap.add_argument("--pim-cache-file", default=None,
+                    help="Path to a persistent PIM shape cache (drain_clk per (route, "
+                         "ctx_bucket, batch_size) shape). When set, the runtime loads "
+                         "the file at init and rewrites it at finalize(), so subsequent "
+                         "runs with the same model + DRAM config skip Ramulator drain "
+                         "for already-seen shapes. Header schema is validated; mismatched "
+                         "files are rejected and the run starts with an empty cache.")
     args = ap.parse_args()
 
     # Resolve requests CSV — create a slice if needed.
@@ -617,6 +626,9 @@ def main() -> None:
     if args.no_pim_cache:
         global PIM_CACHE_ENABLED
         PIM_CACHE_ENABLED = False
+    if args.pim_cache_file is not None:
+        global PIM_CACHE_FILE
+        PIM_CACHE_FILE = args.pim_cache_file
     print(f"[csv]           {REQUESTS_CSV}  ({n} requests)")
     print(f"[model]         {args.model}  layers={NUM_LAYERS} heads={NUM_HEADS} "
           f"d_head={D_HEAD} dtype_bytes={DTYPE_BYTES} vision_prefix={VISION_PREFIX_TOKENS}")
@@ -626,7 +638,8 @@ def main() -> None:
     print(f"[slo]           e2e={SLO_E2E_MS}ms  ttft={SLO_TTFT_MS}ms")
     print(f"[kv_oom]        policy={KV_OOM_POLICY}  hold_limit={KV_OOM_HOLD_LIMIT_MS}ms")
     print(f"[pim_cmd_mode]  {PIM_COMMAND_MODE}")
-    print(f"[pim_cache]     {'enabled' if PIM_CACHE_ENABLED else 'disabled'}")
+    print(f"[pim_cache]     {'enabled' if PIM_CACHE_ENABLED else 'disabled'}"
+          f"{'  persist=' + PIM_CACHE_FILE if PIM_CACHE_FILE else ''}")
     print(f"[cost_tables]   gpu={COST_GPU_CSV}  hybrid={COST_HYBRID_CSV}")
     if COST_GPU_MODEL:
         print(f"[cost_models]   gpu={COST_GPU_MODEL}  hybrid={COST_HYBRID_MODEL}")

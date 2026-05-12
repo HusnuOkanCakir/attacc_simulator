@@ -183,13 +183,25 @@ class Runtime {
                   << "# format: [wall_time_ms] EVENT  fields...\n"
                   << "# events: ARRIVE ADMIT KV_ALLOC KV_FREE KV_OOM_HOLD KV_OOM_FALLBACK "
                      "KV_WAKE TASK_START TRANSLATE TASK_DONE DONE PROGRESS TIMING "
-                     "CACHE_HIT CACHE_MISS CACHE_FILL PIM_CACHE_STATS\n"
+                     "CACHE_HIT CACHE_MISS CACHE_FILL PIM_CACHE_STATS CMD_GEN\n"
                   << "#\n";
       // Forward scheduler events to the same log file.
       m_scheduler.set_log_fn([this](const std::string& line) {
         m_debug_log << line << '\n';
       });
+
+      // Derive status.txt path next to debug.log.  status.txt is rewritten
+      // atomically every ~1 wall-second so the user can `cat` it any time
+      // to see live progress without waiting for the run to finish.
+      const auto slash = cfg.debug_log_path.find_last_of('/');
+      m_status_file_path = (slash == std::string::npos)
+          ? std::string("status.txt")
+          : (cfg.debug_log_path.substr(0, slash) + "/status.txt");
     }
+
+    // Note: load_pim_cache() runs from connect_memory_system(), not here,
+    // because the cache fingerprint includes m_memory_system->get_tCK()
+    // and the memory system is attached after init().
   }
 
   void attach_translation(ITranslation* translation) {
@@ -209,6 +221,10 @@ class Runtime {
       throw ConfigurationError("ServingOnline runtime: invalid tCK from memory system");
     }
     m_cycles_per_ms = 1.0e6 / static_cast<double>(m_memory_system->get_tCK());
+
+    // Now that we know tCK we can compute the cache fingerprint and try
+    // to load a persisted cache. No-op when pim_cache_file is empty.
+    load_pim_cache();
   }
 
   // ── Simulation tick ────────────────────────────────────────────────────────
@@ -288,29 +304,158 @@ class Runtime {
   }
 
   // Phase 1: print one PROGRESS line per ~1s wall-clock, gated on debug log.
-  // Cheap: one steady_clock::now() + one comparison per tick.
+  // Also rewrites status.txt atomically so the user can `cat` it for live
+  // progress at any moment. Cheap: one steady_clock::now() + one comparison
+  // per tick.
   void maybe_log_progress() {
     if (!m_debug_log.is_open()) return;
     const auto now = wall_clock::now();
     using namespace std::chrono;
     if (now - m_last_progress_wall < seconds(1)) return;
+    const double dt_wall_s =
+        duration<double>(now - m_last_progress_wall).count();
     m_last_progress_wall = now;
+
     const double wall_s = duration<double>(now - m_wall_start).count();
     const double sim_s  = now_ms() / 1000.0;
     const double ratio  = (wall_s > 1e-9) ? (sim_s / wall_s) : 0.0;
+
+    // Delta-based throughput rates since the last PROGRESS emission.
+    const size_t d_cmds = (m_next_pim_request >= m_last_progress_cmds_sent)
+        ? (m_next_pim_request - m_last_progress_cmds_sent) : 0;
+    const Clk_t  d_cyc  = (m_clk >= m_last_progress_clk)
+        ? (m_clk - m_last_progress_clk) : 0;
+    const double cmds_per_s = (dt_wall_s > 1e-9)
+        ? (static_cast<double>(d_cmds) / dt_wall_s) : 0.0;
+    const double cyc_per_s  = (dt_wall_s > 1e-9)
+        ? (static_cast<double>(d_cyc) / dt_wall_s) : 0.0;
+    m_last_progress_cmds_sent = m_next_pim_request;
+    m_last_progress_clk       = m_clk;
+
     std::string task_str = "idle";
     if (m_active_task.has_value()) {
       task_str = m_active_task->phase + "/" + m_active_task->route;
     }
     dlog(sfmt("[%10.3fms] PROGRESS    cycle=%llu  task=%-30s  "
               "cmds_total=%zu  cmds_sent=%zu  cmds_outstanding=%zu  "
+              "cmds_per_s=%.2e  cycles_per_s=%.2e  "
+              "bp_task=%zu  bp_total=%zu  "
               "wall_elapsed=%.3fs  sim_per_wall=%.3fx",
               now_ms(), (unsigned long long)m_clk,
               task_str.c_str(),
               m_pending_pim_requests.size(),
               m_next_pim_request,
               m_pim_outstanding,
+              cmds_per_s, cyc_per_s,
+              m_send_backpressure_events_task,
+              m_send_backpressure_events_total,
               wall_s, ratio));
+    // Flush so `tail -f debug.log` shows PROGRESS lines in real time
+    // instead of in bursts.
+    m_debug_log.flush();
+
+    emit_status_file(wall_s, ratio, cmds_per_s, cyc_per_s);
+  }
+
+  // Atomically write a small status.txt next to debug.log so the user can
+  // `cat <run_dir>/<policy>/status.txt` any time without parsing logs.
+  // Write to status.txt.tmp then rename — a concurrent reader either sees
+  // the previous snapshot or the new one, never a half-written file.
+  void emit_status_file(double wall_s, double sim_per_wall,
+                        double cmds_per_s, double cyc_per_s) {
+    if (m_status_file_path.empty()) return;
+    const std::string tmp = m_status_file_path + ".tmp";
+    std::ofstream out(tmp);
+    if (!out.is_open()) return;
+
+    std::string task_str = "idle";
+    int    task_ctx = 0;
+    int    task_bs  = 0;
+    std::string task_reqs = "";
+    if (m_active_task.has_value()) {
+      task_str = m_active_task->phase + "/" + m_active_task->route;
+      task_ctx = m_active_task->context_tokens;
+      task_bs  = m_active_task->batch_size;
+      for (int idx : m_active_task->request_indices) {
+        if (!task_reqs.empty()) task_reqs += ',';
+        task_reqs += std::to_string(m_scheduler.requests()[idx].id);
+      }
+    }
+
+    // Scheduler state summary.
+    size_t s_waiting = 0, s_done = 0, s_dropped = 0;
+    for (const auto& r : m_scheduler.requests()) {
+      switch (r.state) {
+        case ReqState::WaitingAdmission:
+        case ReqState::WaitingPrefill:
+        case ReqState::WaitingDecode:  s_waiting++; break;
+        case ReqState::Done:           s_done++;    break;
+        case ReqState::Dropped:        s_dropped++; break;
+      }
+    }
+
+    const size_t cmds_total = m_pending_pim_requests.size();
+    const double pct = (cmds_total > 0)
+        ? (100.0 * static_cast<double>(m_next_pim_request) / cmds_total) : 0.0;
+
+    // ETAs derived from observed rates. Print "N/A" when the input rate is
+    // zero (e.g. no in-flight task, no completed requests yet) so we never
+    // emit a misleading huge number.
+    const size_t cmds_remaining_in_task = (cmds_total > m_next_pim_request)
+        ? (cmds_total - m_next_pim_request) : 0;
+    std::string eta_task_str = "N/A";
+    if (m_active_task.has_value() && cmds_per_s > 1.0 && cmds_remaining_in_task > 0) {
+      const double eta_task_s =
+          static_cast<double>(cmds_remaining_in_task) / cmds_per_s;
+      eta_task_str = sfmt("%.1f s", eta_task_s);
+    }
+    std::string eta_run_str = "N/A";
+    if (s_done > 0 && wall_s > 1.0) {
+      const double done_rate = static_cast<double>(s_done) / wall_s;
+      const size_t remaining = (m_total_requests > s_done)
+          ? (m_total_requests - s_done) : 0;
+      if (remaining > 0 && done_rate > 0.0) {
+        const double eta_run_s = static_cast<double>(remaining) / done_rate;
+        eta_run_str = sfmt("%.1f s  (~%.1f min)", eta_run_s, eta_run_s / 60.0);
+      } else {
+        eta_run_str = "0 s";
+      }
+    }
+
+    out << "# live status snapshot — rewritten every ~1 wall second\n";
+    out << sfmt("sim_time_ms              : %.3f\n",  now_ms());
+    out << sfmt("wall_elapsed_s           : %.3f\n",  wall_s);
+    out << sfmt("sim_per_wall             : %.4fx\n", sim_per_wall);
+    out << sfmt("cycle                    : %llu\n",  (unsigned long long)m_clk);
+    out << sfmt("cmds_per_wall_s          : %.2e\n",  cmds_per_s);
+    out << sfmt("cycles_per_wall_s        : %.2e\n",  cyc_per_s);
+    out << "\n";
+    out << sfmt("active_task              : %s\n",    task_str.c_str());
+    out << sfmt("active_reqs              : [%s]\n",  task_reqs.c_str());
+    out << sfmt("active_ctx_tokens        : %d\n",    task_ctx);
+    out << sfmt("active_batch_size        : %d\n",    task_bs);
+    out << sfmt("cmds_sent_in_task        : %zu / %zu  (%.1f%%)\n",
+                m_next_pim_request, cmds_total, pct);
+    out << sfmt("cmds_outstanding         : %zu\n",   m_pim_outstanding);
+    out << sfmt("backpressure_task        : %zu\n",   m_send_backpressure_events_task);
+    out << sfmt("backpressure_total       : %zu\n",   m_send_backpressure_events_total);
+    out << sfmt("eta_current_task         : %s\n",    eta_task_str.c_str());
+    out << "\n";
+    out << sfmt("cache_hits_total         : %zu\n",   m_pim_cache_total_hits);
+    out << sfmt("cache_misses_total       : %zu\n",   m_pim_cache_total_misses);
+    out << sfmt("cache_distinct_shapes    : %zu\n",   m_pim_shape_cache.size());
+    out << "\n";
+    out << sfmt("scheduler_waiting        : %zu\n",   s_waiting);
+    out << sfmt("scheduler_done           : %zu\n",   s_done);
+    out << sfmt("scheduler_dropped        : %zu\n",   s_dropped);
+    out << sfmt("scheduler_total          : %zu\n",   m_total_requests);
+    out << sfmt("eta_full_run             : %s\n",    eta_run_str.c_str());
+    out.close();
+    if (out.fail()) {
+      std::remove(tmp.c_str());
+      return;
+    }
+    std::rename(tmp.c_str(), m_status_file_path.c_str());
   }
 
   // ── Status ────────────────────────────────────────────────────────────────
@@ -355,8 +500,163 @@ class Runtime {
     m_debug_log.flush();
   }
 
+  // ── Cross-run PIM-shape cache I/O ──────────────────────────────────────────
+  //
+  // Schema fingerprint: model architecture fields from ServingOnlineConfig
+  // plus the Ramulator clock period (tCK). Any of those changing means a
+  // previously-measured drain_clk is no longer valid for the same logical
+  // (route, ctx_bucket, batch_size) shape — different command count or
+  // different DRAM timing.
+
+  std::string pim_cache_fingerprint() const {
+    return sfmt("num_layers=%d num_heads=%d d_head=%d dtype_bytes=%d "
+                "pim_route=%s gpu_route=%s pim_cmd_mode=%s vision_prefix=%d "
+                "tCK=%.4f",
+                m_cfg.num_layers, m_cfg.num_heads, m_cfg.d_head, m_cfg.dtype_bytes,
+                m_cfg.pim_route_name.c_str(), m_cfg.gpu_route_name.c_str(),
+                m_cfg.pim_command_mode.c_str(),
+                m_cfg.vision_prefix_tokens,
+                (m_memory_system != nullptr) ? m_memory_system->get_tCK() : 0.0f);
+  }
+
+  // Populate m_pim_shape_cache from disk if pim_cache_file is set and the
+  // file exists. Header line must match the current run's fingerprint;
+  // otherwise the load is rejected (cache starts empty) and a warning is
+  // emitted to debug.log.
+  void load_pim_cache() {
+    if (m_cfg.pim_cache_file.empty()) return;
+    std::ifstream in(m_cfg.pim_cache_file);
+    if (!in.is_open()) {
+      if (m_debug_log.is_open()) {
+        dlog(sfmt("[          ] PIM_CACHE_LOAD  path=%s  status=missing  "
+                  "(no preload, cache starts empty)",
+                  m_cfg.pim_cache_file.c_str()));
+      }
+      return;
+    }
+    const std::string expected_fp = pim_cache_fingerprint();
+    std::string line;
+    bool header_ok = false;
+    size_t loaded = 0;
+    while (std::getline(in, line)) {
+      if (line.empty()) continue;
+      if (line[0] == '#') {
+        // Look for the fingerprint line — first '#' line that contains '='.
+        if (!header_ok && line.find('=') != std::string::npos) {
+          // Strip leading "# " and compare.
+          const auto pos = line.find_first_not_of("# \t");
+          const std::string got = (pos == std::string::npos) ? "" : line.substr(pos);
+          if (got != expected_fp) {
+            if (m_debug_log.is_open()) {
+              dlog(sfmt("[          ] PIM_CACHE_LOAD_REJECT  path=%s  "
+                        "reason=header_mismatch",
+                        m_cfg.pim_cache_file.c_str()));
+              dlog(sfmt("[          ]   expected: %s", expected_fp.c_str()));
+              dlog(sfmt("[          ]   got     : %s", got.c_str()));
+            }
+            return;  // start fresh, do NOT load any rows
+          }
+          header_ok = true;
+        }
+        continue;
+      }
+      // Data row: route,ctx_bucket,bs,drain_clk,cmds_total
+      // We tolerate header_ok==false silently here (file might not have a
+      // header at all — old format). But for safety, require header_ok.
+      if (!header_ok) {
+        if (m_debug_log.is_open()) {
+          dlog(sfmt("[          ] PIM_CACHE_LOAD_REJECT  path=%s  "
+                    "reason=no_header_line",
+                    m_cfg.pim_cache_file.c_str()));
+        }
+        return;
+      }
+      const auto c1 = line.find(',');
+      const auto c2 = (c1 == std::string::npos) ? std::string::npos : line.find(',', c1 + 1);
+      const auto c3 = (c2 == std::string::npos) ? std::string::npos : line.find(',', c2 + 1);
+      const auto c4 = (c3 == std::string::npos) ? std::string::npos : line.find(',', c3 + 1);
+      if (c4 == std::string::npos) continue;  // malformed
+      try {
+        const std::string route = line.substr(0, c1);
+        const int ctx = std::stoi(line.substr(c1 + 1, c2 - c1 - 1));
+        const int bs  = std::stoi(line.substr(c2 + 1, c3 - c2 - 1));
+        const Clk_t drain = static_cast<Clk_t>(std::stoull(line.substr(c3 + 1, c4 - c3 - 1)));
+        const size_t cmds = static_cast<size_t>(std::stoull(line.substr(c4 + 1)));
+        m_pim_shape_cache[PimShapeKey{route, ctx, bs}] =
+            PimShapeStats{drain, cmds, 0};
+        loaded++;
+      } catch (const std::exception&) {
+        // Skip malformed line.
+      }
+    }
+    if (m_debug_log.is_open()) {
+      dlog(sfmt("[          ] PIM_CACHE_LOAD  path=%s  status=loaded  "
+                "entries=%zu",
+                m_cfg.pim_cache_file.c_str(), loaded));
+    }
+  }
+
+  // Persist m_pim_shape_cache to disk. Atomic via .tmp + rename so a
+  // concurrent reader (or a crash) never sees a half-written file.
+  void save_pim_cache() {
+    if (m_cfg.pim_cache_file.empty()) return;
+    if (m_pim_shape_cache.empty()) {
+      // Nothing learned this run; do not stomp an existing file with
+      // an empty body.
+      if (m_debug_log.is_open()) {
+        dlog(sfmt("[          ] PIM_CACHE_SAVE  path=%s  status=skipped  "
+                  "reason=empty_cache",
+                  m_cfg.pim_cache_file.c_str()));
+      }
+      return;
+    }
+    const std::string tmp = m_cfg.pim_cache_file + ".tmp";
+    std::ofstream out(tmp);
+    if (!out.is_open()) {
+      if (m_debug_log.is_open()) {
+        dlog(sfmt("[          ] PIM_CACHE_SAVE  path=%s  status=open_failed",
+                  m_cfg.pim_cache_file.c_str()));
+      }
+      return;
+    }
+    out << "# pim_shape_cache v1\n";
+    out << "# " << pim_cache_fingerprint() << '\n';
+    out << "# columns: route,ctx_bucket,batch_size,drain_clk,cmds_total\n";
+    for (const auto& [key, stats] : m_pim_shape_cache) {
+      out << key.route << ','
+          << key.ctx_bucket << ','
+          << key.batch_size << ','
+          << stats.drain_clk << ','
+          << stats.cmds_total << '\n';
+    }
+    out.close();
+    if (out.fail()) {
+      std::remove(tmp.c_str());
+      if (m_debug_log.is_open()) {
+        dlog(sfmt("[          ] PIM_CACHE_SAVE  path=%s  status=write_failed",
+                  m_cfg.pim_cache_file.c_str()));
+      }
+      return;
+    }
+    if (std::rename(tmp.c_str(), m_cfg.pim_cache_file.c_str()) != 0) {
+      std::remove(tmp.c_str());
+      if (m_debug_log.is_open()) {
+        dlog(sfmt("[          ] PIM_CACHE_SAVE  path=%s  status=rename_failed",
+                  m_cfg.pim_cache_file.c_str()));
+      }
+      return;
+    }
+    if (m_debug_log.is_open()) {
+      dlog(sfmt("[          ] PIM_CACHE_SAVE  path=%s  status=saved  "
+                "entries=%zu",
+                m_cfg.pim_cache_file.c_str(), m_pim_shape_cache.size()));
+      m_debug_log.flush();
+    }
+  }
+
   void finalize() {
     log_pim_cache_stats();
+    save_pim_cache();
     if (m_cfg.requests_out_csv.empty()) return;
 
     std::ofstream out(m_cfg.requests_out_csv);
@@ -367,6 +667,9 @@ class Runtime {
 
     out << "request_id,arrival_ms,context_tokens,generated_tokens,state,route,is_lost,"
            "admission_attempts,admission_last_reject_reason,dropped_reason,"
+           "admitted_ms,scheduler_predicted_start_ms,scheduler_predicted_finish_ms,"
+           "scheduler_predicted_e2e_ms,scheduler_predicted_prefill_ms,"
+           "scheduler_predicted_decode_total_ms,"
            "prefill_start_ms,prefill_end_ms,first_token_ms,completion_ms,"
            "ttft_ms,e2e_ms,tbt_mean_ms,preempt_count,tail_trim_tokens\n";
 
@@ -386,6 +689,12 @@ class Runtime {
           << req.admission_attempts << ','
           << req.admission_last_reject_reason << ','
           << req.dropped_reason << ','
+          << req.admitted_ms << ','
+          << req.scheduler_predicted_start_ms << ','
+          << req.scheduler_predicted_finish_ms << ','
+          << req.scheduler_predicted_e2e_ms << ','
+          << req.scheduler_predicted_prefill_ms << ','
+          << req.scheduler_predicted_decode_total_ms << ','
           << req.prefill_start_ms << ','
           << req.prefill_end_ms << ','
           << req.first_token_ms << ','
@@ -503,6 +812,7 @@ class Runtime {
     m_pim_outstanding           = 0;
     m_completed_callback_events = 0;
     m_issue_done                = true;
+    m_send_backpressure_events_task = 0;
 
     // Reset section timers and remember wall-clock start of this task so
     // TASK_DONE can print a per-section breakdown.
@@ -559,11 +869,31 @@ class Runtime {
       m_issue_done = false;
       for (const int idx : task.request_indices) {
         const auto& req = m_scheduler.requests()[idx];
+        const int ctx_now = current_context_tokens(req);
         auto on_complete = [this](Request&) { m_completed_callback_events++; };
         auto t0 = wall_clock::now();
         auto cmds = m_command_gen->decode_step(
-            req.id, current_context_tokens(req), on_complete);
-        m_t_cmd_gen += wall_clock::now() - t0;
+            req.id, ctx_now, on_complete);
+        const auto elapsed = wall_clock::now() - t0;
+        m_t_cmd_gen += elapsed;
+
+        // Per-call CMD_GEN diagnostic: how much wall-time did decode_step()
+        // spend constructing this request's command vector, and what's the
+        // per-element cost? Lets us directly test the hypothesis that
+        // online command generation is the wall-clock bottleneck.
+        if (m_debug_log.is_open()) {
+          const size_t ncmds = cmds.size();
+          const double wall_ms =
+              std::chrono::duration<double, std::milli>(elapsed).count();
+          const double per_cmd_ns = (ncmds > 0)
+              ? (std::chrono::duration<double, std::nano>(elapsed).count()
+                 / static_cast<double>(ncmds))
+              : 0.0;
+          dlog(sfmt("[%10.3fms] CMD_GEN     req=%3d  ctx=%5d  cmds=%zu  "
+                    "wall_ms=%.3f  per_cmd_ns=%.1f",
+                    start_ms, req.id, ctx_now, ncmds, wall_ms, per_cmd_ns));
+        }
+
         m_pending_pim_requests.insert(m_pending_pim_requests.end(),
                                       std::make_move_iterator(cmds.begin()),
                                       std::make_move_iterator(cmds.end()));
@@ -653,7 +983,12 @@ class Runtime {
         m_t_send += wall_clock::now() - t0;
       }
       if (!sent) {
-        break;  // memory system full; retry next tick
+        // Memory system full; we'll retry next tick. Count this so PROGRESS
+        // / status.txt can show how often the pump is stalled by Ramulator
+        // backpressure vs running freely.
+        m_send_backpressure_events_task++;
+        m_send_backpressure_events_total++;
+        break;
       }
       if (req.callback) {
         m_pim_outstanding++;
@@ -776,7 +1111,18 @@ class Runtime {
 
   // Debug log (null stream when disabled).
   std::ofstream m_debug_log;
+  std::string   m_status_file_path;   // <run_dir>/<policy>/status.txt; live heartbeat
   int m_translate_sample_count = 0;   // resets per task; cap TRANSLATE lines at 4
+
+  // Live-instrumentation counters.
+  //   *_task  — reset at every start_task; reflects the in-flight task only.
+  //   *_total — never reset; lifetime totals for run summary.
+  // Delta-tracking state is for PROGRESS rate computation between consecutive
+  // ~1s emissions.
+  size_t m_send_backpressure_events_task  = 0;
+  size_t m_send_backpressure_events_total = 0;
+  size_t m_last_progress_cmds_sent        = 0;
+  Clk_t  m_last_progress_clk              = 0;
 
   // ── PIM shape cache ────────────────────────────────────────────────────────
   // Populated on cache miss in complete_active_task_if_ready(); consulted at
@@ -906,6 +1252,10 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
     // Per-shape PIM-decode cycle cache (Lever 1). True = skip Ramulator on
     // repeated (route, ctx_bucket, batch_size) shapes.
     cfg.pim_cache_enabled = param<bool>("pim_cache_enabled").default_val(true);
+
+    // Cross-run cache persistence. Empty = disabled. When set, runtime
+    // loads at init and rewrites at finalize. Mismatched header → rejected.
+    cfg.pim_cache_file = param<std::string>("pim_cache_file").default_val("");
 
     // Debug log (empty string = disabled)
     cfg.debug_log_path = param<std::string>("debug_log_path").default_val("");

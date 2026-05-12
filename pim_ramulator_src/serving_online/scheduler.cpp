@@ -194,17 +194,76 @@ double Scheduler::predict_finish(const std::string& route,
                                   int context_tokens, int generated_tokens,
                                   double now_ms, double gpu_free_ms,
                                   double pim_free_ms) const {
+  auto pred = predict_finish_detail(route, context_tokens, generated_tokens,
+                                    now_ms, gpu_free_ms, pim_free_ms);
+  return pred ? pred->finish_ms : -1.0;
+}
+
+std::optional<Scheduler::PredictionEstimate> Scheduler::predict_finish_detail(
+    const std::string& route,
+    int context_tokens, int generated_tokens,
+    double now_ms, double gpu_free_ms, double pim_free_ms) const {
   auto est = m_table->estimate(route, context_tokens, generated_tokens, 1);
-  if (!est) return -1.0;
+  if (!est) return std::nullopt;
 
-  // GPU and PIM run in parallel; the task starts when both are free.
-  double start = std::max({now_ms, gpu_free_ms, pim_free_ms});
-  double prefill_end = start + est->prefill_e2e_ms;
+  struct DecodeBacklog {
+    double token_work_ms = 0.0;
+    int    request_count = 0;
+  };
 
-  // Approximate: decode tokens run sequentially after prefill.
-  double finish = prefill_end
-                + static_cast<double>(est->decode_tokens) * est->decode_e2e_ms;
-  return finish;
+  DecodeBacklog pim_decode;
+  DecodeBacklog gpu_decode;
+  double queued_prefill_ms = 0.0;
+
+  auto add_decode = [&](const RuntimeRequest& r, int tokens) {
+    if (tokens <= 0) return;
+    DecodeBacklog& b = (r.route == m_cfg.pim_route_name) ? pim_decode : gpu_decode;
+    b.token_work_ms += static_cast<double>(tokens) * r.svc.decode_e2e_ms;
+    b.request_count++;
+  };
+
+  // Requests already admitted but not prefetched are ahead of this candidate's
+  // prefill under prompt-priority scheduling. Do not count their full future
+  // decode here: once they reach decode, the candidate can batch/interleave with
+  // them instead of waiting for all of their tokens to finish first.
+  for (int i : m_waiting_prefill) {
+    const auto& r = m_requests[i];
+    queued_prefill_ms += r.svc.prefill_e2e_ms;
+  }
+  for (int i : m_waiting_decode) {
+    const auto& r = m_requests[i];
+    add_decode(r, r.remaining_decode);
+  }
+
+  auto batched_decode_ms = [&](const DecodeBacklog& b) {
+    if (b.request_count <= 0) return 0.0;
+    const int effective_bs = std::max(1, std::min(m_cfg.max_decode_batch_size,
+                                                  b.request_count));
+    return b.token_work_ms / static_cast<double>(effective_bs);
+  };
+
+  double queued_decode_ms = 0.0;
+  if (route == m_cfg.pim_route_name) {
+    queued_decode_ms = batched_decode_ms(pim_decode);
+  } else if (route == m_cfg.gpu_route_name) {
+    // pick_decode_batch() visits the PIM route first and keeps it on equal
+    // earliest-start ties, so visible PIM decode backlog can sit ahead of GPU.
+    queued_decode_ms = batched_decode_ms(pim_decode) + batched_decode_ms(gpu_decode);
+  } else {
+    queued_decode_ms = batched_decode_ms(pim_decode) + batched_decode_ms(gpu_decode);
+  }
+  const double base_ms = std::max({now_ms, gpu_free_ms, pim_free_ms});
+  const double start = base_ms + queued_prefill_ms;
+  const double decode_total =
+      static_cast<double>(est->decode_tokens) * est->decode_e2e_ms;
+
+  PredictionEstimate pred;
+  pred.start_ms        = start;
+  pred.prefill_ms      = est->prefill_e2e_ms;
+  pred.decode_total_ms = decode_total;
+  pred.finish_ms       = start + est->prefill_e2e_ms
+                       + queued_decode_ms + decode_total;
+  return pred;
 }
 
 // ─── choose_route() ──────────────────────────────────────────────────────────
@@ -387,11 +446,21 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
         // Record when this request first hit KV OOM.
         if (req->kv_oom_first_ms < 0.0) req->kv_oom_first_ms = now_ms;
 
-        // Under max_utilization we always hold FCFS (per vLLM §4.5) and never
-        // fall back; the kv_oom_policy knob is ignored with a one-time log.
+        // If this request's initial KV footprint exceeds the per-region pool
+        // capacity it can never fit in PIM even with an empty pool — force GPU
+        // fallback immediately, regardless of scheduler policy. This prevents
+        // infinite KV_OOM_HOLD loops under max_utilization (which otherwise
+        // ignores kv_oom_policy).
         const bool max_util = (m_cfg.kv_scheduler_policy == "max_utilization");
-        bool do_fallback = false;
-        if (!max_util) {
+        const uint64_t pool_half = m_cfg.kv_pool_bytes / 2;
+        const bool inherently_oversized = (pool_half > 0 && kv_side >= pool_half);
+        bool do_fallback = inherently_oversized;
+        if (inherently_oversized) {
+          dlog(sfmt("[%10.3fms] KV_OOM_OVERSIZED  req=%3d  kv_side_bytes=%llu  pool_half_bytes=%llu  -> fallback_gpu",
+                    now_ms, req->id,
+                    (unsigned long long)kv_side,
+                    (unsigned long long)pool_half));
+        } else if (!max_util) {
           if (m_cfg.kv_oom_policy == "fallback_gpu") {
             do_fallback = true;
           } else if (m_cfg.kv_oom_policy == "hold_then_fallback") {
@@ -412,6 +481,17 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
                       m_cfg.kv_oom_hold_limit_ms,
                       m_cfg.gpu_route_name.c_str()));
             req->admission_last_reject_reason = "kv_oom_fallback_gpu";
+            auto pred = predict_finish_detail(
+                m_cfg.gpu_route_name,
+                req->context_tokens, req->generated_tokens,
+                now_ms, gpu_free_ms, pim_free_ms);
+            if (pred) {
+              req->scheduler_predicted_start_ms        = pred->start_ms;
+              req->scheduler_predicted_finish_ms       = pred->finish_ms;
+              req->scheduler_predicted_e2e_ms          = pred->finish_ms - req->arrival_ms;
+              req->scheduler_predicted_prefill_ms      = pred->prefill_ms;
+              req->scheduler_predicted_decode_total_ms = pred->decode_total_ms;
+            }
             set_state(wait_idx, ReqState::WaitingPrefill);
             req->route              = m_cfg.gpu_route_name;
             req->svc                = gpu_ref;
@@ -453,6 +533,16 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
               req->context_tokens, req->generated_tokens,
               req->admission_attempts,
               req->is_lost ? "  [SLO_MISS]" : ""));
+    auto pred = predict_finish_detail(route, req->context_tokens,
+                                      req->generated_tokens,
+                                      now_ms, gpu_free_ms, pim_free_ms);
+    if (pred) {
+      req->scheduler_predicted_start_ms        = pred->start_ms;
+      req->scheduler_predicted_finish_ms       = pred->finish_ms;
+      req->scheduler_predicted_e2e_ms          = pred->finish_ms - req->arrival_ms;
+      req->scheduler_predicted_prefill_ms      = pred->prefill_ms;
+      req->scheduler_predicted_decode_total_ms = pred->decode_total_ms;
+    }
     set_state(wait_idx, ReqState::WaitingPrefill);
     req->route              = route;
     req->svc                = est;
