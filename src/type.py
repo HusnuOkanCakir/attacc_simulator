@@ -41,3 +41,4 @@ class InterfaceType(Enum):
 class GPUType(Enum):
     A100a = 0
     H100 = 1
+    A6000 = 2

@@ -94,20 +94,37 @@ class Transformer:
         self.dtype = modelinfos['dtype']
         self.dhead = int(self.hdim / self.num_heads)
         self.tp = tensor_parallel
+        # GQA/MQA awareness: gqa_size = num_heads / num_kv_heads.
+        #   gqa_size = 1  → MHA  (num_kv_heads = num_heads)
+        #   gqa_size = num_heads → MQA (num_kv_heads = 1)
+        # Affects qkv FC output dim: Q stays at hdim, K/V each scale with
+        # num_kv_heads instead of num_heads. Score/context MATMULs still
+        # iterate Q heads (unchanged FLOPs) — the savings show up in the
+        # qkv projection and KV cache memory bandwidth.
+        self.gqa_size = modelinfos.get('gqa_size', 1)
+        self.num_kv_heads = max(1, self.num_heads // self.gqa_size)
+        # qkv FC output dim, in elements (pre-TP-shard).
+        # MHA:  hdim + 2 * num_heads     * dhead = 3 * hdim
+        # MQA:  hdim + 2 * num_kv_heads  * dhead < 3 * hdim
+        self.qkv_out_dim = self.hdim + 2 * self.num_kv_heads * self.dhead
 
     def build(self, batch, lin, lout, attn_on_hetero=False):
         self.sum_decoder = []
         self.gen_decoder = []
 
         # Summarization
+        # qkv FC output dim is MQA/GQA-aware: hdim (Q) + 2 * num_kv_heads * dhead
+        # (K + V). Reduces to 3*hdim for MHA (num_kv_heads = num_heads).
         self.sum_decoder.append(
             Layer('sum', 'qkv', LayerType.FC, True, self.dtype, batch * lin,
-                  3 * int(self.hdim / self.tp), self.hdim, 1))
+                  int(self.qkv_out_dim / self.tp), self.hdim, 1))
         if (attn_on_hetero):
-            # send kv matrices
+            # send kv matrices. For MQA/GQA the K+V transfer shrinks to
+            # 2 * num_kv_heads * dhead instead of 2 * hdim.
             self.sum_decoder.append(
                 Layer('sum', 'comm_x2g', LayerType.X2G, False, self.dtype,
-                      batch * lin, 2 * int(self.hdim / self.tp), 1, 1))
+                      batch * lin,
+                      int(2 * self.num_kv_heads * self.dhead / self.tp), 1, 1))
         self.sum_decoder.append(
             Layer('sum', 'score', LayerType.MATMUL, False, self.dtype, lin,
                   lin, self.dhead,
@@ -170,11 +187,12 @@ class Transformer:
             decoder = []
             decoder.append(
                 Layer('gen', 'qkv', LayerType.FC, True, self.dtype, batch,
-                      3 * int(self.hdim / self.tp), self.hdim, 1))
+                      int(self.qkv_out_dim / self.tp), self.hdim, 1))
             if (attn_on_hetero):
+                # Q+K+V transfer; MQA/GQA-aware (same dim as qkv FC output).
                 decoder.append(
                     Layer('gen', 'comm_x2g', LayerType.X2G, False, self.dtype,
-                          batch, 3 * int(self.hdim / self.tp), 1, 1))
+                          batch, int(self.qkv_out_dim / self.tp), 1, 1))
             decoder.append(
                 Layer('gen', 'score', LayerType.MATMUL, False, self.dtype, 1,
                       lin + stage, self.dhead,

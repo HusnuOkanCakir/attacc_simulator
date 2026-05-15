@@ -108,6 +108,40 @@ def make_xpu_config(gpu_type: GPUType,
         config['CPU']["INTERFACE_BW"] = 4 * 64 * 1000 * 1000 * 1000
         config['CPU']["ENERGY_TABLE"] = ENERGY_TABLE['CPU']
 
+    elif gpu_type == GPUType.A6000:
+        # Ref: NVIDIA RTX A6000 datasheet (Ampere, sm86).
+        # - 84 SMs, ~10752 CUDA cores
+        # - 309.7 TFLOPS bf16 with tensor cores + sparsity; ~154.8 TFLOPS without sparsity
+        #   (use the no-sparsity number for cost-model FLOPS budget)
+        # - 48 GB GDDR6 ECC, 768 GB/s peak memory bandwidth
+        # - L2: 6 MB; L1/SMEM: 128 KB per SM
+        # - NVLink (RTX A6000): 112 GB/s peer link
+        config['GPU']["NUM_CORE"] = 84
+        config['GPU']["FLOPS_PER_DEVICE"] = 154.8 * 1000 * 1000 * 1000 * 1000 \
+                                            if flops is None else flops
+        config['GPU']["MEM_CAPACITY_PER_DEVICE"] = 48 * 1024 * 1024 * 1024 \
+                                                    if mem_cap is None else mem_cap
+        config['GPU']["OFF_MEM_BW_PER_DEVICE"] = 768 * 1000 * 1000 * 1000 \
+                                                  if mem_bw is None else mem_bw
+        config['GPU']["L2_MEM_BW_PER_DEVICE"] = float('inf')
+        config['GPU']["L1_CAP_PER_CORE"] = 128 * 1024
+        config['GPU']["L2_CAP_PER_DEVICE"] = 6 * 1024 * 1024
+        config['GPU']["INTERFACE_BW"] = 112 * 1000 * 1000 * 1000
+        config['GPU']["ENERGY_TABLE"] = ENERGY_TABLE['GPU']
+
+        # CPU host (typical workstation pairing — Threadripper/Xeon-W). The cost
+        # model touches CPU only for non-PIM bookkeeping; values mirror A100a.
+        config['CPU']["NUM_DEVICE"] = 2
+        config['CPU']["NUM_CORE"] = 64
+        config['CPU']["FLOPS_PER_DEVICE"] = 4 * 1000 * 1000 * 1000 * 1000
+        config['CPU']["MEM_CAPACITY_PER_DEVICE"] = 1024 * 1024 * 1024 * 1024
+        config['CPU']["OFF_MEM_BW_PER_DEVICE"] = 200 * 1000 * 1000 * 1000
+        config['CPU']["L2_MEM_BW_PER_DEVICE"] = float('inf')
+        config['CPU']["L1_CAP_PER_CORE"] = 96 * 1024
+        config['CPU']["L2_CAP_PER_DEVICE"] = 256 * 1024 * 1024
+        config['CPU']["INTERFACE_BW"] = 4 * 64 * 1000 * 1000 * 1000
+        config['CPU']["ENERGY_TABLE"] = ENERGY_TABLE['CPU']
+
     elif gpu_type == GPUType.H100:
         # Ref: DGX-H100 whitepaper
         config['GPU']["NUM_CORE"] = 132
@@ -244,8 +278,9 @@ def make_model_config(name, dtype):
     model_table['MT-530B'] = [105, 20480, 128, 160, 4, 1]
     model_table['MT-1008B'] = [128, 25600, 160, 160, 4, 1]
     model_table['OPT-66B'] = [64, 9216, 72, 128, 4, 1]
-    # PI0 paligemma-only approximation (gemma_2b)
-    model_table['PI0'] = [18, 2048, 8, 256, 8, 1]
+    # PI0 paligemma-only approximation (gemma_2b: 18 layers, 8 Q heads,
+    # 1 KV head MQA → gqa_size = num_heads / num_kv_heads = 8).
+    model_table['PI0'] = [18, 2048, 8, 256, 8, 8]
     # OpenVLA-7B uses Llama2-7B as the LLM backbone (identical to LLAMA-7B).
     # Vision encoder is treated as a pre-encoded patch prefix at the simulator
     # layer (vision_prefix_tokens), so cost-table-side params match Llama2-7B.

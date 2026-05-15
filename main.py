@@ -543,8 +543,10 @@ def main():
         gpu_device = GPUType.H100
     elif args.gpu == 'A100a':
         gpu_device = GPUType.A100a
+    elif args.gpu == 'A6000':
+        gpu_device = GPUType.A6000
     else:
-        assert 0
+        raise ValueError(f"Unknown --gpu '{args.gpu}' (expected H100, A100a, or A6000)")
 
     num_gpu = args.ngpu
     gmem_cap = args.gmemcap * 1024 * 1024 * 1024
