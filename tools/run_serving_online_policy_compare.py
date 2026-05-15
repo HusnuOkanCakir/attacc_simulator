@@ -60,30 +60,52 @@ KV_OOM_HOLD_LIMIT_MS = 50.0 # max hold time before GPU fallback (hold_then_fallb
 PIM_COMMAND_MODE  = "realistic"  # realistic | simple — diagnostic A/B knob
 PIM_CACHE_ENABLED = True         # cache PIM-decode drain cycles by shape (Lever 1)
 PIM_CACHE_FILE    = ""           # persisted cache across runs (empty = disabled)
+ROUTE_POLICY      = "min_finish" # min_finish | latency_guarded_energy
+ENERGY_LATENCY_GUARD_MS         = 20.0  # used by latency_guarded_energy only
+MAX_DECODE_BATCH_SIZE           = 8     # max requests in one decode batch
+MAX_CONSECUTIVE_DECODE_BATCHES  = 4     # force a prefill after this many decodes
+PROMPT_PRIORITY                 = True  # if true, prefill always wins over decode when waiting
 
 # Model architecture (filled from MODEL_PRESETS in main()).
-NUM_LAYERS           = 40
+NUM_LAYERS           = 18
 NUM_HEADS            = 8
+NUM_KV_HEADS         = 1     # K/V projection heads; defaults to MQA (Pi0)
 D_HEAD               = 256
 DTYPE_BYTES          = 2
 VISION_PREFIX_TOKENS = 0
 
 # Per-model defaults: architecture + cost-table paths. Selected via --model.
-# CLI flags --n-layers / --n-heads / --d-head / --vision-prefix-tokens override
-# the preset for ablation runs. CLI flags --ml / --dense pick model-specific
-# alternatives derived from the preset paths.
+# CLI flags --n-layers / --n-heads / --n-kv-heads / --d-head / --vision-prefix-tokens
+# override the preset for ablation runs. CLI flags --ml / --dense pick
+# model-specific alternatives derived from the preset paths.
+#
+# Architecture sources:
+#   Pi0     — PaliGemma (Gemma-2B): 18 layers, 8 Q heads, 1 KV head (MQA),
+#             d_head=256, +SigLIP 256-token vision prefix.
+#   OpenVLA — Prismatic-7B (Llama-2-7B MHA): 32 layers, 32 heads (MHA),
+#             d_head=128, +256-token vision prefix (DinoV2+SigLIP concat).
 MODEL_PRESETS: dict[str, dict] = {
     "pi0": dict(
-        num_layers=40, num_heads=8, d_head=256, dtype_bytes=2,
-        vision_prefix_tokens=0,
-        cost_dir_csv="cluster_outputs/cost_tables_full_energy",
-        cost_dir_models="cluster_outputs/cost_models_full_energy",
+        num_layers=18, num_heads=8, num_kv_heads=1, d_head=256, dtype_bytes=2,
+        vision_prefix_tokens=256,
+        # Cost-table directories per GPU. A100 paths preserved as default;
+        # A6000 paths come online after Pi0-MQA cost tables are regenerated.
+        cost_dirs={
+            "a100":  ("cluster_outputs/cost_tables_full_energy",
+                      "cluster_outputs/cost_models_full_energy"),
+            "a6000": ("cluster_outputs/cost_tables_full_energy_pi0_a6000",
+                      "cluster_outputs/cost_models_full_energy_pi0_a6000"),
+        },
     ),
     "openvla": dict(
-        num_layers=32, num_heads=32, d_head=128, dtype_bytes=2,
+        num_layers=32, num_heads=32, num_kv_heads=32, d_head=128, dtype_bytes=2,
         vision_prefix_tokens=256,
-        cost_dir_csv="cluster_outputs/cost_tables_full_energy_openvla",
-        cost_dir_models="cluster_outputs/cost_models_full_energy_openvla",
+        cost_dirs={
+            "a100":  ("cluster_outputs/cost_tables_full_energy_openvla",
+                      "cluster_outputs/cost_models_full_energy_openvla"),
+            "a6000": ("cluster_outputs/cost_tables_full_energy_openvla_a6000",
+                      "cluster_outputs/cost_models_full_energy_openvla_a6000"),
+        },
     ),
 }
 
@@ -162,6 +184,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
         MAX_ADDR = ((MAX_ADDR >> 30) + 1) << 30
 
     PIM_CACHE_ENABLED_YAML = "true" if PIM_CACHE_ENABLED else "false"
+    PROMPT_PRIORITY_YAML   = "true" if PROMPT_PRIORITY else "false"
 
     return f"""Frontend:
   impl: ServingOnlineFrontend
@@ -178,12 +201,12 @@ def yaml_text(label: str, run_dir: Path) -> str:
   gpu_route_name: gpu_only
   hybrid_route_name: lpddr5_pim_bank
 
-  route_policy: min_finish
-  energy_latency_guard_ms: 20.0
+  route_policy: {ROUTE_POLICY}
+  energy_latency_guard_ms: {ENERGY_LATENCY_GUARD_MS}
 
-  max_decode_batch_size: 8
-  prompt_priority: true
-  max_consecutive_decode_batches: 4
+  max_decode_batch_size: {MAX_DECODE_BATCH_SIZE}
+  prompt_priority: {PROMPT_PRIORITY_YAML}
+  max_consecutive_decode_batches: {MAX_CONSECUTIVE_DECODE_BATCHES}
   max_active_requests: {MAX_ACTIVE}
 
   admission_max_wait_ms: 150.0
@@ -201,6 +224,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
 
   generator_num_layers: {NUM_LAYERS}
   generator_num_heads: {NUM_HEADS}
+  generator_num_kv_heads: {NUM_KV_HEADS}
   generator_dhead: {D_HEAD}
   generator_dtype_bytes: {DTYPE_BYTES}
   vision_prefix_tokens: {VISION_PREFIX_TOKENS}
@@ -497,10 +521,22 @@ def main() -> None:
     ap.add_argument("--model", choices=sorted(MODEL_PRESETS.keys()), default="pi0",
                     help="Model preset selecting architecture (num_layers/num_heads/d_head) "
                          "and the matching cost tables / ML models. Default: pi0.")
+    ap.add_argument("--gpu", choices=("a100", "a6000"), default="a100",
+                    help="GPU target — selects which cost_dirs entry of the model preset "
+                         "to load. a6000 paths require regenerated cost tables; a100 is "
+                         "the legacy default. Default: a100.")
+    ap.add_argument("--csv-path", type=str, default=None,
+                    help="Override the requests CSV path. By default the runner picks an "
+                         "Azure-LLM trace slice based on --n-requests. Use --csv-path with "
+                         "tools/gen_vla_synthetic_trace.py output for VLA-realistic workloads "
+                         "(Lout=7 OpenVLA / Lout=50 Pi0, Poisson arrivals at robot control rate).")
     ap.add_argument("--n-layers", type=int, default=None,
                     help="Override generator_num_layers from the model preset.")
     ap.add_argument("--n-heads", type=int, default=None,
-                    help="Override generator_num_heads from the model preset.")
+                    help="Override generator_num_heads (Q projection heads) from the model preset.")
+    ap.add_argument("--n-kv-heads", type=int, default=None,
+                    help="Override generator_num_kv_heads (K/V projection heads) from the model preset. "
+                         "Set < num_heads for MQA/GQA. Pi0 default: 1 (MQA). OpenVLA default: 32 (MHA).")
     ap.add_argument("--d-head", type=int, default=None,
                     help="Override generator_dhead from the model preset.")
     ap.add_argument("--vision-prefix-tokens", type=int, default=None,
@@ -555,11 +591,51 @@ def main() -> None:
                          "runs with the same model + DRAM config skip Ramulator drain "
                          "for already-seen shapes. Header schema is validated; mismatched "
                          "files are rejected and the run starts with an empty cache.")
+    ap.add_argument("--route-policy",
+                    choices=["min_finish", "latency_guarded_energy"], default=None,
+                    help="How choose_route() picks between PIM and GPU among eligible "
+                         "(deadline-feasible) routes. 'min_finish' = lowest predicted "
+                         "finish time. 'latency_guarded_energy' = lowest energy among "
+                         "routes within --energy-latency-guard-ms of the fastest. "
+                         "Default: min_finish.")
+    ap.add_argument("--energy-latency-guard-ms", type=float, default=None,
+                    help="Latency slack (ms) for latency_guarded_energy: routes within "
+                         "this many ms of the fastest are considered latency-equivalent "
+                         "and energy decides the pick. Ignored under min_finish. "
+                         "Default: 20.0.")
+    ap.add_argument("--max-decode-batch-size", type=int, default=None,
+                    help="Max requests in one decode batch (continuous batching cap). "
+                         "Larger amortizes GPU FC cost across requests but increases "
+                         "memory pressure and tail latency on the slowest member. "
+                         "Default: 8.")
+    ap.add_argument("--max-consecutive-decode-batches", type=int, default=None,
+                    help="After this many consecutive decode batches, force a prefill "
+                         "step. Prevents prefill starvation (and TTFT spikes) under "
+                         "sustained decode load. Default: 4.")
+    ap.add_argument("--prompt-priority", dest="prompt_priority",
+                    action="store_true", default=None,
+                    help="When set, prefill always wins over decode whenever a prefill "
+                         "is waiting (default). Short-circuits the max_consec_decode "
+                         "check in pick_task(). Use --no-prompt-priority to disable.")
+    ap.add_argument("--no-prompt-priority", dest="prompt_priority",
+                    action="store_false",
+                    help="Disable prompt_priority. Decode batches run up to "
+                         "max_consec_decode_batches before being forced to yield to "
+                         "prefill. Required for max_consec_decode_batches to actually "
+                         "do anything.")
     args = ap.parse_args()
 
-    # Resolve requests CSV — create a slice if needed.
+    # Resolve requests CSV. --csv-path wins (use it for synthetic VLA traces);
+    # otherwise pick an Azure-LLM trace slice sized to --n-requests.
     n = args.n_requests
-    if n == 50:
+    if args.csv_path is not None:
+        csv_path = Path(args.csv_path)
+        if not csv_path.is_absolute():
+            csv_path = REPO / csv_path
+        if not csv_path.exists():
+            sys.exit(f"[error] --csv-path not found: {csv_path}")
+        REQUESTS_CSV = str(csv_path.relative_to(REPO)) if csv_path.is_relative_to(REPO) else str(csv_path)
+    elif n == 50:
         REQUESTS_CSV = REQUESTS_CSV_DEFAULT
     else:
         slice_csv = REPO / f"cluster_outputs/azure/AzureLLMInferenceTrace_conv_first{n}.csv"
@@ -577,17 +653,30 @@ def main() -> None:
     # Apply model preset (architecture + cost-table directories), then let
     # CLI flags override individual fields.
     preset = MODEL_PRESETS[args.model]
-    global NUM_LAYERS, NUM_HEADS, D_HEAD, DTYPE_BYTES, VISION_PREFIX_TOKENS
-    NUM_LAYERS  = args.n_layers if args.n_layers is not None else preset["num_layers"]
-    NUM_HEADS   = args.n_heads  if args.n_heads  is not None else preset["num_heads"]
-    D_HEAD      = args.d_head   if args.d_head   is not None else preset["d_head"]
-    DTYPE_BYTES = preset["dtype_bytes"]
+    global NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, D_HEAD, DTYPE_BYTES, VISION_PREFIX_TOKENS
+    NUM_LAYERS   = args.n_layers   if args.n_layers   is not None else preset["num_layers"]
+    NUM_HEADS    = args.n_heads    if args.n_heads    is not None else preset["num_heads"]
+    NUM_KV_HEADS = args.n_kv_heads if args.n_kv_heads is not None else preset.get("num_kv_heads", NUM_HEADS)
+    D_HEAD       = args.d_head     if args.d_head     is not None else preset["d_head"]
+    DTYPE_BYTES  = preset["dtype_bytes"]
     VISION_PREFIX_TOKENS = (args.vision_prefix_tokens
                             if args.vision_prefix_tokens is not None
                             else preset["vision_prefix_tokens"])
 
+    # Cost tables / models are GPU-specific (different FLOPs, BW, energy
+    # constants). The preset's `cost_dirs` map keys --gpu (a100/a6000) → paths.
+    cost_dirs_map = preset.get("cost_dirs")
+    if cost_dirs_map is None:
+        # Backward compat: presets that still use the old single-pair fields.
+        csv_dir   = preset["cost_dir_csv"]
+        model_dir = preset["cost_dir_models"]
+    else:
+        if args.gpu not in cost_dirs_map:
+            sys.exit(f"[error] model '{args.model}' has no cost_dirs entry for "
+                     f"--gpu '{args.gpu}'. Available: {sorted(cost_dirs_map)}")
+        csv_dir, model_dir = cost_dirs_map[args.gpu]
+
     global COST_GPU_CSV, COST_HYBRID_CSV
-    csv_dir = preset["cost_dir_csv"]
     if args.dense:
         COST_GPU_CSV    = f"{csv_dir}/gpu_only_dense.csv"
         COST_HYBRID_CSV = f"{csv_dir}/lpddr5_pim_bank_dense.csv"
@@ -596,7 +685,6 @@ def main() -> None:
         COST_HYBRID_CSV = f"{csv_dir}/lpddr5_pim_bank.csv"
     if args.ml:
         global COST_GPU_MODEL, COST_HYBRID_MODEL
-        model_dir = preset["cost_dir_models"]
         COST_GPU_MODEL    = f"{model_dir}/gpu_only_trees.bin"
         COST_HYBRID_MODEL = f"{model_dir}/lpddr5_pim_bank_trees.bin"
     if args.debug_log:
@@ -629,14 +717,34 @@ def main() -> None:
     if args.pim_cache_file is not None:
         global PIM_CACHE_FILE
         PIM_CACHE_FILE = args.pim_cache_file
+    if args.route_policy is not None:
+        global ROUTE_POLICY
+        ROUTE_POLICY = args.route_policy
+    if args.energy_latency_guard_ms is not None:
+        global ENERGY_LATENCY_GUARD_MS
+        ENERGY_LATENCY_GUARD_MS = args.energy_latency_guard_ms
+    if args.max_decode_batch_size is not None:
+        global MAX_DECODE_BATCH_SIZE
+        MAX_DECODE_BATCH_SIZE = args.max_decode_batch_size
+    if args.max_consecutive_decode_batches is not None:
+        global MAX_CONSECUTIVE_DECODE_BATCHES
+        MAX_CONSECUTIVE_DECODE_BATCHES = args.max_consecutive_decode_batches
+    if args.prompt_priority is not None:
+        global PROMPT_PRIORITY
+        PROMPT_PRIORITY = args.prompt_priority
     print(f"[csv]           {REQUESTS_CSV}  ({n} requests)")
     print(f"[model]         {args.model}  layers={NUM_LAYERS} heads={NUM_HEADS} "
-          f"d_head={D_HEAD} dtype_bytes={DTYPE_BYTES} vision_prefix={VISION_PREFIX_TOKENS}")
+          f"kv_heads={NUM_KV_HEADS} d_head={D_HEAD} dtype_bytes={DTYPE_BYTES} "
+          f"vision_prefix={VISION_PREFIX_TOKENS}")
     print(f"[max_active]    {MAX_ACTIVE} (0 = unlimited)")
     print(f"[kv_pool]       {KV_POOL_BYTES} bytes ({KV_POOL_BYTES / (1<<30):.2f} GiB)")
     print(f"[arrival_scale] {ARRIVAL_SCALE}")
     print(f"[slo]           e2e={SLO_E2E_MS}ms  ttft={SLO_TTFT_MS}ms")
     print(f"[kv_oom]        policy={KV_OOM_POLICY}  hold_limit={KV_OOM_HOLD_LIMIT_MS}ms")
+    print(f"[route_policy]  {ROUTE_POLICY}  guard_ms={ENERGY_LATENCY_GUARD_MS}")
+    print(f"[batching]      max_decode_bs={MAX_DECODE_BATCH_SIZE}  "
+          f"max_consec_decode={MAX_CONSECUTIVE_DECODE_BATCHES}  "
+          f"prompt_priority={PROMPT_PRIORITY}")
     print(f"[pim_cmd_mode]  {PIM_COMMAND_MODE}")
     print(f"[pim_cache]     {'enabled' if PIM_CACHE_ENABLED else 'disabled'}"
           f"{'  persist=' + PIM_CACHE_FILE if PIM_CACHE_FILE else ''}")
@@ -674,6 +782,7 @@ def main() -> None:
         f"model={args.model}\n"
         f"num_layers={NUM_LAYERS}\n"
         f"num_heads={NUM_HEADS}\n"
+        f"num_kv_heads={NUM_KV_HEADS}\n"
         f"d_head={D_HEAD}\n"
         f"dtype_bytes={DTYPE_BYTES}\n"
         f"vision_prefix_tokens={VISION_PREFIX_TOKENS}\n"
@@ -732,8 +841,10 @@ def main() -> None:
     except ImportError:
         _plot_pred_vs_actual = None
     if _plot_pred_vs_actual is not None:
-        gpu_pkl    = REPO / preset["cost_dir_models"] / "gpu_only.pkl"
-        hybrid_pkl = REPO / preset["cost_dir_models"] / "lpddr5_pim_bank.pkl"
+        # Resolve the same model-dir we computed earlier (handles both the
+        # new cost_dirs mapping and the legacy cost_dir_models field).
+        gpu_pkl    = REPO / model_dir / "gpu_only.pkl"
+        hybrid_pkl = REPO / model_dir / "lpddr5_pim_bank.pkl"
         if gpu_pkl.exists() or hybrid_pkl.exists():
             print("\n[predicted_vs_actual] generating per-policy plots ...")
             import warnings as _warnings
