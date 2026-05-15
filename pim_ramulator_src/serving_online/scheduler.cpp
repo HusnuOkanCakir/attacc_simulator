@@ -136,9 +136,12 @@ void Scheduler::enqueue_arrivals(double now_ms) {
 // ─── kv_bytes_per_side() ─────────────────────────────────────────────────────
 
 uint64_t Scheduler::kv_bytes_for_ctx(int ctx_tokens) const {
+  // Per-side (K or V) bytes. K and V each scale with num_kv_heads, NOT
+  // num_heads (the Q-projection heads). Callers multiply by 2 externally
+  // when they need total K+V bytes (e.g. scheduler.cpp:528, 848 / 184, 433).
   if (ctx_tokens < 0) ctx_tokens = 0;
   return static_cast<uint64_t>(m_cfg.num_layers)
-       * static_cast<uint64_t>(m_cfg.num_heads)
+       * static_cast<uint64_t>(m_cfg.num_kv_heads)
        * static_cast<uint64_t>(ctx_tokens)
        * static_cast<uint64_t>(m_cfg.d_head)
        * static_cast<uint64_t>(m_cfg.dtype_bytes);
@@ -154,8 +157,9 @@ uint64_t Scheduler::kv_bytes_per_side(const RuntimeRequest& req) const {
 }
 
 uint64_t Scheduler::kv_bytes_per_token_per_side() const {
+  // Per-token, per-side (K or V). Scales with num_kv_heads, not num_heads.
   return static_cast<uint64_t>(m_cfg.num_layers)
-       * static_cast<uint64_t>(m_cfg.num_heads)
+       * static_cast<uint64_t>(m_cfg.num_kv_heads)
        * static_cast<uint64_t>(m_cfg.d_head)
        * static_cast<uint64_t>(m_cfg.dtype_bytes);
 }
@@ -244,15 +248,24 @@ std::optional<Scheduler::PredictionEstimate> Scheduler::predict_finish_detail(
 
   double queued_decode_ms = 0.0;
   if (route == m_cfg.pim_route_name) {
+    // PIM requests wait behind other PIM decode work only.
     queued_decode_ms = batched_decode_ms(pim_decode);
   } else if (route == m_cfg.gpu_route_name) {
-    // pick_decode_batch() visits the PIM route first and keeps it on equal
-    // earliest-start ties, so visible PIM decode backlog can sit ahead of GPU.
-    queued_decode_ms = batched_decode_ms(pim_decode) + batched_decode_ms(gpu_decode);
+    // GPU-only requests interleave with PIM via pick_decode_batch() (each
+    // tick picks whichever cohort has the earliest ready_ms). A GPU-only
+    // request does NOT have to drain the entire PIM backlog first — they
+    // take turns. Use only the GPU-specific backlog so the prediction
+    // reflects the actual competition for the GPU resource, not the PIM
+    // queue depth. This allows choose_route() to prefer GPU when PIM is
+    // heavily backlogged.
+    queued_decode_ms = batched_decode_ms(gpu_decode);
   } else {
     queued_decode_ms = batched_decode_ms(pim_decode) + batched_decode_ms(gpu_decode);
   }
-  const double base_ms = std::max({now_ms, gpu_free_ms, pim_free_ms});
+  // Use the hardware-free time relevant to the chosen route so GPU predictions
+  // don't inflate when PIM hardware is draining.
+  const double hw_free_ms = (route == m_cfg.pim_route_name) ? pim_free_ms : gpu_free_ms;
+  const double base_ms = std::max(now_ms, hw_free_ms);
   const double start = base_ms + queued_prefill_ms;
   const double decode_total =
       static_cast<double>(est->decode_tokens) * est->decode_e2e_ms;

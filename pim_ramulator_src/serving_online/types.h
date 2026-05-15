@@ -287,12 +287,14 @@ struct ServingOnlineConfig {
   int      num_channels    = 8;     // LPDDR5 channel count for KV interleaving
 
   // Model architecture parameters (used for KV size formula and command
-  // generation). Defaults are Pi0; override via YAML for other models
-  // (e.g. OpenVLA-7B: 32 / 32 / 128).
-  int num_layers  = 18;
-  int num_heads   = 8;
-  int d_head      = 256;
-  int dtype_bytes = 2;   // 2 = FP16
+  // generation). Defaults are Pi0 (Gemma-2B backbone): 18 layers, 8 query
+  // heads, 1 KV head (MQA). Override via YAML for other models
+  // (e.g. OpenVLA-7B / Llama-2-7B MHA: 32 / 32 / 32 / 128).
+  int num_layers   = 18;
+  int num_heads    = 8;     // Q projection heads
+  int num_kv_heads = 1;     // K/V projection heads. MHA when == num_heads; MQA when 1.
+  int d_head       = 256;
+  int dtype_bytes  = 2;     // 2 = FP16
 
   // Vision-encoder prefix: number of pre-encoded image patch tokens that
   // every request implicitly carries before its text context. Added to

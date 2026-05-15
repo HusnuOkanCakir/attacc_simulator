@@ -49,11 +49,12 @@ class PimCommandGen {
   };
 
   struct Params {
-    int  num_layers  = 18;    // number of attention layers (pi0 = 18)
-    int  num_heads   = 8;     // attention heads per layer (pi0 = 8)
-    int  d_head      = 256;   // key/value head dimension in elements (pi0 = 256)
-    int  dtype_bytes = 2;     // bytes per element: 2 = FP16
-    Mode mode        = Mode::Realistic;
+    int  num_layers   = 18;    // number of attention layers (pi0 = 18)
+    int  num_heads    = 8;     // Q-projection heads per layer (pi0 = 8)
+    int  num_kv_heads = 1;     // K/V-projection heads per layer; MHA when == num_heads, MQA when 1
+    int  d_head       = 256;   // key/value head dimension in elements (pi0 = 256)
+    int  dtype_bytes  = 2;     // bytes per element: 2 = FP16
+    Mode mode         = Mode::Realistic;
   };
 
   /**
@@ -70,8 +71,9 @@ class PimCommandGen {
   /**
    * Generate all memory requests for one attention decode step.
    *
-   * For each layer and head, emits one Read for the full K row and one for
-   * the full V row. Total = num_layers * num_heads * 2 requests.
+   * For each layer and KV head, emits one Read for the full K row and one
+   * for the full V row. Total = num_layers * num_kv_heads * 2 requests in
+   * Simple mode; Realistic mode emits per-block K/V command sequences.
    *
    * Each returned Request has its callback set to `on_complete` so the caller
    * can count outstanding requests and detect when the step is finished.

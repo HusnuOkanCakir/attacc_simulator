@@ -158,10 +158,11 @@ class Runtime {
 
     // Build PIM command generator.
     PimCommandGen::Params cmd_params;
-    cmd_params.num_layers  = cfg.num_layers;
-    cmd_params.num_heads   = cfg.num_heads;
-    cmd_params.d_head      = cfg.d_head;
-    cmd_params.dtype_bytes = cfg.dtype_bytes;
+    cmd_params.num_layers   = cfg.num_layers;
+    cmd_params.num_heads    = cfg.num_heads;
+    cmd_params.num_kv_heads = cfg.num_kv_heads;
+    cmd_params.d_head       = cfg.d_head;
+    cmd_params.dtype_bytes  = cfg.dtype_bytes;
     if (cfg.pim_command_mode == "simple") {
       cmd_params.mode = PimCommandGen::Mode::Simple;
     } else {
@@ -509,10 +510,11 @@ class Runtime {
   // different DRAM timing.
 
   std::string pim_cache_fingerprint() const {
-    return sfmt("num_layers=%d num_heads=%d d_head=%d dtype_bytes=%d "
+    return sfmt("num_layers=%d num_heads=%d num_kv_heads=%d d_head=%d dtype_bytes=%d "
                 "pim_route=%s gpu_route=%s pim_cmd_mode=%s vision_prefix=%d "
                 "tCK=%.4f",
-                m_cfg.num_layers, m_cfg.num_heads, m_cfg.d_head, m_cfg.dtype_bytes,
+                m_cfg.num_layers, m_cfg.num_heads, m_cfg.num_kv_heads,
+                m_cfg.d_head, m_cfg.dtype_bytes,
                 m_cfg.pim_route_name.c_str(), m_cfg.gpu_route_name.c_str(),
                 m_cfg.pim_command_mode.c_str(),
                 m_cfg.vision_prefix_tokens,
@@ -1235,11 +1237,14 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
     cfg.page_size_bytes = (param<Addr_t>("translation_pagesize_KB").default_val(4) << 10);
     cfg.num_channels    = param<int>("generator_channel_count").default_val(8);
 
-    // Model architecture (Pi0 defaults; OpenVLA: 32/32/128)
-    cfg.num_layers  = param<int>("generator_num_layers").default_val(18);
-    cfg.num_heads   = param<int>("generator_num_heads").default_val(8);
-    cfg.d_head      = param<int>("generator_dhead").default_val(256);
-    cfg.dtype_bytes = param<int>("generator_dtype_bytes").default_val(2);
+    // Model architecture (Pi0 defaults: 18 layers / 8 Q heads / 1 KV head MQA / d_head 256;
+    // OpenVLA-7B MHA: 32 / 32 / 32 / 128). generator_num_kv_heads defaults to
+    // num_heads so legacy YAMLs without the field continue to model MHA.
+    cfg.num_layers   = param<int>("generator_num_layers").default_val(18);
+    cfg.num_heads    = param<int>("generator_num_heads").default_val(8);
+    cfg.num_kv_heads = param<int>("generator_num_kv_heads").default_val(cfg.num_heads);
+    cfg.d_head       = param<int>("generator_dhead").default_val(256);
+    cfg.dtype_bytes  = param<int>("generator_dtype_bytes").default_val(2);
 
     // Vision-encoder prefix: pre-encoded image tokens added to every
     // request's context at load time. 0 = text-only model (Pi0). 256 is

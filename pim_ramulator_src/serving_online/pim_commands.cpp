@@ -3,23 +3,26 @@
  *
  * Realistic LPDDR5-PIM attention decode-step command generator.
  *
- * Per (layer, head), at cache-line block granularity:
+ * Per (layer, kv_head), at cache-line block granularity. Iteration is over
+ * num_kv_heads, not num_heads: K and V live once per KV head and are shared
+ * across query heads in MQA/GQA. For MHA (num_kv_heads == num_heads) this
+ * reduces to the original formula.
  *
  *   K-side score matmul:
  *     for each block in blocks(L):
- *       PIM_WR_GB(K[layer,head,block])   // write query into global buffer
- *       PIM_MAC_AB(K[layer,head,block])  // all-bank MAC against K row
- *     PIM_MV_SB(control)                 // collect per-bank partial scores
- *     PIM_SFM(control)                   // softmax across the score vector
+ *       PIM_WR_GB(K[layer,kv_head,block])  // write query into global buffer
+ *       PIM_MAC_AB(K[layer,kv_head,block]) // all-bank MAC against K row
+ *     PIM_MV_SB(control)                   // collect per-bank partial scores
+ *     PIM_SFM(control)                     // softmax across the score vector
  *
  *   V-side context matmul:
  *     for each block in blocks(L):
- *       PIM_MV_GB(V[layer,head,block])   // broadcast prob vector
- *       PIM_MAC_AB(V[layer,head,block])  // all-bank MAC against V row
- *     PIM_MV_SB(control)                 // collect partial contexts
- *     PIM_BARRIER(control)               // serialize before next (layer, head)
+ *       PIM_MV_GB(V[layer,kv_head,block])  // broadcast prob vector
+ *       PIM_MAC_AB(V[layer,kv_head,block]) // all-bank MAC against V row
+ *     PIM_MV_SB(control)                   // collect partial contexts
+ *     PIM_BARRIER(control)                 // serialize before next (layer, kv_head)
  *
- * Total commands per decode step: num_layers * num_heads * (4 * blocks + 4)
+ * Total commands per decode step: num_layers * num_kv_heads * (4 * blocks + 4)
  * with blocks = ceil(context_tokens / (kLineBytes / dtype_bytes)).
  *
  * Ported from serving1_5/pim_commands.cpp (only namespace renamed).
@@ -56,14 +59,14 @@ uint64_t PimCommandGen::control_addr(int request_id, int layer, int head,
 
 int PimCommandGen::decode_step_count(int context_tokens) const {
   if (m_p.mode == Mode::Simple) {
-    // One PIM_MAC_AB for K and one for V per (layer, head). Context-length
+    // One PIM_MAC_AB for K and one for V per (layer, kv_head). Context-length
     // independent — diagnostic only.
-    return m_p.num_layers * m_p.num_heads * 2;
+    return m_p.num_layers * m_p.num_kv_heads * 2;
   }
   const int tokens_per_block = kLineBytes / m_p.dtype_bytes;
   const int blocks = (context_tokens + tokens_per_block - 1) / tokens_per_block;
-  // Per (layer, head): 2*blocks K-side + 2*blocks V-side + 4 control commands.
-  return m_p.num_layers * m_p.num_heads * (4 * blocks + 4);
+  // Per (layer, kv_head): 2*blocks K-side + 2*blocks V-side + 4 control commands.
+  return m_p.num_layers * m_p.num_kv_heads * (4 * blocks + 4);
 }
 
 // ─── decode_step() ───────────────────────────────────────────────────────────
@@ -80,18 +83,21 @@ std::vector<Request> PimCommandGen::decode_step(
       static_cast<uint64_t>(m_p.d_head) * static_cast<uint64_t>(m_p.dtype_bytes);
   const uint64_t bytes_per_head =
       static_cast<uint64_t>(context_tokens) * bytes_per_token;
+  // KV region is laid out as [layer][kv_head][ctx_token][d_head] — each
+  // layer occupies num_kv_heads × bytes_per_head, NOT num_heads × bytes_per_head.
+  // For MHA (num_kv_heads == num_heads) this is unchanged.
   const uint64_t bytes_per_layer =
-      static_cast<uint64_t>(m_p.num_heads) * bytes_per_head;
+      static_cast<uint64_t>(m_p.num_kv_heads) * bytes_per_head;
 
-  // Simple mode: emit two PIM_MAC_AB per (layer, head) — one for K, one for V
-  // — at the head's base address. No control commands, no per-block stream.
-  // Diagnostic only; absolute decode latency still comes from the cost table.
+  // Simple mode: emit two PIM_MAC_AB per (layer, kv_head) — one for K, one
+  // for V — at the kv_head's base address. No control commands, no per-block
+  // stream. Diagnostic only; absolute decode latency still comes from the cost table.
   if (m_p.mode == Mode::Simple) {
     for (int layer = 0; layer < m_p.num_layers; ++layer) {
-      for (int head = 0; head < m_p.num_heads; ++head) {
+      for (int kv_head = 0; kv_head < m_p.num_kv_heads; ++kv_head) {
         const uint64_t key_base =
-            static_cast<uint64_t>(layer) * bytes_per_layer +
-            static_cast<uint64_t>(head)  * bytes_per_head;
+            static_cast<uint64_t>(layer)   * bytes_per_layer +
+            static_cast<uint64_t>(kv_head) * bytes_per_head;
         const uint64_t key_va = m_alloc->encode_va(
             KvRegion::Key,   request_id, key_base);
         const uint64_t val_va = m_alloc->encode_va(
@@ -111,10 +117,10 @@ std::vector<Request> PimCommandGen::decode_step(
   const int blocks = (context_tokens + tokens_per_block - 1) / tokens_per_block;
 
   for (int layer = 0; layer < m_p.num_layers; ++layer) {
-    for (int head = 0; head < m_p.num_heads; ++head) {
+    for (int kv_head = 0; kv_head < m_p.num_kv_heads; ++kv_head) {
       const uint64_t key_base =
-          static_cast<uint64_t>(layer) * bytes_per_layer +
-          static_cast<uint64_t>(head)  * bytes_per_head;
+          static_cast<uint64_t>(layer)   * bytes_per_layer +
+          static_cast<uint64_t>(kv_head) * bytes_per_head;
       const uint64_t value_base = key_base;  // K and V live in separate VA regions
 
       // K-side: write query and MAC against each cache-line block of the K row.
@@ -130,9 +136,9 @@ std::vector<Request> PimCommandGen::decode_step(
                               Request::Type::PIM_MAC_AB,
                               request_id, on_complete);
       }
-      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, head, 1)),
+      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, kv_head, 1)),
                             Request::Type::PIM_MV_SB, request_id, on_complete);
-      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, head, 2)),
+      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, kv_head, 2)),
                             Request::Type::PIM_SFM,   request_id, on_complete);
 
       // V-side: broadcast prob vector and MAC against each cache-line block of V.
@@ -148,11 +154,11 @@ std::vector<Request> PimCommandGen::decode_step(
                               Request::Type::PIM_MAC_AB,
                               request_id, on_complete);
       }
-      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, head, 3)),
+      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, kv_head, 3)),
                             Request::Type::PIM_MV_SB,  request_id, on_complete);
       // BARRIER is fire-and-forget: empty callback so it does not decrement
       // the outstanding-counter (matches serving1_5).
-      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, head, 4)),
+      commands.emplace_back(static_cast<Addr_t>(control_addr(request_id, layer, kv_head, 4)),
                             Request::Type::PIM_BARRIER, request_id,
                             std::function<void(Request&)>{});
     }

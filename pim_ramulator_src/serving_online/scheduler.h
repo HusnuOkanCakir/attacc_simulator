@@ -149,9 +149,10 @@ class Scheduler {
   // per-decode-step delta during growth.
   uint64_t kv_bytes_for_ctx(int ctx_tokens) const;
 
-  // KV bytes produced per decode token per side (= num_layers * num_heads
+  // KV bytes produced per decode token per side (= num_layers * num_kv_heads
   // * d_head * dtype_bytes). Used by tail-trim to convert a byte delta into
-  // a token count.
+  // a token count. Note: scales with num_kv_heads (MQA/GQA-aware), not
+  // num_heads (the Q-projection head count).
   uint64_t kv_bytes_per_token_per_side() const;
 
   // Sum of predicted final KV footprint (per-side × 2) across all in-flight
