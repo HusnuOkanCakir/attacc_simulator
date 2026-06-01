@@ -1,19 +1,13 @@
-add_library(ramulator-dram OBJECT)
+add_subdirectory(base)
+add_subdirectory(frontend)
+add_subdirectory(translation)
+add_subdirectory(memory_system)
+add_subdirectory(addr_mapper)
+add_subdirectory(dram)
+add_subdirectory(dram_controller)
 
 target_sources(
-  ramulator-dram PRIVATE
-  dram.h  node.h  spec.h  lambdas.h  
-  
-  lambdas/preq.h  lambdas/rowhit.h  lambdas/rowopen.h 
-
-  impl/LPDDR5.cpp
-  impl/LPDDR5-PIM.cpp
-  impl/HBM3.cpp
-  impl/HBM3-PIM.cpp
-)
-
-target_link_libraries(
-  ramulator
-  PRIVATE
-  ramulator-dram
+  ramulator-exe
+  PRIVATE 
+  main.cpp
 )
