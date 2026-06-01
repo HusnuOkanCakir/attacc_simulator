@@ -165,6 +165,10 @@ class Runtime {
     cmd_params.dtype_bytes  = cfg.dtype_bytes;
     if (cfg.pim_command_mode == "simple") {
       cmd_params.mode = PimCommandGen::Mode::Simple;
+    } else if (cfg.pim_command_mode == "attacc_qbroadcast") {
+      cmd_params.mode = PimCommandGen::Mode::AttAccQBroadcast;
+    } else if (cfg.pim_command_mode == "bank_stripe") {
+      cmd_params.mode = PimCommandGen::Mode::BankStripe;
     } else {
       cmd_params.mode = PimCommandGen::Mode::Realistic;
     }
@@ -288,6 +292,17 @@ class Runtime {
         && m_active_task->route == m_cfg.pim_route_name
         && m_issue_done
         && m_pim_outstanding == 0) {
+      // Part 1b: capture the ACTUAL Ramulator2 drain BEFORE we fast-forward
+      // m_clk to the cost-table target. This is what later gets cached as
+      // drain_clk in complete_active_task_if_ready(), so the cache reflects
+      // measured DRAM cycles per (mode, shape) rather than the mode-agnostic
+      // cost-table prediction. We only capture once per task (the first tick
+      // this branch is taken).
+      if (!m_active_task_drain_captured) {
+        m_active_task_drain_clk_pim_done = (m_clk > m_clk_at_task_start)
+                                           ? (m_clk - m_clk_at_task_start) : 0;
+        m_active_task_drain_captured = true;
+      }
       const double target = m_active_task->start_ms
                           + std::max({m_active_task->gpu_ms,
                                       m_active_task->pim_ms,
@@ -707,6 +722,68 @@ class Runtime {
           << req.preempt_count << ','
           << req.tail_trim_tokens << '\n';
     }
+
+    write_queue_snapshots();
+  }
+
+  // Phase E telemetry: drain the scheduler's queue-event log into two
+  // parallel files in the same directory as requests_out.csv:
+  //   queue_snapshots.csv  — machine-parseable; mirrors the old
+  //                          guard0_queue_snapshots.csv schema.
+  //   queue_snapshots.txt  — human-readable mirror in the
+  //                          guard0_queue_snapshots.txt format.
+  // Called once from finalize() right after the requests CSV is written.
+  void write_queue_snapshots() const {
+    const auto& events = m_scheduler.queue_events();
+    if (events.empty()) return;
+
+    // Derive sibling file paths from requests_out_csv.
+    std::string base = m_cfg.requests_out_csv;
+    auto slash = base.find_last_of('/');
+    std::string dir = (slash == std::string::npos) ? std::string(".")
+                                                   : base.substr(0, slash);
+    const std::string csv_path = dir + "/queue_snapshots.csv";
+    const std::string txt_path = dir + "/queue_snapshots.txt";
+
+    std::ofstream csv(csv_path);
+    std::ofstream txt(txt_path);
+    if (!csv.is_open() || !txt.is_open()) return;  // best-effort; don't crash
+
+    csv << "event_index,sim_now_ms,event,request_id,reason,wait_ms,"
+           "waiting_admission_count,waiting_queue_order,note\n";
+
+    for (const auto& ev : events) {
+      // CSV row.
+      csv << ev.event_index << ','
+          << ev.sim_now_ms << ','
+          << ev.event << ','
+          << ev.request_id << ','
+          << ev.reason << ','
+          << ev.wait_ms << ','
+          << ev.queue_order.size() << ',';
+      // queue_order serialized as `[a,b,c]` (no internal commas to confuse
+      // simple CSV parsers — wrap in brackets).
+      csv << "\"[";
+      for (size_t i = 0; i < ev.queue_order.size(); ++i) {
+        if (i) csv << ' ';
+        csv << ev.queue_order[i];
+      }
+      csv << "]\","
+          << ev.note << '\n';
+
+      // Human-readable TXT row matching guard0_queue_snapshots.txt.
+      txt << '[' << ev.event_index << "] t=" << ev.sim_now_ms << "ms ";
+      txt << "queue=[";
+      for (size_t i = 0; i < ev.queue_order.size(); ++i) {
+        if (i) txt << ',';
+        txt << ev.queue_order[i];
+      }
+      txt << "] " << ev.event << " r" << ev.request_id;
+      if (!ev.reason.empty()) txt << " reason=" << ev.reason;
+      if (ev.wait_ms > 0.0)   txt << " wait=" << ev.wait_ms << "ms";
+      if (!ev.note.empty())   txt << "  // " << ev.note;
+      txt << '\n';
+    }
   }
 
   void print_stats(YAML::Emitter& emitter,
@@ -735,6 +812,7 @@ class Runtime {
     emitter << YAML::Key << "full_evict_count"  << YAML::Value << m_scheduler.full_evict_count();
     emitter << YAML::Key << "tokens_recomputed" << YAML::Value << m_scheduler.tokens_recomputed();
     emitter << YAML::Key << "predictive_holds"  << YAML::Value << m_scheduler.predictive_holds();
+    emitter << YAML::Key << "admission_violation_holds" << YAML::Value << m_scheduler.admission_violation_holds();
     emitter << YAML::Key << "kv_scheduler_policy" << YAML::Value << m_cfg.kv_scheduler_policy;
     emitter << YAML::Key << "route_counts"      << YAML::Value << YAML::BeginMap;
     emitter << YAML::Key << m_cfg.gpu_route_name << YAML::Value << gpu_routes;
@@ -751,6 +829,48 @@ class Runtime {
     emitter << YAML::Key << "pim_cache_misses"       << YAML::Value << m_pim_cache_total_misses;
     emitter << YAML::Key << "pim_cache_distinct_shapes" << YAML::Value
             << m_pim_shape_cache.size();
+
+    // Phase E telemetry: per-step decode-batch-size aggregates. Mirrors the
+    // old Python trace_replay/simulator.py decode_batching dict format so
+    // existing analysis scripts (plot_v5_energy_bs_sweep_results.py et al.)
+    // and the new tools/plot_decode_batching.py both consume the same keys.
+    const auto& bsv = m_scheduler.decode_batch_sizes();
+    emitter << YAML::Key << "decode_batching" << YAML::Value << YAML::BeginMap;
+    emitter << YAML::Key << "enabled"
+            << YAML::Value << (m_cfg.max_decode_batch_size > 1);
+    emitter << YAML::Key << "num_decode_steps"
+            << YAML::Value << bsv.size();
+    {
+      double mean_bs = 0.0;
+      if (!bsv.empty()) {
+        double sum = 0.0;
+        for (int b : bsv) sum += static_cast<double>(b);
+        mean_bs = sum / static_cast<double>(bsv.size());
+      }
+      emitter << YAML::Key << "mean_batch_size" << YAML::Value << mean_bs;
+    }
+    {
+      int max_bs = 0;
+      for (int b : bsv) if (b > max_bs) max_bs = b;
+      emitter << YAML::Key << "max_batch_size_achieved" << YAML::Value << max_bs;
+    }
+    emitter << YAML::Key << "max_batch_size_configured"
+            << YAML::Value << m_cfg.max_decode_batch_size;
+    {
+      // histogram[i] = count of steps at batch_size i+1, sized by
+      // max(configured, achieved). Flow-style sequence stays on one line.
+      int max_seen = m_cfg.max_decode_batch_size;
+      for (int b : bsv) if (b > max_seen) max_seen = b;
+      std::vector<size_t> histogram(static_cast<size_t>(std::max(1, max_seen)), 0);
+      for (int b : bsv)
+        if (b >= 1 && b <= max_seen) histogram[static_cast<size_t>(b - 1)]++;
+      emitter << YAML::Key << "histogram"
+              << YAML::Value << YAML::Flow << YAML::BeginSeq;
+      for (size_t c : histogram) emitter << c;
+      emitter << YAML::EndSeq;
+    }
+    emitter << YAML::EndMap;
+
     emitter << YAML::EndMap << YAML::Newline;
   }
 
@@ -804,9 +924,11 @@ class Runtime {
       }
     }
 
-    // Advance the GPU and PIM free-time clocks.
+    // Advance the GPU free-time clock. The PIM clock is committed below,
+    // AFTER a possible cache-hit override of task.pim_ms (Option C Part 1):
+    // for PIM-decode cache hits the bus-time reservation reflects the
+    // measured drain rather than the mode-agnostic cost-table prediction.
     m_gpu_free_ms = std::max(m_gpu_free_ms, start_ms) + task.gpu_ms;
-    m_pim_free_ms = std::max(m_pim_free_ms, start_ms) + task.pim_ms;
 
     // Reset PIM command state.
     m_pending_pim_requests.clear();
@@ -823,11 +945,16 @@ class Runtime {
     m_task_wall_start              = wall_clock::now();
     m_clk_at_task_start            = m_clk;
     m_active_task_was_cache_hit    = false;
+    m_active_task_drain_clk_pim_done = 0;
+    m_active_task_drain_captured     = false;
 
-    // For PIM decode tasks: consult the per-shape cache before generating
-    // commands. On hit, fast-forward by max(cost_table, cached_drain) and
-    // skip Ramulator entirely. On miss, fall through to the inline path
-    // and capture drain_clk in complete_active_task_if_ready().
+    // For PIM decode tasks: consult the per-shape cache BEFORE committing
+    // PIM bus time. On hit, override task.pim_ms / task.e2e_ms with the
+    // measured drain (cached_drain_clk / cycles_per_ms) so the fast-forward
+    // in tick() and the m_pim_free_ms commit below both reflect the actual
+    // simulated DRAM cost of this mode's command stream. Skip command
+    // generation and Ramulator drain on hit.
+    bool cache_hit = false;
     if (task.phase == "decode" && task.route == m_cfg.pim_route_name) {
       if (m_cfg.pim_cache_enabled) {
         const PimShapeKey key{task.route,
@@ -835,14 +962,21 @@ class Runtime {
                               task.batch_size};
         auto it = m_pim_shape_cache.find(key);
         if (it != m_pim_shape_cache.end()) {
-          // Cache hit: skip command generation and Ramulator drain.
+          // Cache hit: override task timings with measured drain and skip
+          // command generation / Ramulator drain.
           it->second.hits++;
           m_pim_cache_total_hits++;
           m_active_task_was_cache_hit = true;
+          const double drain_ms = (m_cycles_per_ms > 0.0)
+              ? (static_cast<double>(it->second.drain_clk) / m_cycles_per_ms)
+              : 0.0;
+          // Pure override: trust the simulator measurement absolutely so
+          // mode-specific command-emission gains (e.g. bank_stripe sharing
+          // K/V MACs across the batch) translate into shorter request
+          // finish times. The cost-table value is discarded here.
+          task.pim_ms = drain_ms;
+          task.e2e_ms = drain_ms;
           if (m_debug_log.is_open()) {
-            const double drain_ms = (m_cycles_per_ms > 0.0)
-                ? (static_cast<double>(it->second.drain_clk) / m_cycles_per_ms)
-                : 0.0;
             dlog(sfmt("[%10.3fms] CACHE_HIT   route=%-20s  ctx_bucket=%4d  bs=%d  "
                       "ctx=%5d  drain_clk=%llu  drain_ms=%.3f  hits=%zu",
                       start_ms, task.route.c_str(),
@@ -851,55 +985,84 @@ class Runtime {
                       (unsigned long long)it->second.drain_clk,
                       drain_ms, it->second.hits));
           }
-          // Hit path: m_issue_done stays true, no commands pumped, no
-          // outstanding callbacks. complete_active_task_if_ready() will
-          // see pim_done=true immediately and finish the task on the
-          // existing fast-forward in tick().
-          m_active_task = std::move(task);
-          return;
-        }
-        // Cache miss: counted now; drain_clk recorded on completion.
-        m_pim_cache_total_misses++;
-        if (m_debug_log.is_open()) {
-          dlog(sfmt("[%10.3fms] CACHE_MISS  route=%-20s  ctx_bucket=%4d  bs=%d  "
-                    "ctx=%5d  (will measure inline)",
-                    start_ms, task.route.c_str(),
-                    key.ctx_bucket, key.batch_size,
-                    task.context_tokens));
+          cache_hit = true;
+        } else {
+          // Cache miss: counted now; drain_clk recorded on completion.
+          // task.pim_ms / task.e2e_ms remain at cost-table values for this
+          // first-of-shape task. Subsequent same-shape tasks hit the cache
+          // and get the drain-driven override above.
+          m_pim_cache_total_misses++;
+          if (m_debug_log.is_open()) {
+            dlog(sfmt("[%10.3fms] CACHE_MISS  route=%-20s  ctx_bucket=%4d  bs=%d  "
+                      "ctx=%5d  (will measure inline)",
+                      start_ms, task.route.c_str(),
+                      key.ctx_bucket, key.batch_size,
+                      task.context_tokens));
+          }
         }
       }
+    }
+
+    // Commit PIM bus time using (possibly drain-overridden) task.pim_ms.
+    // For cache-hit decode tasks this reflects the actual simulated DRAM
+    // cost; for cache-miss tasks and non-PIM-decode tasks it stays at
+    // the cost-table prediction.
+    m_pim_free_ms = std::max(m_pim_free_ms, start_ms) + task.pim_ms;
+
+    if (cache_hit) {
+      // Hit path: m_issue_done stays true, no commands pumped, no
+      // outstanding callbacks. complete_active_task_if_ready() will
+      // see pim_done=true immediately and finish the task on the
+      // existing fast-forward in tick().
+      m_active_task = std::move(task);
+      return;
+    }
+
+    if (task.phase == "decode" && task.route == m_cfg.pim_route_name) {
       m_issue_done = false;
+      // Build per-request id + ctx vectors for the batched command generator.
+      // For Realistic / Simple modes this concatenates per-request streams
+      // (identical to the prior per-request loop). For AttAccQBroadcast /
+      // BankStripe it emits one shared command stream amortized across B.
+      std::vector<int> batch_ids;
+      std::vector<int> batch_ctxs;
+      batch_ids.reserve(task.request_indices.size());
+      batch_ctxs.reserve(task.request_indices.size());
+      int max_ctx_in_batch = 0;
       for (const int idx : task.request_indices) {
         const auto& req = m_scheduler.requests()[idx];
         const int ctx_now = current_context_tokens(req);
-        auto on_complete = [this](Request&) { m_completed_callback_events++; };
-        auto t0 = wall_clock::now();
-        auto cmds = m_command_gen->decode_step(
-            req.id, ctx_now, on_complete);
-        const auto elapsed = wall_clock::now() - t0;
-        m_t_cmd_gen += elapsed;
-
-        // Per-call CMD_GEN diagnostic: how much wall-time did decode_step()
-        // spend constructing this request's command vector, and what's the
-        // per-element cost? Lets us directly test the hypothesis that
-        // online command generation is the wall-clock bottleneck.
-        if (m_debug_log.is_open()) {
-          const size_t ncmds = cmds.size();
-          const double wall_ms =
-              std::chrono::duration<double, std::milli>(elapsed).count();
-          const double per_cmd_ns = (ncmds > 0)
-              ? (std::chrono::duration<double, std::nano>(elapsed).count()
-                 / static_cast<double>(ncmds))
-              : 0.0;
-          dlog(sfmt("[%10.3fms] CMD_GEN     req=%3d  ctx=%5d  cmds=%zu  "
-                    "wall_ms=%.3f  per_cmd_ns=%.1f",
-                    start_ms, req.id, ctx_now, ncmds, wall_ms, per_cmd_ns));
-        }
-
-        m_pending_pim_requests.insert(m_pending_pim_requests.end(),
-                                      std::make_move_iterator(cmds.begin()),
-                                      std::make_move_iterator(cmds.end()));
+        batch_ids.push_back(req.id);
+        batch_ctxs.push_back(ctx_now);
+        max_ctx_in_batch = std::max(max_ctx_in_batch, ctx_now);
       }
+      auto on_complete = [this](Request&) { m_completed_callback_events++; };
+      auto t0 = wall_clock::now();
+      auto cmds = m_command_gen->decode_step_batched(
+          batch_ids, batch_ctxs, on_complete);
+      const auto elapsed = wall_clock::now() - t0;
+      m_t_cmd_gen += elapsed;
+
+      // Per-call CMD_GEN diagnostic: how much wall-time did the batched
+      // generator spend, and how many commands did it emit? Useful for
+      // checking that batched modes produce fewer commands than Realistic.
+      if (m_debug_log.is_open()) {
+        const size_t ncmds = cmds.size();
+        const double wall_ms =
+            std::chrono::duration<double, std::milli>(elapsed).count();
+        const double per_cmd_ns = (ncmds > 0)
+            ? (std::chrono::duration<double, std::nano>(elapsed).count()
+               / static_cast<double>(ncmds))
+            : 0.0;
+        dlog(sfmt("[%10.3fms] CMD_GEN     bs=%zu  max_ctx=%5d  cmds=%zu  "
+                  "wall_ms=%.3f  per_cmd_ns=%.1f",
+                  start_ms, batch_ids.size(), max_ctx_in_batch,
+                  ncmds, wall_ms, per_cmd_ns));
+      }
+
+      m_pending_pim_requests.insert(m_pending_pim_requests.end(),
+                                    std::make_move_iterator(cmds.begin()),
+                                    std::make_move_iterator(cmds.end()));
     }
 
     // Log task start (before move — use local `task`, not m_active_task).
@@ -1060,8 +1223,16 @@ class Runtime {
       const PimShapeKey key{m_active_task->route,
                             ctx_bucket(m_active_task->context_tokens),
                             m_active_task->batch_size};
-      const Clk_t drain_clk = (m_clk > m_clk_at_task_start)
-                              ? (m_clk - m_clk_at_task_start) : 0;
+      // Part 1b: prefer the pre-fast-forward drain (captured in tick() the
+      // first cycle all PIM cmds were drained). Without this we'd record
+      // m_clk - m_clk_at_task_start, which is post-fast-forward and equals
+      // the cost-table-predicted target rather than the measured drain.
+      // Fall back to the post-fast-forward delta if capture didn't fire
+      // (defensive — shouldn't happen for a real PIM-decode miss).
+      const Clk_t drain_clk = m_active_task_drain_captured
+                              ? m_active_task_drain_clk_pim_done
+                              : ((m_clk > m_clk_at_task_start)
+                                 ? (m_clk - m_clk_at_task_start) : 0);
       m_pim_shape_cache[key] = PimShapeStats{
           drain_clk, m_pending_pim_requests.size(), 0};
       if (m_debug_log.is_open()) {
@@ -1135,6 +1306,13 @@ class Runtime {
   bool   m_active_task_was_cache_hit = false;
   size_t m_pim_cache_total_hits      = 0;
   size_t m_pim_cache_total_misses    = 0;
+
+  // Part 1b: capture actual Ramulator2 drain BEFORE the fast-forward at
+  // tick():290-303 bumps m_clk to the cost-table target. Without this, the
+  // cache stores cost-table predictions instead of measured drain cycles
+  // (which makes Part 1's pim_ms override a no-op across modes).
+  Clk_t  m_active_task_drain_clk_pim_done = 0;
+  bool   m_active_task_drain_captured     = false;
 
   static int ctx_bucket(int context_tokens) {
     return (context_tokens + kCacheBucketTokens - 1) / kCacheBucketTokens;
@@ -1212,6 +1390,7 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
     // Admission
     cfg.admission_max_wait_ms       = param<float>("admission_max_wait_ms").default_val(0.0f);
     cfg.admission_retry_interval_ms = param<float>("admission_retry_interval_ms").default_val(1.0f);
+    cfg.admission_violation_budget  = param<int>("admission_violation_budget").default_val(-1);
     cfg.kv_oom_policy               = param<std::string>("kv_oom_policy").default_val("hold");
     cfg.kv_oom_hold_limit_ms        = param<float>("kv_oom_hold_limit_ms").default_val(50.0f);
     cfg.kv_scheduler_policy         = param<std::string>("kv_scheduler_policy")
@@ -1278,9 +1457,13 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
           "ServingOnlineFrontend: kv_oom_policy must be 'hold', 'fallback_gpu', or 'hold_then_fallback'");
     }
     // Validate pim_command_mode.
-    if (cfg.pim_command_mode != "realistic" && cfg.pim_command_mode != "simple") {
+    if (cfg.pim_command_mode != "realistic" &&
+        cfg.pim_command_mode != "simple" &&
+        cfg.pim_command_mode != "attacc_qbroadcast" &&
+        cfg.pim_command_mode != "bank_stripe") {
       throw ConfigurationError(
-          "ServingOnlineFrontend: pim_command_mode must be 'realistic' or 'simple'");
+          "ServingOnlineFrontend: pim_command_mode must be one of "
+          "'realistic', 'simple', 'attacc_qbroadcast', 'bank_stripe'");
     }
     // Validate kv_scheduler_policy.
     if (cfg.kv_scheduler_policy != "guaranteed_no_evict" &&

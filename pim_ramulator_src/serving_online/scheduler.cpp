@@ -94,7 +94,15 @@ std::optional<ActiveTask> Scheduler::tick(double now_ms,
                                           double pim_free_ms) {
   enqueue_arrivals(now_ms);
   process_admission(now_ms, gpu_free_ms, pim_free_ms);
-  return pick_task(now_ms, gpu_free_ms, pim_free_ms);
+  auto task = pick_task(now_ms, gpu_free_ms, pim_free_ms);
+  // Phase E (telemetry): record the actual batch size of any decode task
+  // launched this tick. pick_task is const, so we record here in the
+  // (non-const) tick path. Prefill tasks are recorded separately if needed
+  // — for now we only need decode-batch stats.
+  if (task.has_value() && task->phase == "decode") {
+    record_decode_batch_size(task->batch_size);
+  }
+  return task;
 }
 
 // ─── enqueue_arrivals() ──────────────────────────────────────────────────────
@@ -127,10 +135,49 @@ void Scheduler::enqueue_arrivals(double now_ms) {
               src.arrival_ms, src.id, src.context_tokens, src.generated_tokens,
               rr.deadline_ms < 0 ? -1.0 : rr.deadline_ms));
     const int new_idx = static_cast<int>(m_requests.size());
+    const int req_id = m_requests.back().id;  // before move; but m_requests was already pushed
+    (void)req_id;  // unused — using src.id below for the snapshot tag
     m_requests.push_back(std::move(rr));
     m_active_count++;
     m_waiting_admission.insert(new_idx);   // request enters in WaitingAdmission
+    log_queue_event(now_ms, "arrival_enqueued", src.id);
   }
+}
+
+// ─── log_queue_event() — Phase E telemetry ──────────────────────────────────
+// Append one QueueEvent capturing the current admission-queue order. No I/O
+// here — events are drained at end-of-run by frontend.cpp::write_queue_snapshots().
+void Scheduler::log_queue_event(double now_ms, const std::string& event,
+                                 int req_id, const std::string& reason,
+                                 double wait_ms, const std::string& note) {
+  if (m_queue_events.size() >= kMaxQueueEvents) {
+    if (!m_queue_events_truncated_logged) {
+      QueueEvent ev;
+      ev.event_index = m_queue_event_counter++;
+      ev.sim_now_ms  = now_ms;
+      ev.event       = "truncated";
+      ev.request_id  = -1;
+      ev.note        = "queue_events log capped at kMaxQueueEvents";
+      m_queue_events.push_back(std::move(ev));
+      m_queue_events_truncated_logged = true;
+    }
+    return;
+  }
+  QueueEvent ev;
+  ev.event_index = m_queue_event_counter++;
+  ev.sim_now_ms  = now_ms;
+  ev.event       = event;
+  ev.request_id  = req_id;
+  ev.reason      = reason;
+  ev.wait_ms     = wait_ms;
+  // Capture the first 8 admission-queue ids (in arbitrary order — unordered_set).
+  ev.queue_order.reserve(std::min<size_t>(8, m_waiting_admission.size()));
+  for (int idx : m_waiting_admission) {
+    if (ev.queue_order.size() >= 8) break;
+    ev.queue_order.push_back(m_requests[idx].id);
+  }
+  ev.note = note;
+  m_queue_events.push_back(std::move(ev));
 }
 
 // ─── kv_bytes_per_side() ─────────────────────────────────────────────────────
@@ -262,9 +309,21 @@ std::optional<Scheduler::PredictionEstimate> Scheduler::predict_finish_detail(
   } else {
     queued_decode_ms = batched_decode_ms(pim_decode) + batched_decode_ms(gpu_decode);
   }
-  // Use the hardware-free time relevant to the chosen route so GPU predictions
-  // don't inflate when PIM hardware is draining.
-  const double hw_free_ms = (route == m_cfg.pim_route_name) ? pim_free_ms : gpu_free_ms;
+  // Phase D — cross-resource contention accounting:
+  //   PIM-route tasks consume BOTH gpu_free_ms (for FFN+projection) AND
+  //   pim_free_ms (for attention). If a candidate D is admitted on PIM
+  //   while gpu_free_ms is busy from prior PIM tasks' FFN portions, D
+  //   has to wait for the GPU as well. Without this max, the predictor
+  //   systematically underestimates PIM's true cost → too many requests
+  //   route to PIM → GPU queue silently grows from PIM tasks' FFN work
+  //   → overflow GPU-routed requests pay the bill in tail latency
+  //   (E5, 2026-05-27: hybrid p99 7.7 s for 10% GPU traffic vs 524 ms
+  //    pure GPU-only).
+  //   GPU-route's start uses gpu_free_ms only (unchanged) since pure
+  //   GPU tasks don't touch pim_free_ms.
+  const double hw_free_ms = (route == m_cfg.pim_route_name)
+      ? std::max(pim_free_ms, gpu_free_ms)
+      : gpu_free_ms;
   const double base_ms = std::max(now_ms, hw_free_ms);
   const double start = base_ms + queued_prefill_ms;
   const double decode_total =
@@ -356,6 +415,79 @@ std::string Scheduler::choose_route(int context_tokens, int generated_tokens,
   return best->route;
 }
 
+// ─── newly_violated_for_route() — Phase C admission-control helper ──────────
+
+int Scheduler::newly_violated_for_route(const RuntimeRequest& D,
+                                         const std::string& route,
+                                         double now_ms,
+                                         double gpu_free_ms,
+                                         double pim_free_ms) const {
+  // Phase C′: predict_finish-based interference model.
+  //
+  // The original per-step delta model (est(N+1) - est(N)) returned 0 in
+  // practice because the cost-table predicts batching is beneficial —
+  // adding a request to a sub-saturated batch typically REDUCES per-step
+  // decode time. Real interference comes from D consuming hardware time:
+  // its prefill/decode advance gpu_free_ms (and pim_free_ms for PIM-routed),
+  // delaying in-flight requests gated by those clocks.
+  //
+  // We project the hardware-free clocks forward as if D were admitted on
+  // `route` right now, then call predict_finish() for each in-flight r
+  // under both the OLD and NEW clocks. The queue term and batching gain
+  // are already inside predict_finish — we don't double-count them.
+
+  // 1. Estimate D's hardware footprint on `route` at single-request bs (the
+  //    same bs used everywhere predict_finish is called).
+  auto D_est = m_table->estimate(route, D.context_tokens, D.generated_tokens, 1);
+  if (!D_est) return 0;  // no cost data → can't reason → don't hold
+
+  // 2. Collect in-flight requests on `route` (WaitingPrefill ∪ WaitingDecode).
+  std::vector<int> inflight;
+  inflight.reserve(m_waiting_prefill.size() + m_waiting_decode.size());
+  for (int i : m_waiting_prefill) {
+    if (m_requests[i].route == route) inflight.push_back(i);
+  }
+  for (int i : m_waiting_decode) {
+    if (m_requests[i].route == route) inflight.push_back(i);
+  }
+  if (inflight.empty()) return 0;  // empty batch — D affects nobody
+
+  // 3. Project gpu_free_ms / pim_free_ms forward by D's admission.
+  //    - Prefill is GPU-only on both routes (cost-table has prefill_pim_ms = 0).
+  //    - Decode: D.decode_gpu_ms × (Lout-1) on GPU; D.decode_pim_ms × (Lout-1) on PIM.
+  //    - For a GPU-route admission, only gpu_free_ms advances.
+  //    - For a PIM-route admission, BOTH advance (PIM-routed decode also runs
+  //      FFN/projections on GPU in parallel).
+  const double base_gpu = std::max(now_ms, gpu_free_ms);
+  const double base_pim = std::max(now_ms, pim_free_ms);
+  const double decode_tokens = static_cast<double>(D_est->decode_tokens);
+  double new_gpu_free = base_gpu + D_est->prefill_e2e_ms
+                      + decode_tokens * D_est->decode_gpu_ms;
+  double new_pim_free = pim_free_ms;  // GPU-route doesn't touch PIM clock
+  if (route == m_cfg.pim_route_name) {
+    new_pim_free = base_pim + decode_tokens * D_est->decode_pim_ms;
+  }
+
+  // 4. For each in-flight r, recompute predict_finish under both clock sets
+  //    and count crossings of r.deadline_ms.
+  int newly_violated = 0;
+  for (int i : inflight) {
+    const auto& r = m_requests[i];
+    if (r.deadline_ms < 0.0) continue;  // SLO disabled for r
+
+    const double r_old = predict_finish(r.route, r.context_tokens,
+                                        r.generated_tokens, now_ms,
+                                        gpu_free_ms, pim_free_ms);
+    if (r_old < 0.0) continue;                       // no cost data for r
+    if (r_old > r.deadline_ms) continue;             // already violated → exclude
+    const double r_new = predict_finish(r.route, r.context_tokens,
+                                        r.generated_tokens, now_ms,
+                                        new_gpu_free, new_pim_free);
+    if (r_new > r.deadline_ms) ++newly_violated;
+  }
+  return newly_violated;
+}
+
 // ─── process_admission() ─────────────────────────────────────────────────────
 
 void Scheduler::process_admission(double now_ms, double gpu_free_ms,
@@ -385,6 +517,42 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
     // Choose the best route.
     std::string route = choose_route(req->context_tokens, req->generated_tokens,
                                      now_ms, gpu_free_ms, pim_free_ms, req->deadline_ms);
+
+    // Phase C‴ — admission-control violation budget, HOLD-ONLY (no reroute).
+    //
+    // Spec (user-confirmed 2026-05-24, after Phase C″ wrong-direction):
+    //   Check the min_finish-chosen route's newly_violated count. If it
+    //   exceeds the budget, HOLD D in WaitingAdmission. Do NOT try the
+    //   alternative route — empirical evidence (E4 v2 + v3 OpenVLA x=0)
+    //   showed that rerouting D to the slower route triggers a cascade:
+    //   D piles onto PIM, PIM queue grows, subsequent admissions also
+    //   reroute to PIM, violators climb.
+    //
+    //   Hold-only matches the original user spec: when admitting D NOW
+    //   would push X+1 in-flight past deadline, wait. The natural FCFS
+    //   loop in process_admission() picks the next waiting request E;
+    //   if E doesn't violate, E gets admitted first (queue-jumping).
+    //   Held D is re-evaluated on the next tick when admission_next_retry_ms
+    //   <= now_ms — usually after a completion has freed up the route.
+    if (!route.empty() && m_cfg.admission_violation_budget >= 0) {
+      const int budget = m_cfg.admission_violation_budget;
+      const int nv_chosen = newly_violated_for_route(*req, route, now_ms,
+                                                     gpu_free_ms, pim_free_ms);
+      if (nv_chosen > budget) {
+        // Hold — no reroute attempt. Wait for in-flight to drain.
+        req->admission_next_retry_ms = now_ms + m_cfg.admission_retry_interval_ms;
+        req->admission_last_reject_reason = "violation_budget";
+        ++m_admission_violation_holds;
+        dlog(sfmt("[%10.3fms] HOLD_VIOL req=%3d  route=%s  nv_chosen=%d  "
+                  "budget=%d  retry_at=%.1fms",
+                  now_ms, req->id, route.c_str(), nv_chosen, budget,
+                  req->admission_next_retry_ms));
+        log_queue_event(now_ms, "hold", req->id, "violation_budget",
+                        now_ms - req->arrival_ms);
+        continue;
+      }
+      // nv_chosen <= budget → admit on min_finish's chosen route (no change).
+    }
 
     if (route.empty()) {
       // No route available yet.
@@ -447,6 +615,8 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
           req->admission_last_reject_reason = "predictive_pressure";
           req->admission_next_retry_ms      = now_ms + m_cfg.predictive_hold_ms;
           ++m_predictive_holds;
+          log_queue_event(now_ms, "hold", req->id, "predictive_pressure",
+                          now_ms - req->arrival_ms);
           continue;
         }
       }
@@ -512,6 +682,8 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
             req->ready_ms           = now_ms;
             req->admitted_ms        = now_ms;
             m_admitted_count++;
+            log_queue_event(now_ms, "admit_route", req->id,
+                            "kv_oom_fallback_gpu", now_ms - req->arrival_ms);
             continue;
           }
         }
@@ -524,6 +696,8 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
                   req->kv_oom_first_ms >= 0 ? now_ms - req->kv_oom_first_ms : 0.0));
         req->admission_next_retry_ms    = now_ms + m_cfg.admission_retry_interval_ms;
         req->admission_last_reject_reason = "kv_oom";
+        log_queue_event(now_ms, "hold", req->id, "kv_oom",
+                        req->kv_oom_first_ms >= 0 ? now_ms - req->kv_oom_first_ms : 0.0);
         continue;
       }
       // Reserve KV memory.
@@ -564,6 +738,8 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
     req->admitted_ms        = now_ms;
     req->admission_last_reject_reason.clear();
     m_admitted_count++;
+    log_queue_event(now_ms, "admit_route", req->id, route,
+                    now_ms - req->arrival_ms);
   }
 }
 

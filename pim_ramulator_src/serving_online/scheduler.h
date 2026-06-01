@@ -101,6 +101,38 @@ class Scheduler {
   int full_evict_count()   const { return m_full_evict_count; }
   uint64_t tokens_recomputed() const { return m_tokens_recomputed; }
   int predictive_holds()   const { return m_predictive_holds; }
+  int admission_violation_holds() const { return m_admission_violation_holds; }
+
+  // Phase E (telemetry): per-step actual decode batch sizes. Populated by
+  // pick_task() after each pick_decode_batch() that returns a non-empty
+  // cohort. Consumed by frontend.cpp print_stats() to emit the
+  // `decode_batching` block of ramulator_summary.yaml.
+  const std::vector<int>& decode_batch_sizes() const { return m_decode_batch_sizes; }
+  void record_decode_batch_size(int bs) { m_decode_batch_sizes.push_back(bs); }
+
+  // Queue-snapshot event log. One QueueEvent per state-affecting admission
+  // event (arrival, hold, admit). Drained by frontend.cpp at end-of-run
+  // into queue_snapshots.{csv,txt}. Cap at kMaxQueueEvents to bound memory
+  // on long runs; once reached, further events are silently dropped (a
+  // single truncation note is appended).
+  struct QueueEvent {
+    size_t      event_index;
+    double      sim_now_ms;
+    std::string event;          // arrival_enqueued / admit_route / hold / dequeue
+    int         request_id;
+    std::string reason;         // "" if not applicable
+    double      wait_ms;        // for holds: ms since arrival_ms
+    std::vector<int> queue_order;  // current m_waiting_admission contents (capped at 8)
+    std::string note;
+  };
+  const std::vector<QueueEvent>& queue_events() const { return m_queue_events; }
+
+  // Emit a queue-snapshot event. Caller passes the event tag, request id,
+  // optional reason / wait_ms / note. Captures the current admission queue
+  // order into the event. No-op when m_queue_events is capped out.
+  void log_queue_event(double now_ms, const std::string& event, int req_id,
+                       const std::string& reason = "", double wait_ms = 0.0,
+                       const std::string& note = "");
 
   // Earliest future time at which scheduler state may change without any
   // active task running. Returns nullopt if no future event is known.
@@ -139,6 +171,22 @@ class Scheduler {
   std::string choose_route(int context_tokens, int generated_tokens,
                            double now_ms, double gpu_free_ms, double pim_free_ms,
                            double deadline_ms) const;
+
+  // Phase C — admission-control violation budget.
+  // Count how many currently-running requests on `route` would become
+  // newly-violated if request D joined the decode batch. "Newly-violated"
+  // means a request whose cached scheduler_predicted_finish_ms <= deadline_ms
+  // would be pushed past deadline by D consuming hardware time. Phase C′:
+  // we project gpu_free_ms / pim_free_ms forward as if D were admitted on
+  // `route` (prefill on GPU + per-token decode contribution to the relevant
+  // hw clock), then recompute predict_finish() for each in-flight r under
+  // the new clocks. Counts r where r_old <= deadline < r_new. Already-
+  // violated requests are excluded.
+  int newly_violated_for_route(const RuntimeRequest& D,
+                               const std::string& route,
+                               double now_ms,
+                               double gpu_free_ms,
+                               double pim_free_ms) const;
 
   // KV bytes needed to cache all K and V tensors for one request at its
   // maximum decode context (ctx + gen - 1). Used by guaranteed_no_evict.
@@ -243,6 +291,14 @@ class Scheduler {
   int m_full_evict_count = 0;           // full-request preemptions (preempt_lru)
   uint64_t m_tokens_recomputed = 0;     // decode tokens trimmed across all events
   int m_predictive_holds = 0;           // admission holds under M3
+  int m_admission_violation_holds = 0;  // Phase C: admission holds because newly_violated > admission_violation_budget
+
+  // Phase E (telemetry) — populated lazily; consumed at end-of-run.
+  std::vector<int>        m_decode_batch_sizes;
+  std::vector<QueueEvent> m_queue_events;
+  size_t                  m_queue_event_counter = 0;
+  static constexpr size_t kMaxQueueEvents = 100000;  // ~5 MB cap
+  bool                    m_queue_events_truncated_logged = false;
 };
 
 }  // namespace Ramulator::ServingOnline

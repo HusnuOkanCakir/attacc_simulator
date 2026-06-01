@@ -44,8 +44,21 @@ class PimCommandGen {
   // ServingOnlineConfig::pim_command_mode for the semantics. Diagnostic
   // toggle for bisecting wall-clock cost (DRAM-tick vs frontend overhead).
   enum class Mode {
-    Realistic,   // full per-block sequence (default)
-    Simple,      // num_layers × num_heads × 2 PIM_MAC_AB only
+    Realistic,         // full per-block sequence, emitted PER REQUEST (default).
+                       // Total cmds for a bs=B step = B × N_L × N_KVH × (4·blocks+4).
+    Simple,            // N_L × N_KVH × 2 PIM_MAC_AB per request only.
+    AttAccQBroadcast,  // AttAcc-faithful: 1 shared Q broadcast + B per-request
+                       // K MACs + shared softmax + 1 shared V broadcast + B
+                       // per-request V MACs, per (layer, kv_head). K/V data
+                       // is still per-request (unique cache), but control +
+                       // Q/V broadcasts are amortized across the batch.
+                       // Total cmds ≈ N_L × N_KVH × (2·blocks·B + 6).
+    BankStripe,        // EXPERIMENTAL: one shared PIM_MAC_AB per block hits
+                       // all batched requests in parallel (relies on the
+                       // channel-interleaved allocator to disperse requests
+                       // across banks/channels). Total cmds ≈ N_L × N_KVH ×
+                       // (4·blocks + 4), independent of B up to num_channels.
+                       // Does not change command count when bs=1.
   };
 
   struct Params {
@@ -69,7 +82,7 @@ class PimCommandGen {
                 int pim_type_id  = Request::Type::PIM_MAC_AB);
 
   /**
-   * Generate all memory requests for one attention decode step.
+   * Generate all memory requests for one attention decode step (single request).
    *
    * For each layer and KV head, emits one Read for the full K row and one
    * for the full V row. Total = num_layers * num_kv_heads * 2 requests in
@@ -77,6 +90,10 @@ class PimCommandGen {
    *
    * Each returned Request has its callback set to `on_complete` so the caller
    * can count outstanding requests and detect when the step is finished.
+   *
+   * For modes that share commands across batched requests
+   * (AttAccQBroadcast, BankStripe), use `decode_step_batched()` instead; this
+   * single-request signature emits a bs=1 stream regardless of mode.
    *
    * @param request_id    Request identifier (must have KV allocated in PimAllocator).
    * @param context_tokens  Number of KV tokens the row covers (for VA encoding).
@@ -87,10 +104,39 @@ class PimCommandGen {
                                    int context_tokens,
                                    std::function<void(Request&)> on_complete) const;
 
+  /**
+   * Generate all memory requests for one BATCHED attention decode step.
+   *
+   * Behavior depends on `Mode`:
+   *   - Realistic / Simple: equivalent to concatenating decode_step() outputs
+   *     for each (request_id, ctx) pair. Cmd count scales linearly with bs.
+   *   - AttAccQBroadcast: emits 1 shared Q broadcast + B per-request K MACs +
+   *     1 shared softmax + 1 shared V broadcast + B per-request V MACs per
+   *     (layer, kv_head). Q/V/control commands are amortized across the batch.
+   *   - BankStripe: emits 1 shared PIM_MAC_AB per block per (layer, kv_head)
+   *     that targets request 0's VA (channel-interleaved layout disperses
+   *     other requests' data onto neighbouring channels naturally).
+   *
+   * `context_tokens` is per request. The cmd stream uses
+   * max_over_batch(context_tokens) to size the block count, matching real
+   * bank-PIM hardware where all banks step in lockstep.
+   *
+   * Pre-condition: request_ids.size() == context_tokens.size() and >= 1.
+   */
+  std::vector<Request> decode_step_batched(
+      const std::vector<int>& request_ids,
+      const std::vector<int>& context_tokens,
+      std::function<void(Request&)> on_complete) const;
+
   // Returns the number of Requests that decode_step() will produce for the
   // given parameters (without actually generating them). Useful for sizing
   // the pending-callback counter before issuing.
   int decode_step_count(int context_tokens) const;
+
+  // Batched analogue of decode_step_count(). Uses the max context across the
+  // batch (matching decode_step_batched()'s block-size choice) and the
+  // current Mode to compute the exact cmd count.
+  int decode_step_count_batched(const std::vector<int>& context_tokens) const;
 
  private:
   // Synthesize a non-KV "control" address for PIM_MV_SB / PIM_SFM /

@@ -206,6 +206,20 @@ struct ServingOnlineConfig {
   double admission_max_wait_ms      = 0.0;  // 0 = no timeout (hold forever until feasible)
   double admission_retry_interval_ms = 1.0; // ms between admission retries
 
+  // Phase C — admission-control violation budget. When a request D is
+  // considered for admission, the scheduler can predict how many
+  // currently-running requests would become newly-violated if D joined the
+  // decode batch (per-step time grows from bs=N to bs=N+1, slowing every
+  // in-flight request). If that count exceeds this budget, D is held in
+  // WaitingAdmission and the FCFS loop moves on to the next candidate.
+  // Values:
+  //   -1 (default) — disabled, preserves prior behavior.
+  //    0           — strict, hold D if any in-flight request would be newly violated.
+  //    N >= 1      — tolerate up to N newly-violated in-flight requests.
+  // Already-violated requests are excluded from the count (we don't penalize
+  // D for adding pain to requests that already missed their deadline).
+  int admission_violation_budget = -1;
+
   // Behavior when the chosen PIM route hits KV OOM at admission time.
   //   "hold"         — (default) keep the request in WaitingAdmission and retry
   //                    once KV memory is freed. Preserves route choice at the
@@ -303,18 +317,33 @@ struct ServingOnlineConfig {
   // 0 disables (Pi0). 256 is typical for OpenVLA's SigLIP/DINO encoder.
   int vision_prefix_tokens = 0;
 
-  // PIM command stream complexity. Diagnostic A/B knob:
-  //   "realistic" (default) — full per-block sequence:
-  //                           (PIM_WR_GB+PIM_MAC_AB)×blocks K-side,
-  //                           PIM_MV_SB+PIM_SFM,
-  //                           (PIM_MV_GB+PIM_MAC_AB)×blocks V-side,
-  //                           PIM_MV_SB+PIM_BARRIER, per (layer, head).
-  //                           Total: num_layers × num_heads × (4*blocks + 4).
-  //   "simple"              — one PIM_MAC_AB per (layer, head) for K and one
-  //                           for V, no control commands. Total:
-  //                           num_layers × num_heads × 2. Useful for
-  //                           bisecting whether DRAM-tick cost or frontend
-  //                           overhead dominates wall-clock time.
+  // PIM command stream complexity. Determines how many DRAM commands the
+  // PIM command generator emits per (batched) decode step.
+  //
+  // Per-request modes (cmds scale linearly with batch_size B):
+  //   "realistic" (default) — full per-block sequence emitted per request.
+  //                           Per (layer, kv_head): (PIM_WR_GB+PIM_MAC_AB)×
+  //                           blocks K-side, PIM_MV_SB+PIM_SFM, (PIM_MV_GB+
+  //                           PIM_MAC_AB)×blocks V-side, PIM_MV_SB+PIM_BARRIER.
+  //                           Total: B × N_L × N_KVH × (4·blocks + 4).
+  //   "simple"              — two PIM_MAC_AB per (layer, kv_head, request).
+  //                           Context-independent diagnostic.
+  //
+  // Shared-command modes (Q/V broadcasts + control are amortized across the
+  // batch; K/V data MAC behavior differs):
+  //   "attacc_qbroadcast"   — AttAcc-faithful. Per (layer, kv_head): 1 PIM_WR_GB
+  //                           + B per-request K MAC_AB + 1 PIM_MV_SB + 1 PIM_SFM
+  //                           + 1 PIM_MV_GB + B per-request V MAC_AB + 1 PIM_MV_SB
+  //                           + 1 PIM_BARRIER. Total: N_L × N_KVH × (2·B·blocks + 6).
+  //                           Linear-in-B but with smaller coefficient than
+  //                           realistic (Q/V broadcasts and control hoisted).
+  //   "bank_stripe"         — Experimental. Per (layer, kv_head): 1 PIM_WR_GB
+  //                           + 1 shared MAC_AB per K block + softmax controls
+  //                           + 1 PIM_MV_GB + 1 shared MAC_AB per V block +
+  //                           final controls. Total: N_L × N_KVH × (2·blocks + 6)
+  //                           — independent of B. Models the ideal case where
+  //                           bank-level parallelism amortizes per-request
+  //                           K/V reads into a single MAC_AB window.
   std::string pim_command_mode = "realistic";
 
   // Per-shape PIM-decode cycle cache. When true (default), the runtime
