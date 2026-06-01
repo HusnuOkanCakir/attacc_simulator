@@ -57,6 +57,7 @@ SLO_E2E_MS        = 900.0   # E2E latency SLO; -1 = disabled
 SLO_TTFT_MS       = -1.0    # TTFT SLO; -1 = disabled
 KV_OOM_POLICY     = "hold"  # hold | fallback_gpu | hold_then_fallback
 KV_OOM_HOLD_LIMIT_MS = 50.0 # max hold time before GPU fallback (hold_then_fallback only)
+ADMISSION_VIOLATION_BUDGET = -1  # Phase C: -1=disabled, 0=strict, N>=1 tolerate N newly-violated
 PIM_COMMAND_MODE  = "realistic"  # realistic | simple — diagnostic A/B knob
 PIM_CACHE_ENABLED = True         # cache PIM-decode drain cycles by shape (Lever 1)
 PIM_CACHE_FILE    = ""           # persisted cache across runs (empty = disabled)
@@ -65,6 +66,7 @@ ENERGY_LATENCY_GUARD_MS         = 20.0  # used by latency_guarded_energy only
 MAX_DECODE_BATCH_SIZE           = 8     # max requests in one decode batch
 MAX_CONSECUTIVE_DECODE_BATCHES  = 4     # force a prefill after this many decodes
 PROMPT_PRIORITY                 = True  # if true, prefill always wins over decode when waiting
+GPU_ONLY                        = False # E5: disable the PIM route (force 100% GPU routing)
 
 # Model architecture (filled from MODEL_PRESETS in main()).
 NUM_LAYERS           = 18
@@ -185,6 +187,11 @@ def yaml_text(label: str, run_dir: Path) -> str:
 
     PIM_CACHE_ENABLED_YAML = "true" if PIM_CACHE_ENABLED else "false"
     PROMPT_PRIORITY_YAML   = "true" if PROMPT_PRIORITY else "false"
+    # When --gpu-only is set, the hybrid route name is replaced by a sentinel
+    # that the cost-table has no entry for. predict_finish() returns -1 for
+    # that route → choose_route() skips it → 100% of requests route to GPU.
+    # No C++ changes needed.
+    HYBRID_ROUTE_NAME = "disabled" if GPU_ONLY else "lpddr5_pim_bank"
 
     return f"""Frontend:
   impl: ServingOnlineFrontend
@@ -199,7 +206,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
   debug_log_path: {debug_log}
 
   gpu_route_name: gpu_only
-  hybrid_route_name: lpddr5_pim_bank
+  hybrid_route_name: {HYBRID_ROUTE_NAME}
 
   route_policy: {ROUTE_POLICY}
   energy_latency_guard_ms: {ENERGY_LATENCY_GUARD_MS}
@@ -211,6 +218,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
 
   admission_max_wait_ms: 150.0
   admission_retry_interval_ms: 10.0
+  admission_violation_budget: {ADMISSION_VIOLATION_BUDGET}
   kv_oom_policy: {KV_OOM_POLICY}
   kv_oom_hold_limit_ms: {KV_OOM_HOLD_LIMIT_MS}
 {policy_lines}
@@ -292,6 +300,7 @@ def _load_summary(path: Path) -> dict:
     except _yaml.YAMLError:
         return {}
     fe = data.get("Frontend", {}) or {}
+    db = fe.get("decode_batching", {}) or {}
     return {
         "admitted":          int(fe.get("admitted_requests", 0)),
         "completed":         int(fe.get("completed_requests", 0)),
@@ -302,7 +311,14 @@ def _load_summary(path: Path) -> dict:
         "full_evict_count":  int(fe.get("full_evict_count", 0)),
         "tokens_recomputed": int(fe.get("tokens_recomputed", 0)),
         "predictive_holds":  int(fe.get("predictive_holds", 0)),
+        "admission_violation_holds": int(fe.get("admission_violation_holds", 0)),
         "scheduler_policy":  str(fe.get("kv_scheduler_policy", "")),
+        # Phase E telemetry (added 2026-05-27)
+        "decode_steps":         int(db.get("num_decode_steps", 0)),
+        "decode_mean_bs":       float(db.get("mean_batch_size", 0.0)),
+        "decode_max_bs":        int(db.get("max_batch_size_achieved", 0)),
+        "decode_max_bs_config": int(db.get("max_batch_size_configured", 0)),
+        "decode_bs_histogram":  list(db.get("histogram", [])),
     }
 
 # ── Summary stats ─────────────────────────────────────────────────────────────
@@ -316,6 +332,26 @@ def summarize(label: str, csv_path: Path, summary: dict) -> dict:
     span_ms = float(d["completion_ms"].max()) if len(d) else float("nan")
     throughput_rps = len(d) / (span_ms / 1000.0) if span_ms and span_ms > 0 else float("nan")
     preempt_total = int(d["preempt_count"].sum()) if "preempt_count" in d else 0
+
+    # ── SLO violation accounting (Phase A) ────────────────────────────────────
+    # A completed request "violated SLO" iff its observed e2e_ms exceeded the
+    # configured slo_e2e_ms deadline. Reported alongside the other counters so
+    # the user can see how many admitted requests missed the deadline. We do
+    # NOT drop or hold violators — they completed, just over deadline.
+    # slo_e2e_ms <= 0 → SLO disabled → all completed requests treated as
+    # non-violators.
+    slo_e2e = float(SLO_E2E_MS)
+    if slo_e2e > 0 and len(d) > 0 and "e2e_ms" in d.columns:
+        slo_violators     = int((d["e2e_ms"] > slo_e2e).sum())
+        slo_non_violators = len(d) - slo_violators
+    else:
+        slo_violators     = 0
+        slo_non_violators = len(d)
+    slo_ttft = float(SLO_TTFT_MS)
+    if slo_ttft > 0 and len(d) > 0 and "ttft_ms" in d.columns:
+        ttft_violators = int((d["ttft_ms"] > slo_ttft).sum())
+    else:
+        ttft_violators = 0
 
     # Effective recomputation estimate: for tail mode the scheduler already
     # reports tokens_recomputed (it's summed across trim events). For the full-
@@ -344,6 +380,11 @@ def summarize(label: str, csv_path: Path, summary: dict) -> dict:
         "e2e_p99":  pct("e2e_ms",  .99),  "e2e_max":  float(d["e2e_ms"].max()) if len(d) else float("nan"),
         "span_ms":  span_ms,
         "throughput_rps": throughput_rps,
+        "slo_e2e_ms":          slo_e2e,
+        "slo_ttft_ms":         slo_ttft,
+        "slo_violators":       slo_violators,
+        "slo_non_violators":   slo_non_violators,
+        "ttft_violators":      ttft_violators,
         "admitted":          summary.get("admitted", 0),
         "dropped":           summary.get("dropped", 0),
         "kv_oom_holds":      summary.get("kv_oom_holds", 0),
@@ -352,7 +393,14 @@ def summarize(label: str, csv_path: Path, summary: dict) -> dict:
         "full_evict_count":  summary.get("full_evict_count", 0),
         "tokens_recomputed": tokens_recomputed_est,
         "predictive_holds":  summary.get("predictive_holds", 0),
+        "admission_violation_holds": summary.get("admission_violation_holds", 0),
         "scheduler_policy":  summary.get("scheduler_policy", ""),
+        # Phase E telemetry pass-through
+        "decode_steps":         summary.get("decode_steps", 0),
+        "decode_mean_bs":       summary.get("decode_mean_bs", 0.0),
+        "decode_max_bs":        summary.get("decode_max_bs", 0),
+        "decode_max_bs_config": summary.get("decode_max_bs_config", 0),
+        "decode_bs_histogram":  summary.get("decode_bs_histogram", []),
     }
 
 # ── Combined comparison plot (2×3 grid) ───────────────────────────────────────
@@ -480,10 +528,15 @@ def print_table(stats: list[dict]) -> None:
         ("Preempt count (tail/full)", lambda s: f"{s['preempt_count']} ({s['tail_trim_count']}/{s['full_evict_count']})"),
         ("Tokens recomputed",       lambda s: f"{s['tokens_recomputed']}"),
         ("Predictive holds",        lambda s: f"{s['predictive_holds']}"),
+        ("Admission viol. holds",   lambda s: f"{s['admission_violation_holds']}"),
         ("TTFT p50/p90 (ms)",       lambda s: f"{s['ttft_p50']:.0f}/{s['ttft_p90']:.0f}"),
         ("TTFT p99 (ms)",           lambda s: f"{s['ttft_p99']:.0f}"),
         ("E2E p50/p90 (ms)",        lambda s: f"{s['e2e_p50']:.0f}/{s['e2e_p90']:.0f}"),
         ("E2E p99 (ms)",            lambda s: f"{s['e2e_p99']:.0f}"),
+        ("SLO E2E violators",       lambda s: f"{s['slo_violators']}/{s['done']}" if s.get('slo_e2e_ms', -1) > 0 else "n/a"),
+        ("SLO TTFT violators",      lambda s: f"{s['ttft_violators']}/{s['done']}" if s.get('slo_ttft_ms', -1) > 0 else "n/a"),
+        ("Decode batch mean/max/cfg", lambda s: f"{s.get('decode_mean_bs', 0.0):.2f}/{s.get('decode_max_bs', 0)}/{s.get('decode_max_bs_config', 0)}"),
+        ("Decode steps",            lambda s: f"{s.get('decode_steps', 0)}"),
         ("Span (ms)",               lambda s: f"{s['span_ms']:.0f}"),
         ("Throughput (req/s)",      lambda s: f"{s['throughput_rps']:.2f}"),
     ]
@@ -571,13 +624,30 @@ def main() -> None:
                          "'hold_then_fallback': hold up to --kv-oom-hold-limit-ms then reroute.")
     ap.add_argument("--kv-oom-hold-limit-ms", type=float, default=None,
                     help="Max hold time before GPU fallback under hold_then_fallback. Default: 50.")
+    ap.add_argument("--admission-violation-budget", type=int, default=None,
+                    help="Phase C admission-control. Hold a candidate request D if admitting "
+                         "D now would push MORE THAN X currently-running requests past their "
+                         "SLO deadline (per-step decode time grows from bs=N to bs=N+1). "
+                         "Already-violated requests are excluded from the count. "
+                         "-1 (default) = disabled. 0 = strict. >=1 = tolerate N newly-violated.")
     ap.add_argument("--debug-log", action="store_true",
                     help="Write per-translation debug.log for each run (very slow; off by default).")
-    ap.add_argument("--pim-command-mode", choices=["realistic", "simple"], default=None,
-                    help="PIM command stream complexity. 'realistic' (default) emits the full "
-                         "per-block LPDDR5-PIM sequence (16K-86K cmds/decode-step). 'simple' emits "
-                         "only num_layers*num_heads*2 PIM_MAC_AB commands. Diagnostic A/B knob: "
-                         "compare wall-clock to bisect DRAM-tick vs frontend overhead.")
+    ap.add_argument("--no-kv-timeline", action="store_true",
+                    help="Skip the end-of-run KV-pool occupancy timeline plot. "
+                         "Useful for large N (e.g. 19k Azure conv) where the "
+                         "matplotlib renderer OOMs on millions of segments. "
+                         "Other plots (sweep_compare, predicted_vs_actual) "
+                         "still run.")
+    ap.add_argument("--pim-command-mode",
+                    choices=["realistic", "simple", "attacc_qbroadcast", "bank_stripe"],
+                    default=None,
+                    help="PIM command emission strategy. "
+                         "'realistic' (default): per-request commands, scales linearly in batch_size. "
+                         "'simple': diagnostic — 2 PIM_MAC_AB per (layer, kv_head, request). "
+                         "'attacc_qbroadcast': AttAcc-faithful — shared Q/V broadcast + B per-request "
+                         "K/V MACs; total ≈ N_L·N_KVH·(2·B·blocks + 6). "
+                         "'bank_stripe': experimental — shared K/V MACs (1 per block) modeling ideal "
+                         "bank-level parallelism; total ≈ N_L·N_KVH·(2·blocks + 6), independent of B.")
     ap.add_argument("--no-pim-cache", action="store_true",
                     help="Disable per-shape PIM-decode cycle cache. By default, repeated decode "
                          "tasks with the same (route, ctx_bucket=ceil(ctx/32), batch_size) shape "
@@ -623,6 +693,12 @@ def main() -> None:
                          "max_consec_decode_batches before being forced to yield to "
                          "prefill. Required for max_consec_decode_batches to actually "
                          "do anything.")
+    ap.add_argument("--gpu-only", action="store_true",
+                    help="Disable the PIM (lpddr5_pim_bank) route entirely. "
+                         "Sets hybrid_route_name to a sentinel that has no "
+                         "cost-table entry, so the scheduler's choose_route() "
+                         "skips it and routes 100%% to GPU. Use for head-to-head "
+                         "comparison vs the default hybrid mode (E5).")
     args = ap.parse_args()
 
     # Resolve requests CSV. --csv-path wins (use it for synthetic VLA traces);
@@ -690,6 +766,7 @@ def main() -> None:
     if args.debug_log:
         global DEBUG_LOG
         DEBUG_LOG = True
+    no_kv_timeline = bool(args.no_kv_timeline)
     if args.max_active > 0:
         global MAX_ACTIVE
         MAX_ACTIVE = args.max_active
@@ -708,6 +785,9 @@ def main() -> None:
     if args.kv_oom_hold_limit_ms is not None:
         global KV_OOM_HOLD_LIMIT_MS
         KV_OOM_HOLD_LIMIT_MS = args.kv_oom_hold_limit_ms
+    if args.admission_violation_budget is not None:
+        global ADMISSION_VIOLATION_BUDGET
+        ADMISSION_VIOLATION_BUDGET = args.admission_violation_budget
     if args.pim_command_mode is not None:
         global PIM_COMMAND_MODE
         PIM_COMMAND_MODE = args.pim_command_mode
@@ -732,6 +812,9 @@ def main() -> None:
     if args.prompt_priority is not None:
         global PROMPT_PRIORITY
         PROMPT_PRIORITY = args.prompt_priority
+    if args.gpu_only:
+        global GPU_ONLY
+        GPU_ONLY = True
     print(f"[csv]           {REQUESTS_CSV}  ({n} requests)")
     print(f"[model]         {args.model}  layers={NUM_LAYERS} heads={NUM_HEADS} "
           f"kv_heads={NUM_KV_HEADS} d_head={D_HEAD} dtype_bytes={DTYPE_BYTES} "
@@ -741,6 +824,9 @@ def main() -> None:
     print(f"[arrival_scale] {ARRIVAL_SCALE}")
     print(f"[slo]           e2e={SLO_E2E_MS}ms  ttft={SLO_TTFT_MS}ms")
     print(f"[kv_oom]        policy={KV_OOM_POLICY}  hold_limit={KV_OOM_HOLD_LIMIT_MS}ms")
+    print(f"[adm_viol_budget] {ADMISSION_VIOLATION_BUDGET}  (-1=disabled, 0=strict, N>=1 tolerate N newly-violated)")
+    if GPU_ONLY:
+        print("[gpu_only]      ENABLED  PIM route disabled via sentinel hybrid_route_name; 100% routing to GPU")
     print(f"[route_policy]  {ROUTE_POLICY}  guard_ms={ENERGY_LATENCY_GUARD_MS}")
     print(f"[batching]      max_decode_bs={MAX_DECODE_BATCH_SIZE}  "
           f"max_consec_decode={MAX_CONSECUTIVE_DECODE_BATCHES}  "
@@ -856,41 +942,81 @@ def main() -> None:
             print("\n[predicted_vs_actual skip] no cost-model .pkl bundles found")
 
     # ── KV pool timeline plots ────────────────────────────────────────────────
+    # At very large N (e.g. 19k Azure conv) the per-segment matplotlib state
+    # can OOM the process. Wrap everything defensively and skip when the
+    # segment count crosses a threshold where the plot is unreadable anyway.
+    if no_kv_timeline:
+        print("\n[timeline skip] --no-kv-timeline set; skipping KV pool plot")
+        print(f"\n[run_dir] {run_dir}")
+        print(f"[plots]   {plots_dir}")
+        return
     print("\n[timeline] generating KV pool occupancy plots ...")
     sys.path.insert(0, str(REPO / "tools"))
-    from plot_kv_pool_timeline import (  # noqa: E402
-        parse_log, replay, plot_timeline, read_pool_bytes,
-    )
-    import matplotlib.pyplot as _plt
-    fig_combined, axes_combined = _plt.subplots(
-        len(runs), 1, figsize=(16, 4.0 * len(runs)), sharex=False)
-    if len(runs) == 1:
-        axes_combined = [axes_combined]
-    for ax, (label, subdir_name) in zip(axes_combined, runs):
-        subdir = run_dir / subdir_name
-        log = subdir / "debug.log"
-        if not log.exists():
-            print(f"[timeline skip] {label}: no debug.log")
-            continue
-        events  = parse_log(log)
-        segs    = replay(events)
-        pool    = read_pool_bytes(subdir)
-        per_pol = subdir / "plots"
-        per_pol.mkdir(parents=True, exist_ok=True)
-        out_single = per_pol / f"{label}_kv_pool_timeline.png"
-        fig_s, ax_s = _plt.subplots(figsize=(16, 5))
-        plot_timeline(ax_s, segs, pool, label)
-        fig_s.tight_layout()
-        fig_s.savefig(out_single, dpi=140)
-        _plt.close(fig_s)
-        print(f"[timeline] {out_single.relative_to(REPO)}")
-        plot_timeline(ax, segs, pool, label)
-    fig_combined.suptitle("PIM KV pool occupancy over time — per policy", fontsize=12)
-    fig_combined.tight_layout(rect=[0, 0, 1, 0.98])
-    out_combined = plots_dir / "kv_pool_timeline_compare.png"
-    fig_combined.savefig(out_combined, dpi=140)
-    _plt.close(fig_combined)
-    print(f"[timeline] {out_combined.relative_to(REPO)}")
+    try:
+        from plot_kv_pool_timeline import (  # noqa: E402
+            parse_log, replay, plot_timeline, read_pool_bytes,
+        )
+        import matplotlib.pyplot as _plt
+    except Exception as e:
+        print(f"[timeline skip] import failed: {e}")
+        parse_log = None  # type: ignore
+
+    # Skip aggressively: matplotlib polygon scratch arrays scale with
+    # segment count AND with event count. At 19k requests we hit 16 MiB
+    # numpy allocations inside savefig that exceed the SLURM mem cap
+    # even when len(segs) reports a "safe" value.
+    MAX_SEGS_FOR_PLOT = 5000   # was 50000 — too lenient for 19k runs
+    MAX_DEBUG_LOG_BYTES = 50 * 1024 * 1024   # 50 MiB
+    if parse_log is not None:
+        try:
+            fig_combined, axes_combined = _plt.subplots(
+                len(runs), 1, figsize=(16, 4.0 * len(runs)), sharex=False)
+            if len(runs) == 1:
+                axes_combined = [axes_combined]
+            for ax, (label, subdir_name) in zip(axes_combined, runs):
+                subdir = run_dir / subdir_name
+                log = subdir / "debug.log"
+                if not log.exists():
+                    print(f"[timeline skip] {label}: no debug.log")
+                    continue
+                # Cheap pre-check: skip on file size before parsing.
+                log_size = log.stat().st_size
+                if log_size > MAX_DEBUG_LOG_BYTES:
+                    print(f"[timeline skip] {label}: debug.log = "
+                          f"{log_size / 1024 / 1024:.0f} MiB > "
+                          f"{MAX_DEBUG_LOG_BYTES // (1024*1024)} MiB cap")
+                    continue
+                try:
+                    events  = parse_log(log)
+                    segs    = replay(events)
+                    pool    = read_pool_bytes(subdir)
+                    if len(segs) > MAX_SEGS_FOR_PLOT:
+                        print(f"[timeline skip] {label}: {len(segs)} segs > "
+                              f"{MAX_SEGS_FOR_PLOT} cap (unreadable + OOM risk)")
+                        continue
+                    per_pol = subdir / "plots"
+                    per_pol.mkdir(parents=True, exist_ok=True)
+                    out_single = per_pol / f"{label}_kv_pool_timeline.png"
+                    fig_s, ax_s = _plt.subplots(figsize=(16, 5))
+                    plot_timeline(ax_s, segs, pool, label)
+                    fig_s.tight_layout()
+                    fig_s.savefig(out_single, dpi=140)
+                    _plt.close(fig_s)
+                    print(f"[timeline] {out_single.relative_to(REPO)}")
+                    plot_timeline(ax, segs, pool, label)
+                except Exception as e:
+                    print(f"[timeline error] {label}: {type(e).__name__}: {e}")
+                    continue
+            fig_combined.suptitle(
+                "PIM KV pool occupancy over time — per policy", fontsize=12)
+            fig_combined.tight_layout(rect=[0, 0, 1, 0.98])
+            out_combined = plots_dir / "kv_pool_timeline_compare.png"
+            fig_combined.savefig(out_combined, dpi=140)
+            _plt.close(fig_combined)
+            print(f"[timeline] {out_combined.relative_to(REPO)}")
+        except Exception as e:
+            print(f"[timeline error] combined-plot failed: "
+                  f"{type(e).__name__}: {e}")
 
     print(f"\n[run_dir] {run_dir}")
     print(f"[plots]   {plots_dir}")

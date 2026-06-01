@@ -239,12 +239,25 @@ def plot_timeline(ax, segments, pool_bytes, title, t_max=None):
 
     ax.axhline(pool_bytes, color="black", lw=0.8)
     ax.set_xlim(T[0], T[-1])
-    ax.set_ylim(0, pool_bytes * 1.02)
+
+    # Auto-zoom Y-axis when peak usage is much smaller than the pool ceiling
+    # (added 2026-05-27 — previously hardcoded to (0, pool*1.02), which made
+    # plots look "empty" when the pool was over-provisioned, e.g. Pi0 + 8 GiB
+    # synthetic VLA with peak ~0.09 GiB). If peak < 25% of pool, zoom to
+    # peak × 1.5; otherwise show the full pool. Either way, the pool ceiling
+    # is marked by the horizontal black line (drawn above) so the reader can
+    # still see the absolute capacity.
+    peak = float(bottom.max()) if len(bottom) else 0.0
+    if peak > 0 and peak < pool_bytes * 0.25:
+        ax.set_ylim(0, max(peak * 1.5, 1.0))
+    else:
+        ax.set_ylim(0, pool_bytes * 1.02)
     ax.set_xlabel("time (ms)")
     ax.set_ylabel("KV bytes reserved")
     gb = pool_bytes / (1024 ** 3)
-    peak = bottom.max() if len(bottom) else 0.0
-    ax.set_title(f"{title}  (pool={gb:.2f} GB, peak={peak / (1024**3):.2f} GB)")
+    peak_gb = peak / (1024 ** 3)
+    util_pct = (100.0 * peak / pool_bytes) if pool_bytes > 0 else 0.0
+    ax.set_title(f"{title}  (pool={gb:.2f} GB, peak={peak_gb:.2f} GB, util={util_pct:.1f}%)")
     ax.grid(axis="y", alpha=0.2)
 
     from matplotlib.patches import Patch
