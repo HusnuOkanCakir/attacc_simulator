@@ -74,6 +74,9 @@ class Ramulator:
         self.trace_recorder_impl = self.pim_config.get("TRACE_RECORDER_IMPL", "HBM3TraceRecorder")
         self.trace_gen_prefix = self.pim_config.get("TRACE_GEN_PREFIX", "gen_trace_attacc_")
         self.channel_count = int(self.pim_config.get("CHANNEL_COUNT", 16))
+        # Energy-only HBM-stack multiplier (see make_pim_config). Defaults
+        # to num_hbm for backward compatibility with the hbm3 target.
+        self.energy_num_hbm = int(self.pim_config.get("ENERGY_NUM_HBM", num_hbm))
         self.tCK = float(self.pim_config.get("TCK_NS", self._derive_tck_ns(self.dram_timing_preset)))
         self._ensure_log_schema()
 
@@ -157,7 +160,9 @@ class Ramulator:
         mem_acc = mac * 32 * self._mem_acc_scale(pim_type)
 
         traffic = [si_io, tsv_io, giomux_io, bgmux_io, mem_acc]
-        traffic = [i * self.num_hbm for i in traffic]
+        # Traffic feeds the energy model only (timing comes from raw
+        # ramulator cycles), so scale by the energy-only HBM count.
+        traffic = [i * self.energy_num_hbm for i in traffic]
         traffic = [i * num_ops_group for i in traffic]
         return traffic
 

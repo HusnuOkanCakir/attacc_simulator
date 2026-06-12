@@ -68,6 +68,15 @@ ENERGY_TABLE['PIM'][PIMType.BA]['comm'] = 10.4
 ENERGY_TABLE['PIM'][PIMType.BG]['comm'] = 10.4
 ENERGY_TABLE['PIM'][PIMType.BUFFER]['comm'] = 10.4
 
+# GDDR6-class off-chip access energy for GDDR-based GPUs (RTX A6000).
+# GDDR6 array + I/O energy is ~7.5 pJ/bit (about 2x the stacked
+# HBM-class path above, which totals ~3.6 pJ/bit), because GDDR drives
+# long PCB traces at high per-pin rates instead of a silicon
+# interposer. Ref: O'Connor et al., MICRO 2017 (FGDRAM) for the
+# breakdown methodology; GDDR6 estimate from JEDEC-era energy surveys.
+ENERGY_TABLE['GPU_GDDR6'] = dict(ENERGY_TABLE['GPU'])
+ENERGY_TABLE['GPU_GDDR6']['mem'] = 7.5 * 8  # 60 pJ/byte
+
 
 def make_xpu_config(gpu_type: GPUType,
                     num_gpu=None,
@@ -127,7 +136,8 @@ def make_xpu_config(gpu_type: GPUType,
         config['GPU']["L1_CAP_PER_CORE"] = 128 * 1024
         config['GPU']["L2_CAP_PER_DEVICE"] = 6 * 1024 * 1024
         config['GPU']["INTERFACE_BW"] = 112 * 1000 * 1000 * 1000
-        config['GPU']["ENERGY_TABLE"] = ENERGY_TABLE['GPU']
+        # A6000 uses GDDR6, not HBM: higher off-chip access energy.
+        config['GPU']["ENERGY_TABLE"] = ENERGY_TABLE['GPU_GDDR6']
 
         # CPU host (typical workstation pairing — Threadripper/Xeon-W). The cost
         # model touches CPU only for non-PIM bookkeeping; values mirror A100a.
@@ -221,6 +231,19 @@ def make_pim_config(pim_type: PIMType,
                                 if bw_scale is None else bw_scale
     config["NUM_ATTACC"] = num_attacc
     config["NUM_HBM"] = num_hbm
+    # Energy-only device-count scale. For the DGX-scale hbm3 target the
+    # GEMV trace represents one HBM stack's share of the partitioned
+    # workload, so total energy scales by num_attacc x num_hbm (vanilla
+    # AttAcc accounting). For the single-module lpddr5 edge target the
+    # trace already covers the full workload on one device; scaling by
+    # the DGX device counts would overcount energy ~40x. Timing paths
+    # (SOFTMAX_MEM_BW, ramulator cycles) are intentionally unaffected.
+    if yaml_target == "lpddr5-pim":
+        config["ENERGY_NUM_HBM"] = 1
+        config["ENERGY_NUM_ATTACC"] = 1
+    else:
+        config["ENERGY_NUM_HBM"] = num_hbm
+        config["ENERGY_NUM_ATTACC"] = num_attacc
     config["MEM_CAPACITY_PER_HBM"] = 16 * 1024 * 1024 * 1024
     config[
         "MEM_BW_PER_HBM"] = 670.4 * 1000 * 1000 * 1000 * internal_bandwidth_scale

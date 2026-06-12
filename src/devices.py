@@ -272,6 +272,10 @@ class PIM:
         self.name = DeviceType.PIM
         self.num_attacc = config['NUM_ATTACC']
         self.num_hbm = config['NUM_HBM']
+        # Energy-only device multiplier (see make_pim_config). Defaults
+        # to num_attacc for backward compatibility with the hbm3 target.
+        self.energy_num_attacc = config.get('ENERGY_NUM_ATTACC',
+                                            config['NUM_ATTACC'])
         self.pim_type = config['PIM_TYPE']
         self.peak_memory_bandwidth = config['MEM_BW_PER_HBM'] * self.num_hbm
         self.softmax_peak_flops = config['SOFTMAX_FLOPS']
@@ -301,7 +305,7 @@ class PIM:
         traffic = m * n * numOp * dbyte
         exec_time = traffic / interface_bw
 
-        energy = traffic * self.energy_table['comm'] * self.num_attacc
+        energy = traffic * self.energy_table['comm'] * self.energy_num_attacc
 
         return exec_time, [0, 0, 0, 0, 0, energy]
 
@@ -318,9 +322,10 @@ class PIM:
 
     def _get_energy(self, layer: Layer):
         off_data = layer.get_size()
-        e_off = sum(off_data) * self.energy_table['sram'] * self.num_attacc
-        e_flop = layer.get_flops(
-        ) / 2 * self.energy_table['alu'] * self.num_attacc
+        e_off = (sum(off_data) * self.energy_table['sram']
+                 * self.energy_num_attacc)
+        e_flop = (layer.get_flops() / 2 * self.energy_table['alu']
+                  * self.energy_num_attacc)
 
         return [e_off, 0, 0, 0, e_flop, 0]
 
@@ -345,7 +350,7 @@ class PIM:
                 cal_energy = layer.get_flops() / 2 * self.energy_table['alu']
 
                 energies = [dram_energy, 0, 0, 0, cal_energy, 0]
-                energies = [i * self.num_attacc for i in energies]
+                energies = [i * self.energy_num_attacc for i in energies]
                 return time, energies
             if self.attn_atomic_pim and 'context' in layer.name:
                 return 0, [0, 0, 0, 0, 0, 0]
