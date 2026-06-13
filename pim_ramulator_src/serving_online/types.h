@@ -121,6 +121,13 @@ struct RuntimeRequest {
   // guaranteed_no_evict.
   int preempt_count = 0;
 
+  // Cumulative full-evict count: preempt_lru() events only (NOT tail-trim).
+  // Compared against ServingOnlineConfig::kv_max_preempt_tries to trigger a
+  // vLLM-style "give up on PIM and reroute to GPU" decision before the
+  // request enters another eviction cycle. Survives across re-admissions
+  // (intentionally — that's the whole point of the budget).
+  int full_evict_tries = 0;
+
   // Cumulative count of decode tokens this request recomputed as a tail-trim
   // victim under kv_evict_granularity="tail". Full evictions do not touch
   // this counter (they go into preempt_count + redo_decodes in the log).
@@ -271,6 +278,20 @@ struct ServingOnlineConfig {
   // kv_scheduler_policy == "max_utilization" and kv_evict_granularity ==
   // "tail".
   int kv_tail_trim_max_per_request = 8;
+
+  // kv_max_preempt_tries: vLLM-style preempt budget per request. Counts
+  // full evictions only (RuntimeRequest::full_evict_tries). When a victim's
+  // full_evict_tries exceeds this cap inside preempt_lru(), instead of
+  // returning the request to WaitingAdmission for another doomed cycle,
+  // the scheduler reroutes it to the GPU route (same code path as
+  // kv_oom_policy == "fallback_gpu"); if no GPU route exists, the request
+  // is dropped (is_lost, dropped_reason set). This solves the small-pool
+  // livelock observed at kv_pool_bytes <~ working-set size. -1 disables
+  // (legacy behavior — possible livelock). Default 3 matches vLLM §4.5
+  // intuition: a request that's been preempted 3 times is unlikely to
+  // make progress under sustained pressure. Effective only under
+  // kv_scheduler_policy == "max_utilization".
+  int kv_max_preempt_tries = 3;
 
   // kv_tail_trim_multiplier: how many times the immediate need to free per
   //   tail-trim event. 1 = free exactly what the growing request needs (default,

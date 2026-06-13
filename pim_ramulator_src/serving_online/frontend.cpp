@@ -813,6 +813,8 @@ class Runtime {
     emitter << YAML::Key << "tokens_recomputed" << YAML::Value << m_scheduler.tokens_recomputed();
     emitter << YAML::Key << "predictive_holds"  << YAML::Value << m_scheduler.predictive_holds();
     emitter << YAML::Key << "admission_violation_holds" << YAML::Value << m_scheduler.admission_violation_holds();
+    emitter << YAML::Key << "eviction_fallback_count"   << YAML::Value << m_scheduler.eviction_fallback_count();
+    emitter << YAML::Key << "eviction_drop_count"       << YAML::Value << m_scheduler.eviction_drop_count();
     emitter << YAML::Key << "kv_scheduler_policy" << YAML::Value << m_cfg.kv_scheduler_policy;
     emitter << YAML::Key << "route_counts"      << YAML::Value << YAML::BeginMap;
     emitter << YAML::Key << m_cfg.gpu_route_name << YAML::Value << gpu_routes;
@@ -1406,6 +1408,7 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
     cfg.predictive_hold_ms             = param<float>("predictive_hold_ms").default_val(50.0f);
     cfg.kv_tail_trim_max_per_request   = param<int>("kv_tail_trim_max_per_request").default_val(8);
     cfg.kv_tail_trim_multiplier        = param<int>("kv_tail_trim_multiplier").default_val(1);
+    cfg.kv_max_preempt_tries           = param<int>("kv_max_preempt_tries").default_val(3);
 
     // Arrival
     cfg.arrival_time_scale = param<float>("arrival_time_scale").default_val(1.0f);
@@ -1489,6 +1492,11 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
       throw ConfigurationError(
           "ServingOnlineFrontend: kv_tail_trim_max_per_request must be >= 0 "
           "(0 disables the livelock guard)");
+    }
+    if (cfg.kv_max_preempt_tries < -1) {
+      throw ConfigurationError(
+          "ServingOnlineFrontend: kv_max_preempt_tries must be >= -1 "
+          "(-1 disables the budget; >=0 triggers GPU reroute after N+1 evicts)");
     }
     if (cfg.kv_scheduler_policy == "max_utilization" &&
         cfg.kv_oom_policy != "hold") {

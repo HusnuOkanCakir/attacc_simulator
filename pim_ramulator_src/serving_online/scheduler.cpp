@@ -64,6 +64,8 @@ void Scheduler::initialize(const ServingOnlineConfig& cfg,
   m_preempt_count = m_tail_trim_count = m_full_evict_count = 0;
   m_tokens_recomputed = 0;
   m_predictive_holds = 0;
+  m_eviction_fallback_count = 0;
+  m_eviction_drop_count     = 0;
   m_active_count = 0;
   m_waiting_admission.clear();
   m_waiting_prefill.clear();
@@ -653,37 +655,9 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
         }
 
         if (do_fallback) {
-          auto gpu_est = m_table->estimate(
-              m_cfg.gpu_route_name,
-              req->context_tokens, req->generated_tokens, 1);
-          if (gpu_est && !gpu_est->uses_pim) {
-            const CostEstimate& gpu_ref = *gpu_est;
-            dlog(sfmt("[%10.3fms] KV_OOM_FALLBACK  req=%3d  waited_ms=%.1f  threshold_ms=%.1f  -> route=%s",
-                      now_ms, req->id,
-                      now_ms - req->kv_oom_first_ms,
-                      m_cfg.kv_oom_hold_limit_ms,
-                      m_cfg.gpu_route_name.c_str()));
-            req->admission_last_reject_reason = "kv_oom_fallback_gpu";
-            auto pred = predict_finish_detail(
-                m_cfg.gpu_route_name,
-                req->context_tokens, req->generated_tokens,
-                now_ms, gpu_free_ms, pim_free_ms);
-            if (pred) {
-              req->scheduler_predicted_start_ms        = pred->start_ms;
-              req->scheduler_predicted_finish_ms       = pred->finish_ms;
-              req->scheduler_predicted_e2e_ms          = pred->finish_ms - req->arrival_ms;
-              req->scheduler_predicted_prefill_ms      = pred->prefill_ms;
-              req->scheduler_predicted_decode_total_ms = pred->decode_total_ms;
-            }
-            set_state(wait_idx, ReqState::WaitingPrefill);
-            req->route              = m_cfg.gpu_route_name;
-            req->svc                = gpu_ref;
-            req->remaining_decode   = gpu_ref.decode_tokens;
-            req->ready_ms           = now_ms;
-            req->admitted_ms        = now_ms;
+          if (try_reroute_to_gpu(wait_idx, "kv_oom_fallback_gpu",
+                                 now_ms, gpu_free_ms, pim_free_ms)) {
             m_admitted_count++;
-            log_queue_event(now_ms, "admit_route", req->id,
-                            "kv_oom_fallback_gpu", now_ms - req->arrival_ms);
             continue;
           }
         }
@@ -843,6 +817,49 @@ void Scheduler::wake_kv_held(double now_ms) {
   }
 }
 
+// ─── try_reroute_to_gpu() ────────────────────────────────────────────────────
+//
+// Shared GPU-reroute path. Caller is responsible for any caller-specific
+// counter bookkeeping (e.g. m_admitted_count for admission-time fallback,
+// m_eviction_fallback_count for preempt-budget fallback). Returns true if the
+// request was placed into WaitingPrefill on the GPU route; false if no GPU
+// route is configured (caller should drop).
+
+bool Scheduler::try_reroute_to_gpu(int req_index, const std::string& reason,
+                                    double now_ms, double gpu_free_ms,
+                                    double pim_free_ms) {
+  auto* req = &m_requests[req_index];
+  auto gpu_est = m_table->estimate(
+      m_cfg.gpu_route_name,
+      req->context_tokens, req->generated_tokens, 1);
+  if (!gpu_est || gpu_est->uses_pim) return false;
+  const CostEstimate& gpu_ref = *gpu_est;
+  dlog(sfmt("[%10.3fms] GPU_REROUTE req=%3d  reason=%s  -> route=%s",
+            now_ms, req->id, reason.c_str(),
+            m_cfg.gpu_route_name.c_str()));
+  req->admission_last_reject_reason = reason;
+  auto pred = predict_finish_detail(
+      m_cfg.gpu_route_name,
+      req->context_tokens, req->generated_tokens,
+      now_ms, gpu_free_ms, pim_free_ms);
+  if (pred) {
+    req->scheduler_predicted_start_ms        = pred->start_ms;
+    req->scheduler_predicted_finish_ms       = pred->finish_ms;
+    req->scheduler_predicted_e2e_ms          = pred->finish_ms - req->arrival_ms;
+    req->scheduler_predicted_prefill_ms      = pred->prefill_ms;
+    req->scheduler_predicted_decode_total_ms = pred->decode_total_ms;
+  }
+  set_state(req_index, ReqState::WaitingPrefill);
+  req->route              = m_cfg.gpu_route_name;
+  req->svc                = gpu_ref;
+  req->remaining_decode   = gpu_ref.decode_tokens;
+  req->ready_ms           = now_ms;
+  req->admitted_ms        = now_ms;
+  log_queue_event(now_ms, "admit_route", req->id,
+                  reason, now_ms - req->arrival_ms);
+  return true;
+}
+
 // ─── preempt_lru() ───────────────────────────────────────────────────────────
 //
 // Used by the max_utilization policy when a running request's KV growth
@@ -850,6 +867,11 @@ void Scheduler::wake_kv_held(double now_ms) {
 // admitted_ms) other than excluded_index, freeing its pages and returning it
 // to WaitingAdmission. The victim will re-run prefill on its next admission —
 // equivalent to vLLM §4.5's "recomputation" recovery path.
+//
+// vLLM-style preempt budget (kv_max_preempt_tries): once a victim's cumulative
+// full-evict count exceeds the budget, instead of returning it to
+// WaitingAdmission for another doomed cycle, route it to GPU (or drop if no
+// GPU route exists). Prevents the small-pool livelock observed at tight pools.
 
 bool Scheduler::preempt_lru(int excluded_index, double now_ms) {
   int best = -1;
@@ -882,17 +904,47 @@ bool Scheduler::preempt_lru(int excluded_index, double now_ms) {
             excluded_index >= 0 ? m_requests[excluded_index].id : -1,
             redone));
   v.kv_bytes_reserved            = 0;
-  set_state(best, ReqState::WaitingAdmission);   // returns to admission queue
   v.route.clear();
   v.remaining_decode             = 0;
-  v.admission_last_reject_reason = "kv_evicted";
   v.admission_next_retry_ms      = now_ms;
   v.admitted_ms                  = -1.0;
   v.preempt_count++;
+  v.full_evict_tries++;                // counts only full evicts (vLLM-style)
   v.tail_trim_events             = 0;    // fresh admission cycle
   m_preempt_count++;
   m_full_evict_count++;
   m_tokens_recomputed += static_cast<uint64_t>(redone);
+
+  // vLLM-style preempt budget. Past the cap, reroute the victim straight to
+  // GPU instead of bouncing it back to WaitingAdmission — that's the only
+  // way to break the small-pool livelock under sustained pressure. If no
+  // GPU route is configured, drop the request (cleanly accounted, not lost
+  // to a livelock).
+  if (m_cfg.kv_max_preempt_tries >= 0 &&
+      v.full_evict_tries > m_cfg.kv_max_preempt_tries) {
+    set_state(best, ReqState::WaitingAdmission);  // transient, helper moves it forward
+    if (try_reroute_to_gpu(best, "kv_max_preempt_tries_exceeded",
+                           now_ms, now_ms, now_ms)) {
+      m_eviction_fallback_count++;
+      return true;
+    }
+    // No GPU route available — drop the request rather than livelock.
+    v.is_lost         = true;
+    v.dropped_reason  = "kv_max_preempt_tries_no_gpu_fallback";
+    set_state(best, ReqState::Dropped);
+    m_active_count--;
+    m_dropped_count++;
+    m_eviction_drop_count++;
+    log_queue_event(now_ms, "drop", v.id,
+                    "kv_max_preempt_tries_exceeded",
+                    now_ms - v.arrival_ms);
+    dlog(sfmt("[%10.3fms] PREEMPT_DROP req=%3d  full_evict_tries=%d  cap=%d  (no GPU route)",
+              now_ms, v.id, v.full_evict_tries, m_cfg.kv_max_preempt_tries));
+    return true;
+  }
+
+  set_state(best, ReqState::WaitingAdmission);   // returns to admission queue
+  v.admission_last_reject_reason = "kv_evicted";
   return true;
 }
 

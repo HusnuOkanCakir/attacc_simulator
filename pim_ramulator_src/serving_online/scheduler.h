@@ -102,6 +102,8 @@ class Scheduler {
   uint64_t tokens_recomputed() const { return m_tokens_recomputed; }
   int predictive_holds()   const { return m_predictive_holds; }
   int admission_violation_holds() const { return m_admission_violation_holds; }
+  int eviction_fallback_count() const { return m_eviction_fallback_count; }
+  int eviction_drop_count()    const { return m_eviction_drop_count; }
 
   // Phase E (telemetry): per-step actual decode batch sizes. Populated by
   // pick_task() after each pick_decode_batch() that returns a non-empty
@@ -219,6 +221,16 @@ class Scheduler {
   // no suitable victim exists.
   bool preempt_lru(int excluded_index, double now_ms);
 
+  // Reroute an already-evicted request from WaitingAdmission to WaitingPrefill
+  // on the GPU route. Reuses the same admission-time fallback machinery as
+  // kv_oom_policy == "fallback_gpu" / "hold_then_fallback". Returns true if
+  // the GPU route's cost estimate is available and the request was placed
+  // into WaitingPrefill on it; returns false if no GPU route is configured
+  // (caller should drop). `reason` is recorded on the request and emitted to
+  // the queue-event log + dlog trace.
+  bool try_reroute_to_gpu(int req_index, const std::string& reason,
+                          double now_ms, double gpu_free_ms, double pim_free_ms);
+
   // Tail-trim preemption: free only the most recent pages of the LIFO victim,
   // enough to cover bytes_needed_per_side (rounded up to whole tokens).
   // Victim stays in WaitingDecode; its remaining_decode is bumped so the
@@ -292,6 +304,8 @@ class Scheduler {
   uint64_t m_tokens_recomputed = 0;     // decode tokens trimmed across all events
   int m_predictive_holds = 0;           // admission holds under M3
   int m_admission_violation_holds = 0;  // Phase C: admission holds because newly_violated > admission_violation_budget
+  int m_eviction_fallback_count = 0;    // # requests rerouted to GPU because full_evict_tries exceeded kv_max_preempt_tries
+  int m_eviction_drop_count = 0;        // # requests dropped (no GPU route) on preempt-budget exhaustion
 
   // Phase E (telemetry) — populated lazily; consumed at end-of-run.
   std::vector<int>        m_decode_batch_sizes;
