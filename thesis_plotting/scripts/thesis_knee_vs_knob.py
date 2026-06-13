@@ -192,11 +192,11 @@ def render(grouped: dict, knob_name: str, out_dir: Path, out_name: str,
     if not linear:
         ax.set_xscale("log")
         ax.set_yscale("log")
-    ax.set_xlabel("Offered RPS  (effective req / s)",
+    ax.set_xlabel("Offered load (RPS)",
                   fontsize=FONT_LABEL, fontweight="bold")
     ax.set_ylabel("E2E p99  (s, log)" if not linear else "E2E p99  (s)",
                   fontsize=FONT_LABEL, fontweight="bold")
-    ax.set_title(f"Pi0 @ azure_poisson_wide v2 — knee vs {title_word}",
+    ax.set_title(f"Pi0 @ azure_poisson_wide v2: knee vs {title_word}",
                  fontsize=FONT_TITLE, fontweight="bold")
     ax.grid(True, alpha=0.4)
     bold_legend(ax.legend(loc="upper left", fontsize=FONT_LABEL,
@@ -218,6 +218,9 @@ def main():
                     default=REPO / "thesis_plotting/figures")
     ap.add_argument("--out-name", type=str, default=None)
     ap.add_argument("--linear", action="store_true")
+    ap.add_argument("--keep-values", type=str, default=None,
+                    help="Comma-separated list of knob values to keep "
+                         "(e.g. '0.25,1,8,64'). Drops all other values.")
     args = ap.parse_args()
 
     if not args.sweep_dir.is_dir():
@@ -228,6 +231,15 @@ def main():
         sys.exit("[error] no parseable cells found")
 
     grouped = group_by_knob_value(records)
+    if args.keep_values:
+        keep = set(args.keep_values.split(","))
+        # Match against the raw knob-value strings as they appear in cell names.
+        # Cell labels store dotted values as "0_25" etc; we accept either form.
+        keep_norm = {v.replace(".", "_") for v in keep} | set(keep)
+        grouped = {k: v for k, v in grouped.items() if k in keep_norm}
+        if not grouped:
+            sys.exit(f"[error] --keep-values left no rows. "
+                     f"Available: {sorted(group_by_knob_value(records).keys())}")
     print(f"[info] {len(records)} cells, {len(grouped)} knob values")
     for v, pts in sorted(grouped.items()):
         print(f"  {v}: {len(pts)} points")

@@ -380,16 +380,11 @@ def make_per_dataset_figure(dataset: str, points: list,
     ax.plot(rps, p99_s,
             linewidth=1.6, color=color, alpha=0.55, zorder=3)
 
-    # Non-cluster points = regular markers with scale label
+    # Non-cluster points = regular markers.
     for r, p99_ms, scale in non_cluster:
         ax.scatter([r], [p99_ms / 1000.0],
                    marker=marker, s=64, zorder=5,
                    color=color, edgecolor="black", linewidth=0.5)
-        ax.annotate(f"s={scale:g}",
-                    xy=(r, p99_ms / 1000.0),
-                    xytext=(6, -3), textcoords="offset points",
-                    fontsize=FONT_ANNOTATE, color="#444",
-                    ha="left", va="center", fontweight="bold")
 
     # Cluster points = smaller hollow markers (visually grouped)
     if cluster:
@@ -398,16 +393,12 @@ def make_per_dataset_figure(dataset: str, points: list,
                        marker=marker, s=38, zorder=4,
                        facecolor="white", edgecolor=color, linewidth=1.0)
         # Single annotation for the whole cluster.
-        cluster_scales = sorted({p[2] for p in cluster}, reverse=True)
-        scales_str = ", ".join(f"{s:g}" for s in cluster_scales[:4])
-        if len(cluster_scales) > 4:
-            scales_str += ", …"
         cluster_rps = cluster[0][0]
         cluster_p99_max = max(p[1] for p in cluster) / 1000.0
         cluster_p99_min = min(p[1] for p in cluster) / 1000.0
         ax.annotate(
-            f"saturated cluster\n({len(cluster)} cells: s ∈ {{{scales_str}}})\n"
-            f"throughput stuck at {cluster_rps:.2f} req/s",
+            f"saturated cluster\n({len(cluster)} cells)\n"
+            f"throughput near {cluster_rps:.2f} RPS",
             xy=(cluster_rps, cluster_p99_min),
             xytext=(-90, -30),
             textcoords="offset points",
@@ -428,7 +419,7 @@ def make_per_dataset_figure(dataset: str, points: list,
                    marker="*", s=320, zorder=6,
                    color=color, edgecolor="black", linewidth=0.9)
         ax.annotate(
-            f"a ≈ {knee_rps:.1f} req/s",
+            f"knee ≈ {knee_rps:.1f} RPS",
             xy=(knee_rps, knee_p99_s),
             xytext=(-15, -28), textcoords="offset points",
             ha="right", va="top",
@@ -438,7 +429,7 @@ def make_per_dataset_figure(dataset: str, points: list,
                       boxstyle="round,pad=0.3", linewidth=0.7,
                       alpha=0.95),
             arrowprops=dict(arrowstyle="->", color=color, lw=0.9))
-        knee_str = f"  (a ≈ {knee_rps:.1f} req/s)"
+        knee_str = f"  (knee ≈ {knee_rps:.1f} RPS)"
 
     if linear:
         # Linear axes: cap y so the saturation cluster doesn't compress
@@ -446,22 +437,22 @@ def make_per_dataset_figure(dataset: str, points: list,
         if knee:
             ax.set_ylim(0, knee[1] / 1000.0 * 3.0)
         ax.set_xlim(0, max(rps) * 1.1)
-        x_label = "Offered RPS  (effective req / s)"
+        x_label = "Offered load (RPS)"
         y_label = "E2E p99  (s)"
-        scale_note = "linear axes — y capped at 3× knee p99"
+        scale_note = "linear axes; y capped at 3x knee p99"
     else:
         ax.set_xscale("log")
         ax.set_yscale("log")
         fmt = mticker.FuncFormatter(lambda x, _p: f"{x:g}")
         ax.xaxis.set_major_formatter(fmt)
-        x_label = "Offered RPS  (effective req / s)"
+        x_label = "Offered load (RPS)"
         y_label = "E2E p99  (s, log scale)"
-        scale_note = "s = arrival_scale; a = knee/sustainable peak RPS"
+        scale_note = "saturation knee under normalized request load"
 
     ax.set_xlabel(x_label, fontsize=FONT_LABEL + 1, fontweight="bold")
     ax.set_ylabel(y_label, fontsize=FONT_LABEL + 1, fontweight="bold")
     ax.set_title(
-        f"{DATASET_DISPLAY[dataset]} — peak-RPS knee\n({scale_note})",
+        f"{DATASET_DISPLAY[dataset]}: RPS knee\n({scale_note})",
         fontsize=FONT_TITLE + 1, fontweight="bold")
     ax.grid(True, which="both" if not linear else "major", alpha=0.5)
     set_spines(ax)

@@ -77,37 +77,45 @@ def main():
     x_unit = "min" if use_minutes else "s"
     x_axis = [t / 60.0 for t in times_s] if use_minutes else times_s
 
+    # Local font overrides — defaults render ~3 pt after LaTeX scales the
+    # figure to \linewidth. Bump everything so the rendered text is readable.
+    FL  = FONT_LABEL    + 7   # axis label
+    FTI = FONT_TITLE    + 7   # suptitle
+    FAN = FONT_ANNOTATE + 8   # legend / subtitle / tick labels
+
     fig, (ax_lin, ax_lout) = plt.subplots(
-        2, 1, figsize=(WIDE_FIGSIZE[0], 4.6),
-        sharex=True, gridspec_kw={"hspace": 0.06},
+        2, 1, figsize=(WIDE_FIGSIZE[0], 6.0),
+        sharex=True, gridspec_kw={"hspace": 0.08},
     )
 
     ax_lin.scatter(x_axis, lins,
-                   s=2.5, alpha=0.45,
+                   s=4.0, alpha=0.45,
                    color=COLOR_MODEL["pi0"],
                    edgecolors="none",
                    label=f"ContextTokens (n={len(lins):,})")
     ax_lin.set_ylabel("ContextTokens (Lin)",
-                      fontsize=FONT_LABEL, fontweight="bold")
+                      fontsize=FL, fontweight="bold")
+    ax_lin.tick_params(axis="both", which="major", labelsize=FAN)
     ax_lin.grid(axis="y", alpha=0.5)
     ax_lin.grid(axis="x", visible=False)
     set_spines(ax_lin)
-    leg = ax_lin.legend(loc="upper right", fontsize=FONT_ANNOTATE + 1)
+    leg = ax_lin.legend(loc="upper right", fontsize=FAN)
     bold_legend(leg)
 
     ax_lout.scatter(x_axis, louts,
-                    s=2.5, alpha=0.45,
+                    s=4.0, alpha=0.45,
                     color=COLOR_MODEL["openvla"],
                     edgecolors="none",
                     label=f"GeneratedTokens (n={len(louts):,})")
     ax_lout.set_ylabel("GeneratedTokens (Lout)",
-                       fontsize=FONT_LABEL, fontweight="bold")
+                       fontsize=FL, fontweight="bold")
     ax_lout.set_xlabel(f"Arrival time ({x_unit})",
-                       fontsize=FONT_LABEL, fontweight="bold")
+                       fontsize=FL, fontweight="bold")
+    ax_lout.tick_params(axis="both", which="major", labelsize=FAN)
     ax_lout.grid(axis="y", alpha=0.5)
     ax_lout.grid(axis="x", visible=False)
     set_spines(ax_lout)
-    leg = ax_lout.legend(loc="upper right", fontsize=FONT_ANNOTATE + 1)
+    leg = ax_lout.legend(loc="upper right", fontsize=FAN)
     bold_legend(leg)
 
     # Headline stats line.
@@ -115,13 +123,14 @@ def main():
     lin_max   = max(lins)
     lout_mean = sum(louts) / len(louts)
     lout_max  = max(louts)
-    subtitle = (f"n={len(rows):,}    span={span_s:,.0f} s    "
-                f"Lin mean / max = {lin_mean:.0f} / {lin_max:,}    "
-                f"Lout mean / max = {lout_mean:.0f} / {lout_max:,}")
-    fig.suptitle(f"Per-request shape over time — {args.tag}\n{subtitle}",
-                 fontsize=FONT_TITLE, fontweight="bold")
+    subtitle = (f"n={len(rows):,}   span={span_s:,.0f} s   "
+                f"Lin mean/max = {lin_mean:.0f}/{lin_max:,}   "
+                f"Lout mean/max = {lout_mean:.0f}/{lout_max:,}")
+    fig.suptitle(f"Per-request shape over time: {args.tag}\n{subtitle}",
+                 fontsize=FTI, fontweight="bold", y=0.995)
 
     ax_lin.set_xlim(0, x_axis[-1] if x_axis else 1)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
 
     save_fig(fig, f"fig_shape_timeline_{args.tag}", args.out_dir)
     plt.close(fig)

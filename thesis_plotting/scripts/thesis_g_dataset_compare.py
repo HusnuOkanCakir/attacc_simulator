@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-dataset Pi0 comparison at the knee (G azure_full19k vs azure_poisson).
+"""Cross-dataset Pi0 route-availability comparison.
 
 Visualises the central finding of the G sweeps: hybrid wins on the
 real Azure heavy-tail trace but the synthetic Poisson trace inverts the
@@ -138,7 +138,7 @@ def render(data: dict, out_dir: Path, out_name: str):
                           rotation=90, va="center", ha="center",
                           fontsize=FONT_LABEL + 1, fontweight="bold")
 
-    fig.suptitle("Pi0 at the knee — real Azure (top) vs synthetic Poisson (bottom)",
+    fig.suptitle("Pi0 route availability: heavy-tail Azure vs narrow Poisson",
                  fontsize=FONT_TITLE, fontweight="bold", y=1.00)
 
     # Single legend at the top.

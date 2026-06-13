@@ -151,23 +151,21 @@ def render(points, out_dir: Path, out_name: str, linear: bool = False):
                     fontsize=FONT_ANNOTATE - 1, color="#444",
                     ha="left", va="center")
 
-    # Knee marker — fixed at a = 2.13 (the DRAIN ceiling).
-    drain_rps_only = [t[1] for t in drain_pts]
-    drain_p99_s_only = [t[2] / 1000.0 for t in drain_pts]
+    # Knee marker — set at the SAFE OPERATING POINT (a = 1.36 req/s, scale=4).
+    # The saturation ceiling (rps≈2.13 at scale≤2.5) is unsafe because of the
+    # metastable bistability between scales 2.55–2.65 (overflow attractor).
+    # The s=4 point is well below the cliff: deep in DRAIN mode, p99 ~78 s,
+    # monotonic improvement above it. See docs/plan/knee_scaled_experiments.md.
     knee_pt = None
-    if drain_rps_only:
-        # The knee is the highest-RPS DRAIN point (lowest p99 at the
-        # ceiling RPS — that's the cliff-start cell).
-        ceiling_rps = max(drain_rps_only)
-        ceiling_pts = [(r, y) for r, y in zip(drain_rps_only, drain_p99_s_only)
-                       if abs(r - ceiling_rps) / ceiling_rps <= 0.05]
-        knee_pt = min(ceiling_pts, key=lambda p: p[1])
+    s4_match = next((t for t in drain_pts if abs(t[0] - 4.0) < 0.01), None)
+    if s4_match:
+        knee_pt = (s4_match[1], s4_match[2] / 1000.0)
     if knee_pt:
         ax.scatter([knee_pt[0]], [knee_pt[1]],
                    marker="*", s=420, zorder=7,
                    color=COLOR_DRAIN, edgecolor="black", linewidth=1.0)
         ax.annotate(
-            f"a ≈ {knee_pt[0]:.2f} req/s",
+            f"a ≈ {knee_pt[0]:.2f} req/s  (safe; s=4)",
             xy=knee_pt,
             xytext=(40, -8), textcoords="offset points",
             ha="left", va="top",
@@ -177,6 +175,23 @@ def render(points, out_dir: Path, out_name: str, linear: bool = False):
                       boxstyle="round,pad=0.3", linewidth=0.8,
                       alpha=0.95),
             arrowprops=dict(arrowstyle="->", color=COLOR_DRAIN, lw=0.9))
+
+    # Shade the cliff/saturation region (rps > a, including the bistability
+    # zone where the OVERFLOW attractor lurks). Visually marks "do not operate
+    # here" without overwhelming the rest of the figure.
+    ceiling_rps_max = max(t[1] for t in drain_pts) if drain_pts else 0.0
+    if knee_pt and ceiling_rps_max > knee_pt[0]:
+        ax.axvspan(knee_pt[0], ceiling_rps_max * 1.05,
+                   color="#c44e52", alpha=0.10, zorder=1)
+        # One small label, top-center of shaded span.
+        x_mid = (knee_pt[0] * ceiling_rps_max) ** 0.5
+        ax.text(x_mid, 0.92, "danger zone\n(cliff + metastable\nbistability at s∈[2.55, 2.65])",
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="top",
+                fontsize=FONT_ANNOTATE, fontweight="bold",
+                color="#a04040",
+                bbox=dict(facecolor="white", edgecolor="#c44e52",
+                          boxstyle="round,pad=0.25", linewidth=0.6, alpha=0.9))
 
     if linear:
         if knee_pt:

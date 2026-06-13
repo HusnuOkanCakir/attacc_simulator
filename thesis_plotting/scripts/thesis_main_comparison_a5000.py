@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-"""Pi0 @ azure_poisson_wide v2 — hybrid vs gpu-only at 1.09 RPS.
+"""Pi0 @ azure_poisson_wide v2 — hybrid vs gpu-only at the new
+max_active=5000 default and the new ref operating point.
 
-The original G figure (`fig_g_pi0_knee_azure_poisson_wide.png`) was
-rendered at arrival_scale=6.5 (peak ≈ a=2.13). The system has metastable
-bistability in scale 2.55–2.65 and an unstable cliff at scale 2.7, so
-"operating at a" is unsafe in practice.
+Source cells (same dataset n=5000, max_active=5000, arrival_scale=2.85,
+mean offered ≈ 1.91 RPS, kv_pool=64 GiB):
+- hybrid:   cluster_outputs/online_serving_runs/main_comparison_a5000_20260605_235416/A_hybrid_a5000
+- gpu-only: cluster_outputs/online_serving_runs/main_comparison_a5000_20260605_235416/B_gpu_only_a5000
 
-This render uses the main Chapter 6 comparison cell whose mean offered
-load is approximately 1.09 RPS. Internal run metadata still contains the
-arrival scaling factor, but the thesis figure reports the RPS value.
-
-Source cells (same dataset n=5000, same canonical config):
-- hybrid:   cluster_outputs/online_serving_runs/knee_vs_route_20260601_151039/03_route_hybrid_s050
-- gpu-only: cluster_outputs/online_serving_runs/knee_vs_route_20260601_151039/09_route_gpu_only_s050
-
-Output: thesis_plotting/figures/fig_g_pi0_knee_azure_poisson_wide_s5.{pdf,png}
+Output: thesis_plotting/figures/fig_main_comparison_a5000_pi0_wide.{pdf,png}
 """
 
 import sys
@@ -36,15 +29,15 @@ from thesis_plotting.style import (  # noqa: E402
 
 
 HYBRID_CELL = (REPO / "cluster_outputs/online_serving_runs"
-               / "knee_vs_route_20260601_151039"
-               / "03_route_hybrid_s050")
+               / "main_comparison_a5000_20260605_235416"
+               / "A_hybrid_a5000")
 GPUONLY_CELL = (REPO / "cluster_outputs/online_serving_runs"
-                / "knee_vs_route_20260601_151039"
-                / "09_route_gpu_only_s050")
+                / "main_comparison_a5000_20260605_235416"
+                / "B_gpu_only_a5000")
 
 DATASET_LABEL = "azure_poisson_wide  (Poisson, mixture v2)"
 MODEL_DISPLAY = "Pi0"
-MEAN_OFFERED_RPS = 1.09
+MEAN_OFFERED_RPS = 1.91
 
 MODE_LABEL = {"hybrid": "Hybrid", "gpuonly": "GPU-only"}
 MODE_COLOR = {"hybrid": COLOR_ROUTE["lpddr5_pim_bank"],
@@ -68,13 +61,23 @@ def render(cells: dict, out_dir: Path, out_name: str):
     if not cells.get("hybrid") or not cells.get("gpuonly"):
         sys.exit("[error] missing hybrid or gpuonly cell")
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.8))
+    # Local font overrides — defaults (FONT_BASE=7) render ~3pt after LaTeX
+    # scales the figure to \linewidth. Bump for readability.
+    FL  = FONT_LABEL + 8    # axis label / value label / tick text     -> 15
+    FTI = FONT_TITLE + 8    # suptitle                                  -> 16
+    FTK = FONT_TICK  + 8    # x-tick labels (GPU-only / Hybrid)         -> 14
+    FDL = FONT_LABEL + 10   # delta label (↑21%, ↓7×)                   -> 17
+
+    fig, axes = plt.subplots(1, 3, figsize=(12.5, 5.0))
 
     metrics = [
         ("throughput", "Throughput  (RPS)",  lambda v: v,
          False, "higher"),
+        # TTFT p99: linear y-axis capped at 3000 ms — the two values
+        # (~1.6 s each) are within 7% of each other and don't benefit
+        # from log scaling.
         ("ttft_p99",   "TTFT p99  (ms)",       lambda v: v,
-         True,  "lower"),
+         False, "lower"),
         ("e2e_p99",    "E2E p99  (s)",         lambda v: v / 1000.0,
          True,  "lower"),
     ]
@@ -110,7 +113,7 @@ def render(cells: dict, out_dir: Path, out_name: str):
             ax.text(0.5, top_y * (2.0 if log else 1.18),
                     label_str,
                     ha="center", va="bottom",
-                    fontsize=FONT_LABEL + 4, fontweight="bold",
+                    fontsize=FDL, fontweight="bold",
                     color=color)
 
         for bar, v in zip(bars, vals):
@@ -121,23 +124,29 @@ def render(cells: dict, out_dir: Path, out_name: str):
                 y_lab = bar.get_height() + max(vals) * 0.015
             ax.text(bar.get_x() + bar.get_width() / 2, y_lab, label,
                     ha="center", va="bottom",
-                    fontsize=FONT_LABEL, fontweight="bold")
+                    fontsize=FL, fontweight="bold")
 
         ax.set_xticks(xs)
         ax.set_xticklabels([MODE_LABEL[m] for m in modes],
-                           fontsize=FONT_TICK, fontweight="bold")
+                           fontsize=FTK, fontweight="bold")
         ax.set_xlim(0.10, 0.90)
-        ax.set_ylabel(ylabel, fontsize=FONT_LABEL, fontweight="bold")
-        if log:
+        ax.set_ylabel(ylabel, fontsize=FL, fontweight="bold")
+        ax.tick_params(axis="y", which="major", labelsize=FTK - 2)
+        if key == "ttft_p99":
+            # Hand-tuned linear cap so the two close-together bars
+            # remain readable with a bit of headroom for the value
+            # labels and the delta callout.
+            ax.set_ylim(0, 3000)
+        elif log:
             ax.set_ylim(top=max(vals) * 4.5)
         else:
             ax.set_ylim(0, max(vals) * 1.32)
         set_spines(ax)
 
-    sup = (f"{MODEL_DISPLAY} @ safe operating point   "
+    sup = (f"{MODEL_DISPLAY} @ ref operating point   "
            f"({DATASET_LABEL}, mean offered load ≈ {MEAN_OFFERED_RPS:.2f} RPS)")
-    fig.suptitle(sup, fontsize=FONT_TITLE, fontweight="bold", y=1.00)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
+    fig.suptitle(sup, fontsize=FTI, fontweight="bold", y=0.995)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
     save_fig(fig, out_name, out_dir)
     plt.close(fig)
 
@@ -154,7 +163,7 @@ def main():
               f"ttft_p99={c.get('ttft_p99'):.0f}ms "
               f"e2e_p99={c.get('e2e_p99')/1000.0:.1f}s")
     render(cells, REPO / "thesis_plotting/figures",
-           "fig_g_pi0_knee_azure_poisson_wide_s5")
+           "fig_main_comparison_a5000_pi0_wide")
 
 
 if __name__ == "__main__":
