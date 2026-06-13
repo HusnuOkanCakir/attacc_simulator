@@ -36,6 +36,23 @@ ncu_roofline*.csv
 # Common logs
 *.log
 
+# Generated thesis figures (PDF/PNG, catalogs) — regenerate via thesis_plotting/scripts/
+thesis_plotting/figures/
+
+# Scratch docs, reports, plans, catalogs, and doc images
+docs/
+
+# Run logs / build artifacts / scratch
+*.out
+log/
+libramulator.so
+status.txt
+debug_out.txt
+null
+.codex
+example/
+memory/
+
 # Notes:
 # - `ramulator2/` is a git submodule. Ignore rules for generated files inside it
 #   should be added in the submodule repo (`ramulator2/.gitignore`) separately.
