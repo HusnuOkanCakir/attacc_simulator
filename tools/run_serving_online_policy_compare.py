@@ -57,6 +57,7 @@ SLO_E2E_MS        = 900.0   # E2E latency SLO; -1 = disabled
 SLO_TTFT_MS       = -1.0    # TTFT SLO; -1 = disabled
 KV_OOM_POLICY     = "hold"  # hold | fallback_gpu | hold_then_fallback
 KV_OOM_HOLD_LIMIT_MS = 50.0 # max hold time before GPU fallback (hold_then_fallback only)
+KV_MAX_PREEMPT_TRIES = 3    # vLLM-style preempt budget per request (-1 disables; >=0 reroutes to GPU after N+1 evicts)
 ADMISSION_VIOLATION_BUDGET = -1  # Phase C: -1=disabled, 0=strict, N>=1 tolerate N newly-violated
 PIM_COMMAND_MODE  = "realistic"  # realistic | simple — diagnostic A/B knob
 PIM_CACHE_ENABLED = True         # cache PIM-decode drain cycles by shape (Lever 1)
@@ -67,6 +68,8 @@ MAX_DECODE_BATCH_SIZE           = 8     # max requests in one decode batch
 MAX_CONSECUTIVE_DECODE_BATCHES  = 4     # force a prefill after this many decodes
 PROMPT_PRIORITY                 = True  # if true, prefill always wins over decode when waiting
 GPU_ONLY                        = False # E5: disable the PIM route (force 100% GPU routing)
+PIM_ONLY                        = False # Symmetric to GPU_ONLY: disable the GPU route (force 100% PIM routing).
+                                        # Auto-forces kv_oom_policy=hold and kv_max_preempt_tries=-1.
 
 # Model architecture (filled from MODEL_PRESETS in main()).
 NUM_LAYERS           = 18
@@ -192,6 +195,12 @@ def yaml_text(label: str, run_dir: Path) -> str:
     # that route → choose_route() skips it → 100% of requests route to GPU.
     # No C++ changes needed.
     HYBRID_ROUTE_NAME = "disabled" if GPU_ONLY else "lpddr5_pim_bank"
+    # Symmetric for --pim-only: replace the GPU route name with the same
+    # sentinel so choose_route() skips it → 100% PIM. Required complement:
+    # kv_oom_policy=hold and kv_max_preempt_tries=-1 (forced in main()) so
+    # the admission / preempt fallback paths cannot try to use the disabled
+    # GPU route.
+    GPU_ROUTE_NAME = "disabled" if PIM_ONLY else "gpu_only"
 
     return f"""Frontend:
   impl: ServingOnlineFrontend
@@ -205,7 +214,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
   requests_out_csv: {out_csv}
   debug_log_path: {debug_log}
 
-  gpu_route_name: gpu_only
+  gpu_route_name: {GPU_ROUTE_NAME}
   hybrid_route_name: {HYBRID_ROUTE_NAME}
 
   route_policy: {ROUTE_POLICY}
@@ -221,6 +230,7 @@ def yaml_text(label: str, run_dir: Path) -> str:
   admission_violation_budget: {ADMISSION_VIOLATION_BUDGET}
   kv_oom_policy: {KV_OOM_POLICY}
   kv_oom_hold_limit_ms: {KV_OOM_HOLD_LIMIT_MS}
+  kv_max_preempt_tries: {KV_MAX_PREEMPT_TRIES}
 {policy_lines}
   slo_e2e_ms: {SLO_E2E_MS}
   slo_ttft_ms: {SLO_TTFT_MS}
@@ -312,6 +322,8 @@ def _load_summary(path: Path) -> dict:
         "tokens_recomputed": int(fe.get("tokens_recomputed", 0)),
         "predictive_holds":  int(fe.get("predictive_holds", 0)),
         "admission_violation_holds": int(fe.get("admission_violation_holds", 0)),
+        "eviction_fallback_count": int(fe.get("eviction_fallback_count", 0)),
+        "eviction_drop_count":     int(fe.get("eviction_drop_count", 0)),
         "scheduler_policy":  str(fe.get("kv_scheduler_policy", "")),
         # Phase E telemetry (added 2026-05-27)
         "decode_steps":         int(db.get("num_decode_steps", 0)),
@@ -394,6 +406,8 @@ def summarize(label: str, csv_path: Path, summary: dict) -> dict:
         "tokens_recomputed": tokens_recomputed_est,
         "predictive_holds":  summary.get("predictive_holds", 0),
         "admission_violation_holds": summary.get("admission_violation_holds", 0),
+        "eviction_fallback_count": summary.get("eviction_fallback_count", 0),
+        "eviction_drop_count":     summary.get("eviction_drop_count", 0),
         "scheduler_policy":  summary.get("scheduler_policy", ""),
         # Phase E telemetry pass-through
         "decode_steps":         summary.get("decode_steps", 0),
@@ -529,6 +543,7 @@ def print_table(stats: list[dict]) -> None:
         ("Tokens recomputed",       lambda s: f"{s['tokens_recomputed']}"),
         ("Predictive holds",        lambda s: f"{s['predictive_holds']}"),
         ("Admission viol. holds",   lambda s: f"{s['admission_violation_holds']}"),
+        ("Eviction reroute/drop",   lambda s: f"{s.get('eviction_fallback_count', 0)}/{s.get('eviction_drop_count', 0)}"),
         ("TTFT p50/p90 (ms)",       lambda s: f"{s['ttft_p50']:.0f}/{s['ttft_p90']:.0f}"),
         ("TTFT p99 (ms)",           lambda s: f"{s['ttft_p99']:.0f}"),
         ("E2E p50/p90 (ms)",        lambda s: f"{s['e2e_p50']:.0f}/{s['e2e_p90']:.0f}"),
@@ -607,6 +622,10 @@ def main() -> None:
     ap.add_argument("--dense", action="store_true",
                     help="Use dense ML-predicted cost tables (*_dense.csv) instead "
                          "of the sparse originals. Generate with tools/gen_dense_cost_table.py.")
+    ap.add_argument("--cost-dir", type=str, default=None,
+                    help="Override the preset's cost-table directory. Expects "
+                         "<dir>/gpu_only.csv and <dir>/lpddr5_pim_bank.csv "
+                         "(or *_dense.csv with --dense).")
     ap.add_argument("--ml", action="store_true",
                     help="Use ML tree-ensemble models (.bin) for cost estimation instead "
                          "of nearest-neighbor CSV lookup. Requires the .bin files generated "
@@ -624,6 +643,12 @@ def main() -> None:
                          "'hold_then_fallback': hold up to --kv-oom-hold-limit-ms then reroute.")
     ap.add_argument("--kv-oom-hold-limit-ms", type=float, default=None,
                     help="Max hold time before GPU fallback under hold_then_fallback. Default: 50.")
+    ap.add_argument("--kv-max-preempt-tries", type=int, default=None,
+                    help="vLLM-style preempt budget per request. After N full evictions "
+                         "(preempt_lru) the request is rerouted to GPU instead of going "
+                         "back to WaitingAdmission (or dropped if no GPU route). Solves the "
+                         "small-pool livelock under max_utilization. -1 disables (legacy). "
+                         "Default: 3.")
     ap.add_argument("--admission-violation-budget", type=int, default=None,
                     help="Phase C admission-control. Hold a candidate request D if admitting "
                          "D now would push MORE THAN X currently-running requests past their "
@@ -699,6 +724,13 @@ def main() -> None:
                          "cost-table entry, so the scheduler's choose_route() "
                          "skips it and routes 100%% to GPU. Use for head-to-head "
                          "comparison vs the default hybrid mode (E5).")
+    ap.add_argument("--pim-only", action="store_true",
+                    help="Symmetric to --gpu-only: disable the GPU route entirely. "
+                         "Sets gpu_route_name to a sentinel that has no "
+                         "cost-table entry, so choose_route() skips it → 100%% PIM. "
+                         "Also forces kv-oom-policy=hold and kv-max-preempt-tries=-1 "
+                         "so the admission and preempt fallback paths cannot route "
+                         "to the disabled GPU. Mutually exclusive with --gpu-only.")
     args = ap.parse_args()
 
     # Resolve requests CSV. --csv-path wins (use it for synthetic VLA traces);
@@ -752,6 +784,11 @@ def main() -> None:
                      f"--gpu '{args.gpu}'. Available: {sorted(cost_dirs_map)}")
         csv_dir, model_dir = cost_dirs_map[args.gpu]
 
+    # --cost-dir overrides the preset's cost-table directory entirely
+    # (e.g. to use the energy-fixed tables without touching presets).
+    if args.cost_dir is not None:
+        csv_dir = args.cost_dir
+
     global COST_GPU_CSV, COST_HYBRID_CSV
     if args.dense:
         COST_GPU_CSV    = f"{csv_dir}/gpu_only_dense.csv"
@@ -785,6 +822,9 @@ def main() -> None:
     if args.kv_oom_hold_limit_ms is not None:
         global KV_OOM_HOLD_LIMIT_MS
         KV_OOM_HOLD_LIMIT_MS = args.kv_oom_hold_limit_ms
+    if args.kv_max_preempt_tries is not None:
+        global KV_MAX_PREEMPT_TRIES
+        KV_MAX_PREEMPT_TRIES = args.kv_max_preempt_tries
     if args.admission_violation_budget is not None:
         global ADMISSION_VIOLATION_BUDGET
         ADMISSION_VIOLATION_BUDGET = args.admission_violation_budget
@@ -812,9 +852,24 @@ def main() -> None:
     if args.prompt_priority is not None:
         global PROMPT_PRIORITY
         PROMPT_PRIORITY = args.prompt_priority
+    if args.gpu_only and args.pim_only:
+        sys.exit("[error] --gpu-only and --pim-only are mutually exclusive")
     if args.gpu_only:
         global GPU_ONLY
         GPU_ONLY = True
+    if args.pim_only:
+        global PIM_ONLY
+        PIM_ONLY = True
+        # KV_OOM_POLICY and KV_MAX_PREEMPT_TRIES are declared global higher up
+        # in main() (in the args.kv_oom_policy / args.kv_max_preempt_tries
+        # blocks). The function-level `global` annotation applies regardless of
+        # whether those blocks ran, so we can assign here without redeclaring.
+        if KV_OOM_POLICY != "hold":
+            print(f"[pim_only]      forcing kv_oom_policy: {KV_OOM_POLICY} → hold")
+            KV_OOM_POLICY = "hold"
+        if KV_MAX_PREEMPT_TRIES != -1:
+            print(f"[pim_only]      forcing kv_max_preempt_tries: {KV_MAX_PREEMPT_TRIES} → -1")
+            KV_MAX_PREEMPT_TRIES = -1
     print(f"[csv]           {REQUESTS_CSV}  ({n} requests)")
     print(f"[model]         {args.model}  layers={NUM_LAYERS} heads={NUM_HEADS} "
           f"kv_heads={NUM_KV_HEADS} d_head={D_HEAD} dtype_bytes={DTYPE_BYTES} "
@@ -823,10 +878,13 @@ def main() -> None:
     print(f"[kv_pool]       {KV_POOL_BYTES} bytes ({KV_POOL_BYTES / (1<<30):.2f} GiB)")
     print(f"[arrival_scale] {ARRIVAL_SCALE}")
     print(f"[slo]           e2e={SLO_E2E_MS}ms  ttft={SLO_TTFT_MS}ms")
-    print(f"[kv_oom]        policy={KV_OOM_POLICY}  hold_limit={KV_OOM_HOLD_LIMIT_MS}ms")
+    print(f"[kv_oom]        policy={KV_OOM_POLICY}  hold_limit={KV_OOM_HOLD_LIMIT_MS}ms  max_preempt_tries={KV_MAX_PREEMPT_TRIES}")
     print(f"[adm_viol_budget] {ADMISSION_VIOLATION_BUDGET}  (-1=disabled, 0=strict, N>=1 tolerate N newly-violated)")
     if GPU_ONLY:
         print("[gpu_only]      ENABLED  PIM route disabled via sentinel hybrid_route_name; 100% routing to GPU")
+    if PIM_ONLY:
+        print("[pim_only]      ENABLED  GPU route disabled via sentinel gpu_route_name; 100% routing to PIM "
+              "(kv_oom_policy=hold, kv_max_preempt_tries=-1 forced)")
     print(f"[route_policy]  {ROUTE_POLICY}  guard_ms={ENERGY_LATENCY_GUARD_MS}")
     print(f"[batching]      max_decode_bs={MAX_DECODE_BATCH_SIZE}  "
           f"max_consec_decode={MAX_CONSECUTIVE_DECODE_BATCHES}  "

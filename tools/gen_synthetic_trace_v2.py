@@ -145,6 +145,30 @@ def mixture_pick(rng: random.Random):
     return AZURE_WIDE_MIXTURE[-1][1], AZURE_WIDE_MIXTURE[-1][2]
 
 
+# Real Azure conv trace used by the 'bootstrap' shape distribution.
+AZURE_CONV_CSV = (Path(__file__).resolve().parents[1]
+                  / "cluster_outputs/azure/AzureLLMInferenceTrace_conv.csv")
+
+
+def load_azure_rows(csv_path: Path) -> list[tuple[int, int]]:
+    """Load (ContextTokens, GeneratedTokens) pairs from the real Azure
+    conv trace for joint bootstrap resampling."""
+    pairs = []
+    with open(csv_path) as f:
+        header = f.readline().strip().split(",")
+        idx_lin = header.index("ContextTokens")
+        idx_lout = header.index("GeneratedTokens")
+        for line in f:
+            parts = line.rstrip("\n").split(",")
+            try:
+                pairs.append((int(parts[idx_lin]), int(parts[idx_lout])))
+            except (ValueError, IndexError):
+                continue
+    if not pairs:
+        raise ValueError(f"no rows parsed from {csv_path}")
+    return pairs
+
+
 PRESETS = {
     "robotic_vla": {
         "lambda_lin":   306,    # vision_prefix(256) + text_instruction(~50)
@@ -182,13 +206,20 @@ def gen_trace(preset_name: str,
     if preset_name not in PRESETS:
         raise ValueError(f"unknown preset {preset_name!r} — "
                          f"choose from {sorted(PRESETS)}")
-    if shape_dist not in ("poisson", "empirical", "mixture_poisson"):
+    if shape_dist not in ("poisson", "empirical", "mixture_poisson",
+                          "bootstrap"):
         raise ValueError(f"unknown shape_dist {shape_dist!r}")
-    if shape_dist in ("empirical", "mixture_poisson") \
+    if shape_dist in ("empirical", "mixture_poisson", "bootstrap") \
             and preset_name != "conversational":
         # robotic_vla has no analogue source trace for these shapes.
         raise ValueError(f"--shape-distribution {shape_dist} only valid "
                          "with --preset conversational")
+
+    # Bootstrap: joint (Lin, Lout) row resampling from the real trace.
+    # Unlike 'empirical' (independent marginals), this preserves the
+    # Lin-Lout correlation of the real workload exactly.
+    azure_pairs = load_azure_rows(AZURE_CONV_CSV) \
+        if shape_dist == "bootstrap" else None
 
     cfg = dict(PRESETS[preset_name])
 
@@ -234,6 +265,8 @@ def gen_trace(preset_name: str,
             # and Lout, matching Azure's "short prompts → short completions").
             lin_l, lout_l = mixture_pick(rng)
             lin_raw, lout_raw = poisson(lin_l), poisson(lout_l)
+        elif shape_dist == "bootstrap":
+            lin_raw, lout_raw = azure_pairs[rng.randrange(len(azure_pairs))]
         else:
             lin_raw, lout_raw = sample_lin_lout_independent()
 
@@ -263,7 +296,8 @@ def main():
                     help="Only meaningful for --preset robotic_vla. "
                          "openvla=Lout~Poisson(7), pi0=Lout~Poisson(50).")
     ap.add_argument("--shape-distribution",
-                    choices=["poisson", "empirical", "mixture_poisson"],
+                    choices=["poisson", "empirical", "mixture_poisson",
+                             "bootstrap"],
                     default="poisson",
                     help="poisson = Lin~Poisson(λ), Lout~Poisson(λ); "
                          "empirical = inverse-CDF sample from AZURE_*_CDF "
@@ -271,7 +305,11 @@ def main():
                          "preset only); mixture_poisson = pick a mode by "
                          "weighted choice, then Poisson within (4 modes "
                          "match Azure's p50/p90/p99/tail; conversational "
-                         "preset only). Default poisson.")
+                         "preset only); bootstrap = sample (Lin, Lout) "
+                         "ROWS jointly with replacement from the real "
+                         "Azure 19k conv trace (preserves the Lin-Lout "
+                         "correlation; conversational preset only). "
+                         "Default poisson.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--start-time", type=str,
                     default="2026-05-14 00:00:00")
@@ -305,6 +343,9 @@ def main():
     elif args.shape_distribution == "empirical":
         print(f"  Lin   ~ empirical CDF (101-point) from full 19k Azure conv")
         print(f"  Lout  ~ empirical CDF (101-point) from full 19k Azure conv")
+    elif args.shape_distribution == "bootstrap":
+        print(f"  (Lin, Lout) rows resampled jointly from {AZURE_CONV_CSV.name}"
+              f" (clipped to Lin<=6144, Lout<=800)")
     else:  # mixture_poisson
         print("  Shape ~ mixture of 4 Poissons matching Azure percentiles:")
         for w, lin_l, lout_l, label in AZURE_WIDE_MIXTURE:

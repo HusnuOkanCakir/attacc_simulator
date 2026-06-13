@@ -127,6 +127,7 @@ preset_for() {
     azure_poisson)       echo "conversational" ;;
     azure_empirical)     echo "conversational" ;;
     azure_poisson_wide)  echo "conversational" ;;
+    azure_bootstrap)     echo "conversational" ;;
     azure_real|azure_full19k) echo "REAL" ;;
     *)                   echo "robotic_vla" ;;
   esac
@@ -135,6 +136,7 @@ shape_for() {
   case "$1" in
     azure_empirical)     echo "empirical" ;;
     azure_poisson_wide)  echo "mixture_poisson" ;;
+    azure_bootstrap)     echo "bootstrap" ;;
     azure_real|azure_full19k) echo "real" ;;
     *)                   echo "poisson" ;;
   esac
