@@ -76,7 +76,8 @@ def collect(sweep_dir):
     return sorted(rows, key=lambda t: t[1])
 
 
-def render(pts, out_dir, out_name, linear=False, x_max=None):
+def render(pts, out_dir, out_name, linear=False, x_max=None, drop_last=0,
+           show_ceiling=True):
     configure_plotting()
     # Local font overrides — defaults render ~3 pt after LaTeX scales the
     # figure to \linewidth. Bump everything so the rendered text is readable.
@@ -89,6 +90,8 @@ def render(pts, out_dir, out_name, linear=False, x_max=None):
 
     if x_max is not None:
         pts = [p for p in pts if p[1] <= x_max]
+    if drop_last:
+        pts = pts[:-drop_last]  # pts are sorted ascending by offered RPS
 
     xs = [p[1] for p in pts]
     ys = [p[2] / 1000.0 for p in pts]  # ms → s
@@ -102,12 +105,13 @@ def render(pts, out_dir, out_name, linear=False, x_max=None):
             transform=ax.get_xaxis_transform(),
             ha="right", va="bottom",
             color="#1f77b4", fontsize=FAN, fontweight="bold")
-    ax.axvline(CEILING, color="#c0392b", linestyle=":", lw=1.6,
-               alpha=0.75, zorder=3)
-    ax.text(CEILING, 0.04, "  ceiling 2.10",
-            transform=ax.get_xaxis_transform(),
-            ha="left", va="bottom",
-            color="#c0392b", fontsize=FAN, fontweight="bold")
+    if show_ceiling:
+        ax.axvline(CEILING, color="#c0392b", linestyle=":", lw=1.6,
+                   alpha=0.75, zorder=3)
+        ax.text(CEILING, 0.04, "  ceiling 2.10",
+                transform=ax.get_xaxis_transform(),
+                ha="left", va="bottom",
+                color="#c0392b", fontsize=FAN, fontweight="bold")
 
     if not linear:
         ax.set_xscale("log")
@@ -137,6 +141,11 @@ def main():
     ap.add_argument("--x-max", type=float, default=None,
                     help="Clip cells past this offered RPS to hide the "
                          "finite-trace plateau (e.g. --x-max 2.1).")
+    ap.add_argument("--drop-last", type=int, default=0,
+                    help="Drop the N right-most (highest offered RPS) points "
+                         "after the --x-max filter.")
+    ap.add_argument("--no-ceiling", dest="show_ceiling", action="store_false",
+                    help="Hide the red ceiling line and its label.")
     ap.add_argument("--out-name", default="fig_rps_knee_a5000_solo_rawp99")
     args = ap.parse_args()
 
@@ -150,7 +159,8 @@ def main():
 
     name = args.out_name + ("_linear" if args.linear else "")
     render(pts, REPO / "thesis_plotting/figures", name,
-           linear=args.linear, x_max=args.x_max)
+           linear=args.linear, x_max=args.x_max, drop_last=args.drop_last,
+           show_ceiling=args.show_ceiling)
 
 
 if __name__ == "__main__":

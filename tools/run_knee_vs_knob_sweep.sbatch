@@ -93,6 +93,14 @@ echo "python:    $(python -V 2>&1)"
 # Optional.
 DATASET="${DATASET:-azure_poisson_wide}"
 ARRIVAL_SCALES="${ARRIVAL_SCALES:-30 20 15 10 7 5 3 2 1.5}"
+# If OFFERED_RPS is set (space-separated offered RPS, NOT achieved), it
+# overrides ARRIVAL_SCALES: each offered value is auto-translated to an
+# arrival_scale via K = N/native-span (offered ~ K/scale). To keep the very
+# low-offered cells tractable, per-cell N is reduced so the simulated span
+# stays <= SPAN_CAP_S (offered RPS is N-independent, so the x-value is kept).
+OFFERED_RPS="${OFFERED_RPS:-}"
+SPAN_CAP_S="${SPAN_CAP_S:-9000}"
+N_MIN="${N_MIN:-200}"
 N_REQUESTS="${N_REQUESTS:-5000}"
 MODEL="${MODEL:-pi0}"
 POLICY="${POLICY:-max_util_full}"
@@ -122,6 +130,10 @@ case "$DATASET" in
     ;;
   azure_poisson_wide)
     CSV_PATH="${ROOT_DIR}/cluster_outputs/synthetic_v2/azure_poisson_wide_n5000_seed0.csv"
+    DEFAULT_N=5000
+    ;;
+  bootstrap)
+    CSV_PATH="${ROOT_DIR}/cluster_outputs/synthetic_v2/azure_bootstrap_n5000_seed0.csv"
     DEFAULT_N=5000
     ;;
   azure_empirical)
@@ -188,6 +200,45 @@ if [ ! -s "$CSV_PATH" ]; then
   log "[error] CSV not found at $CSV_PATH"; exit 1
 fi
 
+# Build the per-cell (arrival_scale, n_requests) plan.
+#   - Default: ARRIVAL_SCALES at the fixed N_REQUESTS.
+#   - OFFERED_RPS set: translate each offered RPS to arrival_scale via
+#     K = N/native-span (offered ~ K/scale), and cap per-cell N so the
+#     simulated span stays <= SPAN_CAP_S.
+CELL_SCALES=(); CELL_NS=(); CELL_OFF=()
+if [ -n "$OFFERED_RPS" ]; then
+  PLAN=$("$PY" - "$CSV_PATH" "$N_REQUESTS" "$SPAN_CAP_S" "$N_MIN" $OFFERED_RPS <<'PYEOF'
+import sys, pandas as pd
+csv, n_target, span_cap, n_min = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
+offereds = [float(x) for x in sys.argv[5:]]
+df = pd.read_csv(csv, nrows=n_target)
+t = pd.to_datetime(df["TIMESTAMP"])
+span_s = (t.max() - t.min()).total_seconds()
+K = len(df) / span_s            # offered RPS at arrival_scale = 1
+print(f"K {K:.6f}")
+for off in offereds:
+    scale = K / off
+    ncell = min(n_target, int(span_cap * off))
+    ncell = max(ncell, n_min)
+    print(f"CELL {off:.3f} {scale:.5f} {ncell}")
+PYEOF
+)
+  while read -r tag a b c; do
+    case "$tag" in
+      K)    log "offered->scale: K=$a (offered RPS at arrival_scale=1)" ;;
+      CELL) CELL_OFF+=("$a"); CELL_SCALES+=("$b"); CELL_NS+=("$c") ;;
+    esac
+  done <<< "$PLAN"
+  log "OFFERED_RPS mode: ${#CELL_SCALES[@]} points (span_cap=${SPAN_CAP_S}s, n_min=$N_MIN)"
+  for k in "${!CELL_SCALES[@]}"; do
+    log "  offered=${CELL_OFF[$k]}  scale=${CELL_SCALES[$k]}  n=${CELL_NS[$k]}"
+  done
+else
+  for s in $ARRIVAL_SCALES; do
+    CELL_SCALES+=("$s"); CELL_NS+=("$N_REQUESTS"); CELL_OFF+=("-")
+  done
+fi
+
 # Build per-cell command. The varied knob's flag/value is inlined.
 # Special-case toggles (flags that take no value):
 #   --gpu-only-toggle      with values {hybrid, gpu_only}
@@ -198,6 +249,7 @@ run_one() {
   local label=$1
   local knob_value=$2
   local scale=$3
+  local n_cell=${4:-$N_REQUESTS}
   local run_dir="${SWEEP_DIR}/${label}"
   local cache_file="${CACHE_DIR}/${MODEL}_${GPU_TYPE}_knee_vs_${KNOB_NAME}_$(safe_label $knob_value)_${DATASET}.bin"
 
@@ -218,7 +270,7 @@ run_one() {
     knob_arg="${KNOB_FLAG} ${knob_value}"
   fi
 
-  log "── start: $label  knob_value=$knob_value  scale=$scale ──"
+  log "── start: $label  knob_value=$knob_value  scale=$scale  n=$n_cell ──"
   log "    cache: $cache_file"
 
   # Prompt priority flag — skipped when the toggle is the swept knob.
@@ -236,7 +288,7 @@ run_one() {
   "$PY" "$RUNNER" \
       --model "$MODEL" \
       --gpu "$GPU_TYPE" \
-      --n-requests "$N_REQUESTS" \
+      --n-requests "$n_cell" \
       --policies "$POLICY" \
       --kv-pool-gb "$KV_POOL_GB" --ml \
       --max-active "$MAX_ACTIVE" \
@@ -262,9 +314,10 @@ run_one() {
 # ── Sweep ────────────────────────────────────────────────────────────────────
 i=1
 for knob_value in $KNOB_VALUES; do
-  for scale in $ARRIVAL_SCALES; do
+  for idx in "${!CELL_SCALES[@]}"; do
+    scale="${CELL_SCALES[$idx]}"; n_cell="${CELL_NS[$idx]}"
     label=$(printf "%02d_%s_%s_%s" "$i" "$KNOB_NAME" "$(safe_label $knob_value)" "$(scale_label $scale)")
-    run_one "$label" "$knob_value" "$scale"
+    run_one "$label" "$knob_value" "$scale" "$n_cell"
     i=$((i+1))
   done
 done

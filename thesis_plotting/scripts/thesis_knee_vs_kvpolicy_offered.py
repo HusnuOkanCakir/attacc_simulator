@@ -100,7 +100,8 @@ def load_cells(sweep_dirs):
     return rows
 
 
-def render(rows, out_dir: Path, out_name: str = OUT_NAME, linear: bool = False):
+def render(rows, out_dir: Path, out_name: str = OUT_NAME, linear: bool = False,
+           title=None):
     configure_plotting()
     # Local font overrides — defaults (FONT_BASE=7) render ~3 pt after LaTeX
     # scales the figure to \linewidth. Bump for readability.
@@ -153,7 +154,7 @@ def render(rows, out_dir: Path, out_name: str = OUT_NAME, linear: bool = False):
     ax.set_ylabel("E2E p99  (s"
                   + ("" if linear else ", log scale") + ")",
                   fontsize=FL, fontweight="bold")
-    ax.set_title("Pi0 @ azure_poisson_wide  —  KV allocation policy at 0.25 GiB pool",
+    ax.set_title(title or "Pi0 @ azure_poisson_wide  —  KV allocation policy at 0.25 GiB pool",
                  fontsize=FTI, fontweight="bold")
     ax.tick_params(axis="both", which="major", labelsize=FTK)
     ax.grid(True, which="major", alpha=0.45)
@@ -176,6 +177,8 @@ def main():
     ap.add_argument("--out-name", default=OUT_NAME)
     ap.add_argument("--sweep-dirs", type=Path, nargs="+", default=[SWEEP],
                     help="One or more sweep dirs to merge.")
+    ap.add_argument("--title", default=None,
+                    help="override plot title (e.g. for the bootstrap trace)")
     args = ap.parse_args()
 
     rows = load_cells(args.sweep_dirs)
@@ -189,7 +192,8 @@ def main():
             print(f"    s={scale:>5.2f}  offered={offered:>5.2f}  "
                   f"achieved={achieved:>5.2f}  e2e_p99={p99/1000.0:>8.1f}s")
     name = args.out_name + ("_linear" if args.linear else "")
-    render(rows, REPO / "thesis_plotting/figures", name, args.linear)
+    render(rows, REPO / "thesis_plotting/figures", name, args.linear,
+           title=args.title)
 
 
 if __name__ == "__main__":

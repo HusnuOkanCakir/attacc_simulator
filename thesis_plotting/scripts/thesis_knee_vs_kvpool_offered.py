@@ -108,8 +108,10 @@ def load_cells(sweep_dirs, keep_values):
     return rows
 
 
-def render(rows, out_dir: Path, out_name: str, keep_order, linear: bool = False):
+def render(rows, out_dir: Path, out_name: str, keep_order, linear: bool = False,
+           title=None, pool_xmax=None, ref_in_legend=False):
     configure_plotting()
+    pool_xmax = pool_xmax or {}
     # Local font overrides — defaults (FONT_BASE=7) render ~3 pt after LaTeX
     # scales the figure to \linewidth. Bump for readability.
     FL  = FONT_LABEL    + 8   # 15  axis labels
@@ -126,15 +128,24 @@ def render(rows, out_dir: Path, out_name: str, keep_order, linear: bool = False)
         if pool not in by_pool:
             continue
         pts = sorted(by_pool[pool], key=lambda r: r[0])
+        xm = pool_xmax.get(pool)
+        if xm is not None:
+            pts = [p for p in pts if p[0] <= xm]
         xs = [p[0] for p in pts]
         ys = [p[2] / 1000.0 for p in pts]
+        safe = 0.9 * max(p[1] for p in by_pool[pool])
+        lbl = POOL_LABEL[pool]
+        if ref_in_legend:
+            lbl += f"   (ref {safe:.2f})"
         ax.plot(xs, ys, marker=POOL_MARKER[pool], ms=10, lw=2.4,
-                color=POOL_COLOR[pool], label=POOL_LABEL[pool],
+                color=POOL_COLOR[pool], label=lbl,
                 markeredgecolor="black", markeredgewidth=0.6, zorder=4)
 
     # Per-pool ref operating point: 0.9 x pool-specific achieved-RPS ceiling.
     # Each pool size hits its own throughput plateau; the unconstrained ceiling
     # (2.10 RPS at max_active=5000) is only reached by the 64 GiB pool.
+    # With ref_in_legend the values are shown in the legend and the vlines are
+    # drawn unlabeled (avoids overlapping text when the ref-ops cluster).
     label_offsets = {"0_25": 0.03, "1": 0.10, "8": 0.17, "64": 0.24}
     for pool in keep_order:
         if pool not in by_pool:
@@ -145,12 +156,13 @@ def render(rows, out_dir: Path, out_name: str, keep_order, linear: bool = False)
         color = POOL_COLOR[pool]
         ax.axvline(safe, color=color, linestyle="--", linewidth=1.4,
                    zorder=3, alpha=0.75)
-        ax.text(safe, label_offsets.get(pool, 0.03),
-                f"  ref {POOL_LABEL[pool]} {safe:.2f}",
-                transform=ax.get_xaxis_transform(),
-                ha="left", va="bottom",
-                color=color, fontsize=FAN,
-                fontweight="bold")
+        if not ref_in_legend:
+            ax.text(safe, label_offsets.get(pool, 0.03),
+                    f"  ref {POOL_LABEL[pool]} {safe:.2f}",
+                    transform=ax.get_xaxis_transform(),
+                    ha="left", va="bottom",
+                    color=color, fontsize=FAN,
+                    fontweight="bold")
 
     if not linear:
         ax.set_xscale("log")
@@ -161,7 +173,7 @@ def render(rows, out_dir: Path, out_name: str, keep_order, linear: bool = False)
     ax.set_ylabel("E2E p99  (s"
                   + ("" if linear else ", log scale") + ")",
                   fontsize=FL, fontweight="bold")
-    ax.set_title("Pi0 @ azure_poisson_wide  —  knee vs KV pool size",
+    ax.set_title(title or "Pi0 @ azure_poisson_wide  —  knee vs KV pool size",
                  fontsize=FTI, fontweight="bold")
     ax.tick_params(axis="both", which="major", labelsize=FTK)
     ax.grid(True, which="major", alpha=0.45)
@@ -187,7 +199,20 @@ def main():
                     default=",".join(DEFAULT_KEEP),
                     help="Comma-separated underscore-form pool values "
                          "(e.g. '0_25,1,8,64'). Default: %(default)s.")
+    ap.add_argument("--title", default=None,
+                    help="override plot title (e.g. for the bootstrap trace)")
+    ap.add_argument("--pool-xmax", default=None,
+                    help="per-pool offered-RPS clip, e.g. "
+                         "'0_25:2.6,1:2.6,8:3.1,64:3.1' (drops the flat plateau)")
+    ap.add_argument("--ref-in-legend", action="store_true",
+                    help="put per-pool ref-op values in the legend and leave "
+                         "the vlines unlabeled (avoids overlapping text)")
     args = ap.parse_args()
+    pool_xmax = {}
+    if args.pool_xmax:
+        for tok in args.pool_xmax.split(","):
+            k, v = tok.split(":")
+            pool_xmax[k.strip()] = float(v)
 
     keep = [v.strip() for v in args.keep_values.split(",") if v.strip()]
     rows = load_cells(args.sweep_dirs, set(keep))
@@ -203,7 +228,8 @@ def main():
             print(f"    s={scale:>5.2f}  offered={offered:>5.2f}  "
                   f"achieved={achieved:>5.2f}  e2e_p99={p99/1000.0:>8.1f}s")
     name = args.out_name + ("_linear" if args.linear else "")
-    render(rows, REPO / "thesis_plotting/figures", name, keep, args.linear)
+    render(rows, REPO / "thesis_plotting/figures", name, keep, args.linear,
+           title=args.title, pool_xmax=pool_xmax, ref_in_legend=args.ref_in_legend)
 
 
 if __name__ == "__main__":

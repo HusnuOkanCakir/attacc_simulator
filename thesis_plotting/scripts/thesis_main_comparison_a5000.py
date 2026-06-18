@@ -56,7 +56,9 @@ def load_cell(cell_dir: Path) -> dict | None:
     return parse_summary(sumfile)
 
 
-def render(cells: dict, out_dir: Path, out_name: str):
+def render(cells: dict, out_dir: Path, out_name: str,
+           dataset_label: str = DATASET_LABEL,
+           mean_offered: float = MEAN_OFFERED_RPS):
     configure_plotting()
     if not cells.get("hybrid") or not cells.get("gpuonly"):
         sys.exit("[error] missing hybrid or gpuonly cell")
@@ -144,7 +146,7 @@ def render(cells: dict, out_dir: Path, out_name: str):
         set_spines(ax)
 
     sup = (f"{MODEL_DISPLAY} @ ref operating point   "
-           f"({DATASET_LABEL}, mean offered load ≈ {MEAN_OFFERED_RPS:.2f} RPS)")
+           f"({dataset_label}, mean offered load ≈ {mean_offered:.2f} RPS)")
     fig.suptitle(sup, fontsize=FTI, fontweight="bold", y=0.995)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
     save_fig(fig, out_name, out_dir)
@@ -152,9 +154,18 @@ def render(cells: dict, out_dir: Path, out_name: str):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--hybrid-cell", type=Path, default=HYBRID_CELL)
+    ap.add_argument("--gpuonly-cell", type=Path, default=GPUONLY_CELL)
+    ap.add_argument("--out-name", default="fig_main_comparison_a5000_pi0_wide")
+    ap.add_argument("--dataset-label", default=DATASET_LABEL)
+    ap.add_argument("--offered", type=float, default=MEAN_OFFERED_RPS)
+    args = ap.parse_args()
+
     cells = {
-        "hybrid":  load_cell(HYBRID_CELL),
-        "gpuonly": load_cell(GPUONLY_CELL),
+        "hybrid":  load_cell(args.hybrid_cell),
+        "gpuonly": load_cell(args.gpuonly_cell),
     }
     for mode, c in cells.items():
         if c is None:
@@ -162,8 +173,8 @@ def main():
         print(f"[info] {mode}: thru={c.get('throughput'):.2f} "
               f"ttft_p99={c.get('ttft_p99'):.0f}ms "
               f"e2e_p99={c.get('e2e_p99')/1000.0:.1f}s")
-    render(cells, REPO / "thesis_plotting/figures",
-           "fig_main_comparison_a5000_pi0_wide")
+    render(cells, REPO / "thesis_plotting/figures", args.out_name,
+           dataset_label=args.dataset_label, mean_offered=args.offered)
 
 
 if __name__ == "__main__":

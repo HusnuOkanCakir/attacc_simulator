@@ -79,11 +79,12 @@ def main():
     gpu = pd.read_csv(GPU_CSV)
     pim = pd.read_csv(PIM_CSV)
 
-    fig, ax = plt.subplots(figsize=(12.5, 6.5))
+    fig, ax = plt.subplots(figsize=(13.5, 6.8))
 
     bar_w = 0.36
-    group_gap = 1.2
+    group_gap = 1.5
     xticks, xlabels = [], []
+    ATTN_COMP = "Attention layer\n(on-chip mem & compute)"
 
     print(f"{'shape':<8} {'route':<5} " +
           " ".join(f"{c[0].splitlines()[0][:12]:>14}" for c in COMPONENTS) +
@@ -98,16 +99,32 @@ def main():
             x = x0 + (bi - 0.5) * (bar_w + 0.04)
             bottom = 0.0
             vals = []
+            attn_comp = None
             for _name, cols, color, hatch in COMPONENTS:
                 v = sum(row[c] for c in cols) / g_total
                 vals.append(v)
                 ax.bar(x, v, bar_w, bottom=bottom,
                        facecolor=color, hatch=hatch,
                        edgecolor="black", linewidth=0.7, zorder=3)
+                if _name == ATTN_COMP:
+                    attn_comp = (bottom + v / 2.0, v)  # (segment center y, value)
                 bottom += v
             ax.text(x, bottom + 0.015, route,
                     ha="center", va="bottom",
                     fontsize=FAN, fontweight="bold")
+            # Explicit numeric callout for the faint on-chip attention sliver:
+            # GPU label to the left, PIM label to the right, with a thin leader.
+            if attn_comp is not None:
+                yc, v = attn_comp
+                side = -1 if route == "GPU" else 1
+                ax.annotate(
+                    f"{v*100:.2f}%",
+                    xy=(x + side * bar_w / 2.0, yc),
+                    xytext=(x + side * (bar_w / 2.0 + 0.28), yc),
+                    ha=("right" if side < 0 else "left"), va="center",
+                    fontsize=FAN - 4, color="#a8541f",
+                    arrowprops=dict(arrowstyle="-", color="#a8541f", lw=0.6),
+                    zorder=6)
             print(f"{label:<8} {route:<5} " +
                   " ".join(f"{v:>14.4f}" for v in vals) +
                   f" {sum(row[c] for cc in COMPONENTS for c in cc[1])/1e6:>13.1f}")
@@ -118,9 +135,10 @@ def main():
 
     ax.set_xticks(xticks)
     ax.set_xticklabels(xlabels, fontsize=FTK)
+    ax.set_xlim(xticks[0] - 0.95, xticks[-1] + 0.95)
     ax.set_ylabel("Normalized energy per output token",
                   fontsize=FL, fontweight="bold")
-    ax.set_ylim(0, 1.18)
+    ax.set_ylim(0, 1.30)
     ax.set_title("Per-token decode energy breakdown: GPU-only vs GPU+PIM "
                  "(Pi0, A6000 target, bs=1)\n"
                  "normalized to GPU-only per shape; absolute GPU-only "

@@ -83,7 +83,9 @@ def load_cells(sweep_dir: Path):
     return rows
 
 
-def render(rows, out_dir: Path, out_name: str, linear: bool):
+def render(rows, out_dir: Path, out_name: str, linear: bool,
+           title=None, ref_rps=SAFE_HYBRID,
+           hybrid_xmax=None, gpuonly_xmax=None):
     # Local font overrides — defaults (FONT_BASE=7) render ~3 pt after LaTeX
     # scales the figure to \linewidth. Bump for readability.
     FL  = FONT_LABEL    + 8   # 15  axis labels
@@ -97,24 +99,29 @@ def render(rows, out_dir: Path, out_name: str, linear: bool):
 
     fig, ax = plt.subplots(figsize=(10.5, 6.0))
 
+    route_xmax = {"hybrid": hybrid_xmax, "gpu_only": gpuonly_xmax}
     for route in ["gpu_only", "hybrid"]:
         if route not in by_route:
             continue
         pts = sorted(by_route[route], key=lambda r: r[0])
+        xm = route_xmax.get(route)
+        if xm is not None:
+            pts = [p for p in pts if p[0] <= xm]
         xs = [p[0] for p in pts]
         ys = [p[2] / 1000.0 for p in pts]
         ax.plot(xs, ys, marker=ROUTE_MARKER[route], ms=10, lw=2.5,
                 color=ROUTE_COLOR[route], label=ROUTE_LABEL[route],
                 markeredgecolor="black", markeredgewidth=0.7, zorder=4)
 
-    ax.axvline(SAFE_HYBRID, color="#1f77b4", linestyle="--",
-               linewidth=1.6, alpha=0.8, zorder=3)
-    ax.text(SAFE_HYBRID, 0.04, "ref op 1.91 (hybrid)  ",
-            transform=ax.get_xaxis_transform(),
-            ha="right", va="bottom",
-            color="#1f77b4", fontsize=FAN, fontweight="bold",
-            bbox=dict(facecolor="white", edgecolor="none",
-                      pad=1.5, alpha=0.85))
+    if ref_rps and ref_rps > 0:
+        ax.axvline(ref_rps, color="#1f77b4", linestyle="--",
+                   linewidth=1.6, alpha=0.8, zorder=3)
+        ax.text(ref_rps, 0.04, f"ref op {ref_rps:.2f} (hybrid)  ",
+                transform=ax.get_xaxis_transform(),
+                ha="right", va="bottom",
+                color="#1f77b4", fontsize=FAN, fontweight="bold",
+                bbox=dict(facecolor="white", edgecolor="none",
+                          pad=1.5, alpha=0.85))
 
     if not linear:
         ax.set_xscale("log")
@@ -125,7 +132,7 @@ def render(rows, out_dir: Path, out_name: str, linear: bool):
     ax.set_ylabel("E2E p99  (s"
                   + ("" if linear else ", log scale") + ")",
                   fontsize=FL, fontweight="bold")
-    ax.set_title("Pi0 @ azure_poisson_wide  —  knee vs route",
+    ax.set_title(title or "Pi0 @ azure_poisson_wide  —  knee vs route",
                  fontsize=FTI, fontweight="bold")
     ax.tick_params(axis="both", which="major", labelsize=FTK)
     ax.grid(True, which="major", alpha=0.45)
@@ -146,11 +153,23 @@ def main():
     ap.add_argument("--linear", action="store_true",
                     help="linear axes instead of log-log")
     ap.add_argument("--out-name", default="fig_knee_vs_route_offered")
+    ap.add_argument("--sweep-dirs", type=Path, nargs="+", default=[SWEEP],
+                    help="one or more route knee sweep dirs to merge")
+    ap.add_argument("--title", default=None,
+                    help="override plot title (e.g. for the bootstrap trace)")
+    ap.add_argument("--ref-rps", type=float, default=SAFE_HYBRID,
+                    help="hybrid ref-op vertical line; <=0 hides it")
+    ap.add_argument("--hybrid-xmax", type=float, default=None,
+                    help="drop hybrid points with offered RPS above this")
+    ap.add_argument("--gpuonly-xmax", type=float, default=None,
+                    help="drop gpu_only points with offered RPS above this")
     args = ap.parse_args()
 
-    rows = load_cells(SWEEP)
+    rows = []
+    for d in args.sweep_dirs:
+        rows += load_cells(d)
     if not rows:
-        sys.exit(f"[error] no cells found in {SWEEP}")
+        sys.exit(f"[error] no cells found in {args.sweep_dirs}")
     print(f"[info] {len(rows)} cells loaded")
     for route in sorted({r[0] for r in rows}):
         print(f"  {route}:")
@@ -160,7 +179,9 @@ def main():
                   f"achieved={achieved:>5.2f}  e2e_p99={p99/1000.0:>8.1f}s")
 
     name = args.out_name + ("_linear" if args.linear else "")
-    render(rows, REPO / "thesis_plotting/figures", name, args.linear)
+    render(rows, REPO / "thesis_plotting/figures", name, args.linear,
+           title=args.title, ref_rps=args.ref_rps,
+           hybrid_xmax=args.hybrid_xmax, gpuonly_xmax=args.gpuonly_xmax)
 
 
 if __name__ == "__main__":
