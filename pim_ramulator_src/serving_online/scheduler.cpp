@@ -92,11 +92,12 @@ bool Scheduler::all_done() const {
 // ─── tick() ──────────────────────────────────────────────────────────────────
 
 std::optional<ActiveTask> Scheduler::tick(double now_ms,
-                                          double gpu_free_ms,
-                                          double pim_free_ms) {
+                                          const ResourceState& hw,
+                                          bool want_pick) {
   enqueue_arrivals(now_ms);
-  process_admission(now_ms, gpu_free_ms, pim_free_ms);
-  auto task = pick_task(now_ms, gpu_free_ms, pim_free_ms);
+  process_admission(now_ms, hw);
+  if (!want_pick) return std::nullopt;
+  auto task = pick_task(now_ms);
   // Phase E (telemetry): record the actual batch size of any decode task
   // launched this tick. pick_task is const, so we record here in the
   // (non-const) tick path. Prefill tasks are recorded separately if needed
@@ -245,19 +246,151 @@ uint64_t Scheduler::projected_in_flight_kv_bytes() const {
 
 double Scheduler::predict_finish(const std::string& route,
                                   int context_tokens, int generated_tokens,
-                                  double now_ms, double gpu_free_ms,
-                                  double pim_free_ms) const {
+                                  double now_ms, const ResourceState& hw) const {
   auto pred = predict_finish_detail(route, context_tokens, generated_tokens,
-                                    now_ms, gpu_free_ms, pim_free_ms);
+                                    now_ms, hw);
   return pred ? pred->finish_ms : -1.0;
 }
 
 std::optional<Scheduler::PredictionEstimate> Scheduler::predict_finish_detail(
     const std::string& route,
     int context_tokens, int generated_tokens,
-    double now_ms, double gpu_free_ms, double pim_free_ms) const {
+    double now_ms, const ResourceState& hw) const {
   auto est = m_table->estimate(route, context_tokens, generated_tokens, 1);
   if (!est) return std::nullopt;
+
+  // ── Pipeline (two-server) finish estimate ────────────────────────────────
+  // Under exec_model="pipeline" the GPU and PIM are independent servers that
+  // run concurrently. The GPU server processes prefill, gpu_only decode, and
+  // the FC stage of pim-route decode; the PIM server processes pim-route
+  // attention. A candidate's finish is the max over the server paths it
+  // touches (a flow-shop lower bound): each server must clear its own backlog
+  // plus the candidate's own work. This makes a pim-route candidate's finish
+  // grow with the PIM backlog while a gpu_only candidate's finish depends only
+  // on the GPU backlog, so min_finish / latency_guarded_energy spill overflow
+  // to the GPU exactly when PIM is the bottleneck — the balancing the serial
+  // (single-server) estimate cannot express.
+  if (m_cfg.exec_model == "pipeline") {
+    // ── 2-GPU pipeline (num_gpus>=2): dedicated gpu_only lane on GPU2 ──────────
+    // The hybrid (pim+gpu) route runs on GPU1 (prefill + FC) in parallel with PIM
+    // (attention); the gpu_only route runs entirely on the dedicated GPU2. The
+    // two lanes carry independent backlogs, so the gpu_only finish stops tracking
+    // the hybrid GPU1 load and the router spills overflow to GPU2 once the hybrid
+    // queue is deeper than GPU2's idle path. Continuous batching: a candidate
+    // joins its lane's in-flight decode batch at the next iteration if a slot is
+    // free (no decode-backlog wait), per Splitwise / vLLM iteration-level
+    // scheduling.
+    if (m_cfg.num_gpus >= 2) {
+      double hyb_prefill_ms = 0.0, g2_prefill_ms = 0.0;
+      double fc_work = 0.0, pim_attn_work = 0.0, g2_decode_work = 0.0;
+      int pim_reqs = 0, g2_reqs = 0, hybrid_fill = 0, g2_fill = 0;
+      for (int i : m_waiting_prefill) {
+        const auto& r = m_requests[i];
+        if (r.in_flight) continue;
+        if (r.route == m_cfg.pim_route_name) hyb_prefill_ms += r.svc.prefill_e2e_ms;
+        else                                  g2_prefill_ms  += r.svc.prefill_e2e_ms;
+      }
+      for (int i : m_waiting_decode) {
+        const auto& r = m_requests[i];
+        const bool is_pim = (r.route == m_cfg.pim_route_name);
+        if (r.in_flight) { if (is_pim) ++hybrid_fill; else ++g2_fill; continue; }
+        const int toks = r.remaining_decode;
+        if (toks <= 0) continue;
+        if (is_pim) {
+          fc_work       += static_cast<double>(toks) * r.svc.decode_gpu_ms;
+          pim_attn_work += static_cast<double>(toks) * r.svc.decode_pim_ms;
+          ++pim_reqs;
+        } else {
+          g2_decode_work += static_cast<double>(toks) * r.svc.decode_gpu_ms;
+          ++g2_reqs;
+        }
+      }
+      const int max_bs = std::max(1, m_cfg.max_decode_batch_size);
+      const int pim_bs = std::max(1, std::min(max_bs, pim_reqs));
+      const int g2_bs  = std::max(1, std::min(max_bs, g2_reqs));
+      const double my_tokens = static_cast<double>(est->decode_tokens);
+
+      PredictionEstimate pred;
+      pred.prefill_ms = est->prefill_e2e_ms;
+      if (route == m_cfg.pim_route_name) {
+        // Lane H: GPU1 (prefill + FC) ∥ PIM (attention).
+        const double gpu1_start   = std::max(now_ms, hw.gpu_free_ms) + hyb_prefill_ms;
+        const double prefill_done = gpu1_start + est->prefill_e2e_ms;
+        const bool   free_slot = (hybrid_fill < max_bs);
+        const double fc_wait   = free_slot ? 0.0 : fc_work / pim_bs;
+        const double pim_wait  = free_slot ? 0.0 : pim_attn_work / pim_bs;
+        const double gpu_path  = prefill_done + fc_wait + my_tokens * est->decode_gpu_ms;
+        const double pim_path  = std::max(prefill_done, std::max(now_ms, hw.pim_free_ms))
+                               + pim_wait + my_tokens * est->decode_pim_ms;
+        pred.start_ms        = gpu1_start;
+        pred.decode_total_ms = my_tokens * std::max(est->decode_gpu_ms, est->decode_pim_ms);
+        pred.finish_ms       = std::max(gpu_path, pim_path);
+      } else {
+        // Lane G: dedicated GPU2 (prefill + decode), independent of GPU1/PIM.
+        const double g2_start     = std::max(now_ms, hw.gpu2_free_ms) + g2_prefill_ms;
+        const double prefill_done = g2_start + est->prefill_e2e_ms;
+        const bool   free_slot = (g2_fill < max_bs);
+        const double dec_wait  = free_slot ? 0.0 : g2_decode_work / g2_bs;
+        pred.start_ms        = g2_start;
+        pred.decode_total_ms = my_tokens * est->decode_gpu_ms;
+        pred.finish_ms       = prefill_done + dec_wait + my_tokens * est->decode_gpu_ms;
+      }
+      return pred;
+    }
+
+    double gpu_prefill_ms = 0.0;   // prefill (GPU, not batched)
+    double gpu_pim_fc_work = 0.0;  // pim-route FC token-work (GPU, batched by pim_bs)
+    double gpu_only_work = 0.0;    // gpu-route decode token-work (GPU, batched by gpu_bs)
+    double pim_attn_work = 0.0;    // pim-route attention token-work (PIM, batched by pim_bs)
+    int    pim_reqs = 0, gpu_reqs = 0;
+
+    for (int i : m_waiting_prefill) {
+      const auto& r = m_requests[i];
+      if (r.in_flight) continue;   // committed work already in *_free_ms
+      gpu_prefill_ms += r.svc.prefill_e2e_ms;
+    }
+    for (int i : m_waiting_decode) {
+      const auto& r = m_requests[i];
+      if (r.in_flight) continue;
+      const int toks = r.remaining_decode;
+      if (toks <= 0) continue;
+      if (r.route == m_cfg.pim_route_name) {
+        gpu_pim_fc_work += static_cast<double>(toks) * r.svc.decode_gpu_ms;
+        pim_attn_work   += static_cast<double>(toks) * r.svc.decode_pim_ms;
+        pim_reqs++;
+      } else {
+        gpu_only_work   += static_cast<double>(toks) * r.svc.decode_gpu_ms;
+        gpu_reqs++;
+      }
+    }
+    const int pim_bs = std::max(1, std::min(m_cfg.max_decode_batch_size, pim_reqs));
+    const int gpu_bs = std::max(1, std::min(m_cfg.max_decode_batch_size, gpu_reqs));
+    const double gpu_backlog_ms = gpu_prefill_ms
+        + gpu_pim_fc_work / static_cast<double>(pim_bs)
+        + gpu_only_work   / static_cast<double>(gpu_bs);
+    const double pim_backlog_ms = pim_attn_work / static_cast<double>(pim_bs);
+
+    const double my_tokens = static_cast<double>(est->decode_tokens);
+    const double gpu_path = std::max(now_ms, hw.gpu_free_ms) + gpu_backlog_ms
+                          + est->prefill_e2e_ms + my_tokens * est->decode_gpu_ms;
+
+    PredictionEstimate pred;
+    pred.prefill_ms = est->prefill_e2e_ms;
+    if (route == m_cfg.pim_route_name) {
+      const double pim_path = std::max(now_ms, hw.pim_free_ms) + pim_backlog_ms
+                            + my_tokens * est->decode_pim_ms;
+      pred.start_ms        = std::max(now_ms, std::max(hw.gpu_free_ms, hw.pim_free_ms))
+                           + gpu_backlog_ms;
+      pred.decode_total_ms = my_tokens * std::max(est->decode_gpu_ms,
+                                                  est->decode_pim_ms);
+      pred.finish_ms       = std::max(gpu_path, pim_path);
+    } else {
+      pred.start_ms        = std::max(now_ms, hw.gpu_free_ms) + gpu_backlog_ms;
+      pred.decode_total_ms = my_tokens * est->decode_gpu_ms;
+      pred.finish_ms       = gpu_path;
+    }
+    return pred;
+  }
 
   struct DecodeBacklog {
     double token_work_ms = 0.0;
@@ -324,8 +457,8 @@ std::optional<Scheduler::PredictionEstimate> Scheduler::predict_finish_detail(
   //   GPU-route's start uses gpu_free_ms only (unchanged) since pure
   //   GPU tasks don't touch pim_free_ms.
   const double hw_free_ms = (route == m_cfg.pim_route_name)
-      ? std::max(pim_free_ms, gpu_free_ms)
-      : gpu_free_ms;
+      ? std::max(hw.pim_free_ms, hw.gpu_free_ms)
+      : hw.gpu_free_ms;
   const double base_ms = std::max(now_ms, hw_free_ms);
   const double start = base_ms + queued_prefill_ms;
   const double decode_total =
@@ -343,8 +476,8 @@ std::optional<Scheduler::PredictionEstimate> Scheduler::predict_finish_detail(
 // ─── choose_route() ──────────────────────────────────────────────────────────
 
 std::string Scheduler::choose_route(int context_tokens, int generated_tokens,
-                                     double now_ms, double gpu_free_ms,
-                                     double pim_free_ms, double deadline_ms) const {
+                                     double now_ms, const ResourceState& hw,
+                                     double deadline_ms) const {
   // Collect candidates for all configured routes.
   struct Candidate {
     std::string route;
@@ -357,7 +490,7 @@ std::string Scheduler::choose_route(int context_tokens, int generated_tokens,
   std::vector<Candidate> cands;
   for (const std::string& route : {m_cfg.pim_route_name, m_cfg.gpu_route_name}) {
     double finish = predict_finish(route, context_tokens, generated_tokens,
-                                   now_ms, gpu_free_ms, pim_free_ms);
+                                   now_ms, hw);
     if (finish < 0.0) continue;  // no cost data for this route
 
     auto est = m_table->estimate(route, context_tokens, generated_tokens, 1);
@@ -422,8 +555,7 @@ std::string Scheduler::choose_route(int context_tokens, int generated_tokens,
 int Scheduler::newly_violated_for_route(const RuntimeRequest& D,
                                          const std::string& route,
                                          double now_ms,
-                                         double gpu_free_ms,
-                                         double pim_free_ms) const {
+                                         const ResourceState& hw) const {
   // Phase C′: predict_finish-based interference model.
   //
   // The original per-step delta model (est(N+1) - est(N)) returned 0 in
@@ -460,14 +592,21 @@ int Scheduler::newly_violated_for_route(const RuntimeRequest& D,
   //    - For a GPU-route admission, only gpu_free_ms advances.
   //    - For a PIM-route admission, BOTH advance (PIM-routed decode also runs
   //      FFN/projections on GPU in parallel).
-  const double base_gpu = std::max(now_ms, gpu_free_ms);
-  const double base_pim = std::max(now_ms, pim_free_ms);
   const double decode_tokens = static_cast<double>(D_est->decode_tokens);
-  double new_gpu_free = base_gpu + D_est->prefill_e2e_ms
-                      + decode_tokens * D_est->decode_gpu_ms;
-  double new_pim_free = pim_free_ms;  // GPU-route doesn't touch PIM clock
+  // D's footprint advances its lane's GPU clock (GPU2 for a gpu_only admission
+  // under num_gpus>=2, else GPU1) and, for a PIM admission, the PIM clock too.
+  const bool d_on_gpu2 = (m_cfg.num_gpus >= 2 && route == m_cfg.gpu_route_name);
+  ResourceState hw_new = hw;
+  const double d_gpu_work = D_est->prefill_e2e_ms
+                          + decode_tokens * D_est->decode_gpu_ms;
+  if (d_on_gpu2) {
+    hw_new.gpu2_free_ms = std::max(now_ms, hw.gpu2_free_ms) + d_gpu_work;
+  } else {
+    hw_new.gpu_free_ms = std::max(now_ms, hw.gpu_free_ms) + d_gpu_work;
+  }
   if (route == m_cfg.pim_route_name) {
-    new_pim_free = base_pim + decode_tokens * D_est->decode_pim_ms;
+    hw_new.pim_free_ms = std::max(now_ms, hw.pim_free_ms)
+                       + decode_tokens * D_est->decode_pim_ms;
   }
 
   // 4. For each in-flight r, recompute predict_finish under both clock sets
@@ -478,13 +617,11 @@ int Scheduler::newly_violated_for_route(const RuntimeRequest& D,
     if (r.deadline_ms < 0.0) continue;  // SLO disabled for r
 
     const double r_old = predict_finish(r.route, r.context_tokens,
-                                        r.generated_tokens, now_ms,
-                                        gpu_free_ms, pim_free_ms);
+                                        r.generated_tokens, now_ms, hw);
     if (r_old < 0.0) continue;                       // no cost data for r
     if (r_old > r.deadline_ms) continue;             // already violated → exclude
     const double r_new = predict_finish(r.route, r.context_tokens,
-                                        r.generated_tokens, now_ms,
-                                        new_gpu_free, new_pim_free);
+                                        r.generated_tokens, now_ms, hw_new);
     if (r_new > r.deadline_ms) ++newly_violated;
   }
   return newly_violated;
@@ -492,8 +629,7 @@ int Scheduler::newly_violated_for_route(const RuntimeRequest& D,
 
 // ─── process_admission() ─────────────────────────────────────────────────────
 
-void Scheduler::process_admission(double now_ms, double gpu_free_ms,
-                                   double pim_free_ms) {
+void Scheduler::process_admission(double now_ms, const ResourceState& hw) {
   if (m_waiting_admission.empty()) return;   // fast no-op when nothing to admit
 
   // Sort eligible candidates by (arrival_ms, id) — FCFS. Carry the index so
@@ -518,7 +654,7 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
 
     // Choose the best route.
     std::string route = choose_route(req->context_tokens, req->generated_tokens,
-                                     now_ms, gpu_free_ms, pim_free_ms, req->deadline_ms);
+                                     now_ms, hw, req->deadline_ms);
 
     // Phase C‴ — admission-control violation budget, HOLD-ONLY (no reroute).
     //
@@ -538,8 +674,7 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
     //   <= now_ms — usually after a completion has freed up the route.
     if (!route.empty() && m_cfg.admission_violation_budget >= 0) {
       const int budget = m_cfg.admission_violation_budget;
-      const int nv_chosen = newly_violated_for_route(*req, route, now_ms,
-                                                     gpu_free_ms, pim_free_ms);
+      const int nv_chosen = newly_violated_for_route(*req, route, now_ms, hw);
       if (nv_chosen > budget) {
         // Hold — no reroute attempt. Wait for in-flight to drain.
         req->admission_next_retry_ms = now_ms + m_cfg.admission_retry_interval_ms;
@@ -655,8 +790,7 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
         }
 
         if (do_fallback) {
-          if (try_reroute_to_gpu(wait_idx, "kv_oom_fallback_gpu",
-                                 now_ms, gpu_free_ms, pim_free_ms)) {
+          if (try_reroute_to_gpu(wait_idx, "kv_oom_fallback_gpu", now_ms, hw)) {
             m_admitted_count++;
             continue;
           }
@@ -696,7 +830,7 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
               req->is_lost ? "  [SLO_MISS]" : ""));
     auto pred = predict_finish_detail(route, req->context_tokens,
                                       req->generated_tokens,
-                                      now_ms, gpu_free_ms, pim_free_ms);
+                                      now_ms, hw);
     if (pred) {
       req->scheduler_predicted_start_ms        = pred->start_ms;
       req->scheduler_predicted_finish_ms       = pred->finish_ms;
@@ -721,6 +855,12 @@ void Scheduler::process_admission(double now_ms, double gpu_free_ms,
 
 void Scheduler::complete_task(const ActiveTask& task, double finish_ms) {
   bool any_done = false;
+
+  // Pipeline: this task's requests are no longer occupying an execution slot.
+  // (No-op under exec_model="serial", where in_flight is never set.)
+  for (int idx : task.request_indices) {
+    m_requests[idx].in_flight = false;
+  }
 
   if (task.phase == "prefill") {
     m_consecutive_decode = 0;
@@ -826,8 +966,7 @@ void Scheduler::wake_kv_held(double now_ms) {
 // route is configured (caller should drop).
 
 bool Scheduler::try_reroute_to_gpu(int req_index, const std::string& reason,
-                                    double now_ms, double gpu_free_ms,
-                                    double pim_free_ms) {
+                                    double now_ms, const ResourceState& hw) {
   auto* req = &m_requests[req_index];
   auto gpu_est = m_table->estimate(
       m_cfg.gpu_route_name,
@@ -841,7 +980,7 @@ bool Scheduler::try_reroute_to_gpu(int req_index, const std::string& reason,
   auto pred = predict_finish_detail(
       m_cfg.gpu_route_name,
       req->context_tokens, req->generated_tokens,
-      now_ms, gpu_free_ms, pim_free_ms);
+      now_ms, hw);
   if (pred) {
     req->scheduler_predicted_start_ms        = pred->start_ms;
     req->scheduler_predicted_finish_ms       = pred->finish_ms;
@@ -924,7 +1063,7 @@ bool Scheduler::preempt_lru(int excluded_index, double now_ms) {
       v.full_evict_tries > m_cfg.kv_max_preempt_tries) {
     set_state(best, ReqState::WaitingAdmission);  // transient, helper moves it forward
     if (try_reroute_to_gpu(best, "kv_max_preempt_tries_exceeded",
-                           now_ms, now_ms, now_ms)) {
+                           now_ms, ResourceState{now_ms, now_ms, now_ms})) {
       m_eviction_fallback_count++;
       return true;
     }
@@ -1088,15 +1227,15 @@ bool Scheduler::grow_kv_or_preempt(int req_index, double now_ms) {
 
 // ─── pick_task() ─────────────────────────────────────────────────────────────
 
-std::optional<ActiveTask> Scheduler::pick_task(double now_ms,
-                                                double gpu_free_ms,
-                                                double pim_free_ms) const {
+std::optional<ActiveTask> Scheduler::pick_task(
+    double now_ms,
+    const std::optional<std::string>& route_filter) const {
   bool has_prefill = false;
-  for (const auto& r : m_requests) {
-    if (r.state == ReqState::WaitingPrefill && r.ready_ms <= now_ms) {
-      has_prefill = true;
-      break;
-    }
+  for (int i : m_waiting_prefill) {
+    const auto& r = m_requests[i];
+    if (r.in_flight) continue;                       // already on a slot
+    if (route_filter && r.route != *route_filter) continue;
+    if (r.ready_ms <= now_ms) { has_prefill = true; break; }
   }
 
   // --- Prefill priority ---
@@ -1105,26 +1244,30 @@ std::optional<ActiveTask> Scheduler::pick_task(double now_ms,
   if (has_prefill &&
       (m_cfg.prompt_priority ||
        m_consecutive_decode >= m_cfg.max_consecutive_decode_batches)) {
-    return pick_prefill(now_ms);
+    return pick_prefill(now_ms, route_filter);
   }
 
   // --- Try decode batch ---
-  auto decode = pick_decode_batch(now_ms);
+  auto decode = pick_decode_batch(now_ms, route_filter);
   if (decode) return decode;
 
   // --- Fall back to prefill if decode had nothing ready ---
-  if (has_prefill) return pick_prefill(now_ms);
+  if (has_prefill) return pick_prefill(now_ms, route_filter);
 
   return std::nullopt;
 }
 
 // ─── pick_prefill() ──────────────────────────────────────────────────────────
 
-std::optional<ActiveTask> Scheduler::pick_prefill(double now_ms) const {
+std::optional<ActiveTask> Scheduler::pick_prefill(
+    double now_ms,
+    const std::optional<std::string>& route_filter) const {
   int best_idx = -1;
   // Iterate WaitingPrefill index instead of all of m_requests.
   for (int i : m_waiting_prefill) {
     const auto& r = m_requests[i];
+    if (r.in_flight) continue;          // pipeline: already occupying a slot
+    if (route_filter && r.route != *route_filter) continue;  // per-lane pick
     if (r.ready_ms > now_ms) continue;
     if (best_idx < 0) { best_idx = i; continue; }
     const auto& cur = m_requests[best_idx];
@@ -1151,7 +1294,9 @@ std::optional<ActiveTask> Scheduler::pick_prefill(double now_ms) const {
 
 // ─── pick_decode_batch() ─────────────────────────────────────────────────────
 
-std::optional<ActiveTask> Scheduler::pick_decode_batch(double now_ms) const {
+std::optional<ActiveTask> Scheduler::pick_decode_batch(
+    double now_ms,
+    const std::optional<std::string>& route_filter) const {
   // Group WaitingDecode requests by route.
   // For each route, form a cohort of requests whose ready_ms <= cutoff,
   // capped at max_decode_batch_size.
@@ -1165,11 +1310,13 @@ std::optional<ActiveTask> Scheduler::pick_decode_batch(double now_ms) const {
 
   std::vector<Cohort> cohorts;
   for (const std::string& route : {m_cfg.pim_route_name, m_cfg.gpu_route_name}) {
+    if (route_filter && route != *route_filter) continue;  // per-lane pick
     // Collect and sort decode-ready requests for this route.
     // Iterate WaitingDecode index — bounded by active set, not m_requests.size().
     std::vector<std::pair<double, int>> ready_reqs;  // (ready_ms, index)
     for (int i : m_waiting_decode) {
       const auto& r = m_requests[i];
+      if (r.in_flight) continue;          // pipeline: already occupying a slot
       if (r.route != route) continue;
       if (r.ready_ms > now_ms) continue;
       ready_reqs.push_back({r.ready_ms, i});

@@ -63,7 +63,20 @@ class Scheduler {
    * Call this once per frontend tick (or whenever the active task finishes
    * and a new one is needed).
    */
-  std::optional<ActiveTask> tick(double now_ms, double gpu_free_ms, double pim_free_ms);
+  // want_pick=false advances arrivals + admission only and returns nullopt
+  // (used by the pipeline executor when an execution slot is busy but the
+  // queues must keep filling). Default true preserves the serial caller.
+  std::optional<ActiveTask> tick(double now_ms, const ResourceState& hw,
+                                 bool want_pick = true);
+
+  // Pick the next ready task (prefill or decode batch). When route_filter is
+  // set, only requests of that route are considered — used by the 2-GPU
+  // pipeline executor to fill the hybrid GPU1 lane and the dedicated gpu_only
+  // GPU2 lane separately. This does NOT advance arrivals/admission; call
+  // tick(..., want_pick=false) once per tick first.
+  std::optional<ActiveTask> pick_task(
+      double now_ms,
+      const std::optional<std::string>& route_filter = std::nullopt) const;
 
   /**
    * Mark a task as completed at `finish_ms`.
@@ -145,13 +158,13 @@ class Scheduler {
   void enqueue_arrivals(double now_ms);
 
   // ── Admission ──────────────────────────────────────────────────────────
-  void process_admission(double now_ms, double gpu_free_ms, double pim_free_ms);
+  void process_admission(double now_ms, const ResourceState& hw);
 
   // Evaluate a route and return its predicted finish time.
   // Returns -1.0 if no cost estimate exists for this route.
   double predict_finish(const std::string& route,
                         int context_tokens, int generated_tokens,
-                        double now_ms, double gpu_free_ms, double pim_free_ms) const;
+                        double now_ms, const ResourceState& hw) const;
 
   struct PredictionEstimate {
     double start_ms        = -1.0;  // predicted prefill start after queued work
@@ -166,12 +179,12 @@ class Scheduler {
   std::optional<PredictionEstimate> predict_finish_detail(
       const std::string& route,
       int context_tokens, int generated_tokens,
-      double now_ms, double gpu_free_ms, double pim_free_ms) const;
+      double now_ms, const ResourceState& hw) const;
 
   // Choose the best route among candidates using the configured policy.
   // Returns the route name, or "" if no eligible route exists.
   std::string choose_route(int context_tokens, int generated_tokens,
-                           double now_ms, double gpu_free_ms, double pim_free_ms,
+                           double now_ms, const ResourceState& hw,
                            double deadline_ms) const;
 
   // Phase C — admission-control violation budget.
@@ -187,8 +200,7 @@ class Scheduler {
   int newly_violated_for_route(const RuntimeRequest& D,
                                const std::string& route,
                                double now_ms,
-                               double gpu_free_ms,
-                               double pim_free_ms) const;
+                               const ResourceState& hw) const;
 
   // KV bytes needed to cache all K and V tensors for one request at its
   // maximum decode context (ctx + gen - 1). Used by guaranteed_no_evict.
@@ -229,7 +241,7 @@ class Scheduler {
   // (caller should drop). `reason` is recorded on the request and emitted to
   // the queue-event log + dlog trace.
   bool try_reroute_to_gpu(int req_index, const std::string& reason,
-                          double now_ms, double gpu_free_ms, double pim_free_ms);
+                          double now_ms, const ResourceState& hw);
 
   // Tail-trim preemption: free only the most recent pages of the LIFO victim,
   // enough to cover bytes_needed_per_side (rounded up to whole tokens).
@@ -253,10 +265,13 @@ class Scheduler {
   void wake_kv_held(double now_ms);
 
   // ── Task selection ─────────────────────────────────────────────────────
-  std::optional<ActiveTask> pick_task(double now_ms, double gpu_free_ms,
-                                      double pim_free_ms) const;
-  std::optional<ActiveTask> pick_prefill(double now_ms) const;
-  std::optional<ActiveTask> pick_decode_batch(double now_ms) const;
+  // pick_task is declared in the public section (the pipeline executor uses it).
+  std::optional<ActiveTask> pick_prefill(
+      double now_ms,
+      const std::optional<std::string>& route_filter = std::nullopt) const;
+  std::optional<ActiveTask> pick_decode_batch(
+      double now_ms,
+      const std::optional<std::string>& route_filter = std::nullopt) const;
 
   // ── Helpers ────────────────────────────────────────────────────────────
   RuntimeRequest* find_req(int id);

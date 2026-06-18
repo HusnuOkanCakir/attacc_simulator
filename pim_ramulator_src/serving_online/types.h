@@ -91,6 +91,14 @@ struct RuntimeRequest {
   double deadline_ms              = -1.0;   // SLO deadline (-1 = disabled)
   bool   is_lost                  = false;  // true if admitted after SLO miss
 
+  // True while a task containing this request occupies an execution slot.
+  // Only used by exec_model="pipeline": two slots (GPU, PIM) can be live at
+  // once, so the scheduler must not re-pick a request whose FC or attention
+  // stage is still running. Set when a task starts, cleared on task
+  // completion. Always false under exec_model="serial" (the single active
+  // task already blocks re-picking), so this is a no-op there.
+  bool   in_flight                = false;
+
   // Admission retry state
   double      admission_next_retry_ms      = 0.0;
   int         admission_attempts           = 0;
@@ -168,6 +176,22 @@ struct ActiveTask {
   double               pim_ms;          // PIM execution time (PIM commands drive actual timing)
   double               e2e_ms;          // wall-clock duration (max of gpu+pim in parallel)
   double               start_ms;        // simulation time when task starts
+};
+
+// ─── Execution-resource state ────────────────────────────────────────────────
+//
+// Snapshot of when each execution server becomes free, passed to the scheduler
+// each tick so it can predict per-lane finish times. Under exec_model="pipeline"
+// with num_gpus>=2 the gpu_only route runs on a dedicated 2nd GPU (gpu2_free_ms),
+// independent of the hybrid lane's GPU1 (gpu_free_ms) + PIM (pim_free_ms). When
+// num_gpus<2, gpu2_free_ms is ignored and the gpu_only route shares GPU1 (legacy
+// behavior). Per-lane in-flight decode-batch occupancy is derived inside the
+// scheduler from RuntimeRequest::in_flight, so it is not carried here.
+
+struct ResourceState {
+  double gpu_free_ms  = 0.0;  // GPU1: hybrid prefill + hybrid-decode FC (and gpu_only when num_gpus<2)
+  double pim_free_ms  = 0.0;  // PIM: hybrid-decode attention
+  double gpu2_free_ms = 0.0;  // GPU2: dedicated gpu_only lane (num_gpus>=2)
 };
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -366,6 +390,35 @@ struct ServingOnlineConfig {
   //                           bank-level parallelism amortizes per-request
   //                           K/V reads into a single MAC_AB window.
   std::string pim_command_mode = "realistic";
+
+  // Execution model for the frontend tick loop.
+  //   "serial"   — (default) one task in flight at a time. Within a decode
+  //                step the GPU feed-forward and PIM attention are charged
+  //                sequentially (finish = gpu_ms + pim_ms), and GPU and PIM
+  //                are never simultaneously busy with different requests. The
+  //                phase split (FC-on-GPU + attention-on-PIM) is per-request
+  //                optimal here, so a request-level router cannot beat it.
+  //   "pipeline" — two independent servers (1 GPU + 1 PIM). The GPU
+  //                feed-forward stage of one batch overlaps the PIM attention
+  //                stage of another. A PIM-route decode traverses GPU (FC)
+  //                then PIM (attention); a GPU-route decode and prefill use
+  //                only the GPU server. Throughput is bound by the busier
+  //                stage, so the router can load-balance the two stages.
+  std::string exec_model = "serial";
+
+  // Number of GPU servers in the system. Effective only under
+  // exec_model="pipeline".
+  //   1 — (default) one GPU. The hybrid (pim+gpu) route uses it for prefill +
+  //       decode FC while PIM runs attention; the gpu_only route shares that
+  //       same GPU, so it never escapes the hybrid GPU contention and the
+  //       router cannot meaningfully spill to it.
+  //   2 — a second, dedicated GPU that serves ONLY the gpu_only route (full
+  //       request: prefill + decode). The hybrid lane (GPU1 + PIM) and the
+  //       gpu_only lane (GPU2) are then independent resources, so the router
+  //       (min_finish / latency_guarded_energy) spills overflow requests to the
+  //       idle GPU2 once the hybrid queue's predicted finish exceeds GPU2's.
+  //       Both GPUs use the same gpu_only cost model (identical hardware).
+  int num_gpus = 1;
 
   // Per-shape PIM-decode cycle cache. When true (default), the runtime
   // measures the inline DRAM-drain cycle count the first time it sees a

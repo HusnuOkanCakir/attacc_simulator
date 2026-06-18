@@ -60,6 +60,8 @@ KV_OOM_HOLD_LIMIT_MS = 50.0 # max hold time before GPU fallback (hold_then_fallb
 KV_MAX_PREEMPT_TRIES = 3    # vLLM-style preempt budget per request (-1 disables; >=0 reroutes to GPU after N+1 evicts)
 ADMISSION_VIOLATION_BUDGET = -1  # Phase C: -1=disabled, 0=strict, N>=1 tolerate N newly-violated
 PIM_COMMAND_MODE  = "realistic"  # realistic | simple — diagnostic A/B knob
+EXEC_MODEL        = "serial"     # serial | pipeline — single active task vs 1 GPU + 1 PIM overlap
+NUM_GPUS          = 1            # >=2 adds a dedicated gpu_only lane on a 2nd GPU (pipeline only)
 PIM_CACHE_ENABLED = True         # cache PIM-decode drain cycles by shape (Lever 1)
 PIM_CACHE_FILE    = ""           # persisted cache across runs (empty = disabled)
 ROUTE_POLICY      = "min_finish" # min_finish | latency_guarded_energy
@@ -247,6 +249,8 @@ def yaml_text(label: str, run_dir: Path) -> str:
   generator_dtype_bytes: {DTYPE_BYTES}
   vision_prefix_tokens: {VISION_PREFIX_TOKENS}
   pim_command_mode: {PIM_COMMAND_MODE}
+  exec_model: {EXEC_MODEL}
+  num_gpus: {NUM_GPUS}
   pim_cache_enabled: {PIM_CACHE_ENABLED_YAML}
   pim_cache_file: "{PIM_CACHE_FILE}"
   generator_channel_count: 16
@@ -673,6 +677,20 @@ def main() -> None:
                          "K/V MACs; total ≈ N_L·N_KVH·(2·B·blocks + 6). "
                          "'bank_stripe': experimental — shared K/V MACs (1 per block) modeling ideal "
                          "bank-level parallelism; total ≈ N_L·N_KVH·(2·blocks + 6), independent of B.")
+    ap.add_argument("--exec-model",
+                    choices=["serial", "pipeline"], default=None,
+                    help="Frontend execution model. 'serial' (default): one task in "
+                         "flight; within a decode step GPU feed-forward and PIM attention "
+                         "are charged sequentially (finish = gpu_ms + pim_ms). 'pipeline': "
+                         "two independent servers (1 GPU + 1 PIM) so the GPU-FC stage of "
+                         "one batch overlaps the PIM-attention stage of another; the router "
+                         "can then load-balance the two stages.")
+    ap.add_argument("--num-gpus", type=int, default=None,
+                    help="Number of GPUs (default 1). >=2 adds a dedicated gpu_only lane "
+                         "on a 2nd GPU: the hybrid (pim+gpu) route runs on GPU1+PIM, while "
+                         "gpu_only requests run end-to-end on the idle GPU2. The router "
+                         "spills overflow to GPU2 once the hybrid queue's predicted finish "
+                         "exceeds GPU2's idle path. Requires --exec-model pipeline.")
     ap.add_argument("--no-pim-cache", action="store_true",
                     help="Disable per-shape PIM-decode cycle cache. By default, repeated decode "
                          "tasks with the same (route, ctx_bucket=ceil(ctx/32), batch_size) shape "
@@ -831,6 +849,12 @@ def main() -> None:
     if args.pim_command_mode is not None:
         global PIM_COMMAND_MODE
         PIM_COMMAND_MODE = args.pim_command_mode
+    if args.exec_model is not None:
+        global EXEC_MODEL
+        EXEC_MODEL = args.exec_model
+    if args.num_gpus is not None:
+        global NUM_GPUS
+        NUM_GPUS = args.num_gpus
     if args.no_pim_cache:
         global PIM_CACHE_ENABLED
         PIM_CACHE_ENABLED = False
@@ -870,7 +894,15 @@ def main() -> None:
         if KV_MAX_PREEMPT_TRIES != -1:
             print(f"[pim_only]      forcing kv_max_preempt_tries: {KV_MAX_PREEMPT_TRIES} → -1")
             KV_MAX_PREEMPT_TRIES = -1
+    if NUM_GPUS < 1:
+        sys.exit("[error] --num-gpus must be >= 1")
+    if NUM_GPUS >= 2 and EXEC_MODEL != "pipeline":
+        sys.exit("[error] --num-gpus >= 2 requires --exec-model pipeline "
+                 f"(got exec_model={EXEC_MODEL!r}). The dedicated gpu_only lane "
+                 "is only meaningful under the pipelined hybrid executor.")
     print(f"[csv]           {REQUESTS_CSV}  ({n} requests)")
+    print(f"[num_gpus]      {NUM_GPUS}" + ("  (dedicated gpu_only lane on GPU2)"
+                                           if NUM_GPUS >= 2 else ""))
     print(f"[model]         {args.model}  layers={NUM_LAYERS} heads={NUM_HEADS} "
           f"kv_heads={NUM_KV_HEADS} d_head={D_HEAD} dtype_bytes={DTYPE_BYTES} "
           f"vision_prefix={VISION_PREFIX_TOKENS}")

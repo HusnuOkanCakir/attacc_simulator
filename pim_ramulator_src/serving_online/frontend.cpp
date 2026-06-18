@@ -19,8 +19,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -237,6 +239,13 @@ class Runtime {
   void tick() {
     if (is_finished()) return;
 
+    // Pipeline executor: 1 GPU + 1 PIM server run concurrently (see
+    // tick_pipeline). The serial body below is the default model.
+    if (m_cfg.exec_model == "pipeline") {
+      tick_pipeline();
+      return;
+    }
+
     maybe_log_progress();
 
     process_callbacks();
@@ -248,7 +257,8 @@ class Runtime {
 
     if (!m_active_task.has_value()) {
       auto t0 = wall_clock::now();
-      auto next = m_scheduler.tick(now_ms(), m_gpu_free_ms, m_pim_free_ms);
+      auto next = m_scheduler.tick(
+          now_ms(), ResourceState{m_gpu_free_ms, m_pim_free_ms, m_gpu2_free_ms});
       m_t_sched += wall_clock::now() - t0;
       if (next) {
         start_task(std::move(*next));
@@ -477,6 +487,15 @@ class Runtime {
   // ── Status ────────────────────────────────────────────────────────────────
 
   bool is_finished() const {
+    if (m_cfg.exec_model == "pipeline") {
+      return m_scheduler.all_done()
+          && !m_active_task.has_value()       // PIM slot empty
+          && !m_gpu_task.has_value()          // GPU1 slot empty
+          && !m_gpu2_task.has_value()         // GPU2 lane empty (num_gpus>=2)
+          && m_pim_ready_queue.empty()        // no FC-done task awaiting PIM
+          && m_completed_callback_events == 0
+          && m_pim_outstanding == 0;
+    }
     return m_scheduler.all_done()
         && !m_active_task.has_value()
         && m_completed_callback_events == 0
@@ -525,6 +544,10 @@ class Runtime {
   // different DRAM timing.
 
   std::string pim_cache_fingerprint() const {
+    // Note: exec_model is intentionally NOT part of the fingerprint. The PIM
+    // command stream and its DRAM drain for a given (route, ctx_bucket, bs)
+    // shape are identical under serial and pipeline execution, so a warm cache
+    // is valid across both modes.
     return sfmt("num_layers=%d num_heads=%d num_kv_heads=%d d_head=%d dtype_bytes=%d "
                 "pim_route=%s gpu_route=%s pim_cmd_mode=%s vision_prefix=%d "
                 "tCK=%.4f",
@@ -823,6 +846,8 @@ class Runtime {
     emitter << YAML::Key << "frontend_cycles"   << YAML::Value << m_clk;
     emitter << YAML::Key << "gpu_free_ms"       << YAML::Value << m_gpu_free_ms;
     emitter << YAML::Key << "pim_free_ms"       << YAML::Value << m_pim_free_ms;
+    emitter << YAML::Key << "num_gpus"          << YAML::Value << m_cfg.num_gpus;
+    emitter << YAML::Key << "gpu2_free_ms"      << YAML::Value << m_gpu2_free_ms;
     emitter << YAML::Key << "requests_out_csv"  << YAML::Value << m_cfg.requests_out_csv;
     // PIM shape-cache stats (Lever 1).
     emitter << YAML::Key << "pim_cache_enabled"      << YAML::Value
@@ -1187,7 +1212,14 @@ class Runtime {
       const bool gpu_done = (now >= m_active_task->start_ms + m_active_task->gpu_ms);
       const bool pim_done = (m_active_task->route != m_cfg.pim_route_name)
                          || (m_issue_done && m_pim_outstanding == 0);
-      if (!gpu_done || !pim_done) return;
+      // Pipeline: a cache-hit PIM stage has no commands to drain, so also hold
+      // the PIM server busy for the analytic attention duration (pim_ms, which
+      // start_task overrode to the measured drain on a hit). No effect in
+      // serial: complete is only reached there after the fast-forward to the
+      // stage end, so now >= start + pim_ms already holds.
+      const bool pim_time_done = (m_cfg.exec_model != "pipeline")
+                              || (now >= m_active_task->start_ms + m_active_task->pim_ms);
+      if (!gpu_done || !pim_done || !pim_time_done) return;
     }
 
     if (m_debug_log.is_open()) {
@@ -1258,6 +1290,293 @@ class Runtime {
     m_completed_callback_events = 0;
   }
 
+  // ── Pipeline executor (exec_model="pipeline") ────────────────────────────────
+  //
+  // Two independent servers run concurrently: one GPU (m_gpu_task, analytic)
+  // and one PIM (m_active_task, the existing Ramulator command machinery). A
+  // pim-route decode traverses GPU (FC) then PIM (attention); a gpu_only decode
+  // and prefill use the GPU server only. The GPU-FC stage of one batch overlaps
+  // the PIM-attention stage of another, so steady-state throughput is bound by
+  // the busier stage rather than the sum, and the router can load-balance the
+  // two stages. Only one PIM stage is ever live (single DRAM model); FC-done
+  // pim-route tasks wait in m_pim_ready_queue for the PIM slot.
+  void tick_pipeline() {
+    maybe_log_progress();
+
+    // Complete all slots: PIM attention (m_active_task), GPU1 (m_gpu_task), and
+    // the dedicated gpu_only GPU2 lane (m_gpu2_task, num_gpus>=2 only).
+    process_callbacks();
+    complete_active_task_if_ready();
+    complete_gpu_slot_if_ready();
+    complete_gpu2_slot_if_ready();
+
+    // Mid-drain fast path: a cache-miss PIM stage is still issuing/draining
+    // commands. Tick the DRAM one cycle at a time (cheap, like the serial
+    // loop) without re-running scheduler admission/dispatch. A GPU stage that
+    // was already running still completed above, so cross-slot overlap is
+    // preserved; only NEW dispatch waits for the (rare, first-of-shape) drain.
+    if (pim_mid_drain()) {
+      pump_active_pim();
+      process_callbacks();
+      complete_active_task_if_ready();
+      if (pim_mid_drain()) {
+        if (!is_finished()) ++m_clk;
+        return;
+      }
+      capture_pim_drain();   // drain just finished this tick
+    }
+
+    // Dispatch onto free slots (both slots are analytic or free here).
+    dispatch_pipeline();
+
+    // A freshly dispatched PIM stage issues its first commands now. On a cache
+    // miss it begins draining (handled by the mid-drain path next tick); on a
+    // hit it is analytic and completes via the fast-forward below.
+    pump_active_pim();
+    process_callbacks();
+    complete_active_task_if_ready();
+    if (pim_mid_drain()) {
+      if (!is_finished()) ++m_clk;
+      return;
+    }
+    capture_pim_drain();
+
+    // Both slots analytic: fast-forward to the next FUTURE event (a stage end
+    // or a future scheduler wake-up) instead of burning empty cycles. Only
+    // future events count: a request that is ready now but blocked on a busy
+    // slot is not an event — it starts when its slot frees (a stage end, which
+    // is already included). next_wakeup_ms() can report a past-due ready time
+    // for such a blocked request, so it must be clamped to > now to avoid a
+    // 1-cycle-per-tick livelock while a long stage (e.g. prefill) holds a slot.
+    const double now = now_ms();
+    double next = std::numeric_limits<double>::infinity();
+    if (m_gpu_task.has_value()) {
+      next = std::min(next, m_gpu_task_end_ms);
+    }
+    if (m_gpu2_task.has_value()) {
+      next = std::min(next, m_gpu2_task_end_ms);
+    }
+    if (m_active_task.has_value()) {
+      next = std::min(next, m_active_task->start_ms
+                          + std::max({m_active_task->gpu_ms,
+                                      m_active_task->pim_ms,
+                                      m_active_task->e2e_ms}));
+    }
+    if (auto wake = m_scheduler.next_wakeup_ms();
+        wake.has_value() && *wake > now) {
+      next = std::min(next, *wake);
+    }
+    // Guarantee forward progress. fast_forward_to_ms jumps to the next event
+    // when there is one; otherwise (or if sub-cycle rounding leaves the target
+    // at the current cycle) advance one cycle so the simulation can never stall
+    // while work is still pending.
+    const Clk_t before = m_clk;
+    if (next < std::numeric_limits<double>::infinity() && next > now) {
+      fast_forward_to_ms(next);
+    }
+    if (m_clk == before && !is_finished()) {
+      ++m_clk;
+    }
+  }
+
+  // True while the PIM slot holds a cache-miss decode stage that has not yet
+  // finished issuing and draining all of its commands.
+  bool pim_mid_drain() const {
+    return m_active_task.has_value()
+        && m_active_task->phase == "decode"
+        && m_active_task->route == m_cfg.pim_route_name
+        && !(m_issue_done && m_pim_outstanding == 0);
+  }
+
+  // Record the measured DRAM drain for a just-finished cache-miss PIM stage
+  // before any fast-forward, so the shape cache stores measured cycles rather
+  // than the cost-table target (mirrors the serial path). No-op on cache hits
+  // (already captured) and when there is no PIM stage.
+  void capture_pim_drain() {
+    if (m_active_task.has_value()
+        && m_active_task->phase == "decode"
+        && m_active_task->route == m_cfg.pim_route_name
+        && m_issue_done && m_pim_outstanding == 0
+        && !m_active_task_drain_captured) {
+      m_active_task_drain_clk_pim_done = (m_clk > m_clk_at_task_start)
+                                         ? (m_clk - m_clk_at_task_start) : 0;
+      m_active_task_drain_captured = true;
+    }
+  }
+
+  // Advance arrivals + admission, then fill the GPU slot (when free) and the
+  // PIM slot (from the FC-done handoff queue). The PIM routing hint includes
+  // attention work that has cleared the GPU (FC done) and is queued for the
+  // PIM slot, so the router sees the true PIM backlog and spills overflow to
+  // the GPU when PIM is the bottleneck — m_pim_free_ms alone omits that
+  // queued-but-not-started work.
+  void dispatch_pipeline() {
+    double pim_hint = m_pim_free_ms;
+    for (const auto& t : m_pim_ready_queue) pim_hint += t.pim_ms;
+    const ResourceState hw{m_gpu_free_ms, pim_hint, m_gpu2_free_ms};
+
+    if (m_cfg.num_gpus >= 2) {
+      // Dedicated gpu_only lane on GPU2. Admission runs once (want_pick=false);
+      // then each free GPU lane pulls its own route-filtered task — GPU1 the
+      // hybrid (pim+gpu) lane, GPU2 the gpu_only lane.
+      m_scheduler.tick(now_ms(), hw, /*want_pick=*/false);
+      if (!m_gpu_task.has_value()) {
+        if (auto pick = m_scheduler.pick_task(now_ms(), m_cfg.pim_route_name)) {
+          if (pick->phase == "decode")
+            m_scheduler.record_decode_batch_size(pick->batch_size);
+          start_gpu_stage(std::move(*pick));
+        }
+      }
+      if (!m_gpu2_task.has_value()) {
+        if (auto pick = m_scheduler.pick_task(now_ms(), m_cfg.gpu_route_name)) {
+          if (pick->phase == "decode")
+            m_scheduler.record_decode_batch_size(pick->batch_size);
+          start_gpu2_stage(std::move(*pick));
+        }
+      }
+    } else {
+      const bool gpu_free = !m_gpu_task.has_value();
+      auto pick = m_scheduler.tick(now_ms(), hw, /*want_pick=*/gpu_free);
+      if (gpu_free && pick.has_value()) {
+        start_gpu_stage(std::move(*pick));
+      }
+    }
+
+    if (!m_active_task.has_value() && !m_pim_ready_queue.empty()) {
+      ActiveTask t = std::move(m_pim_ready_queue.front());
+      m_pim_ready_queue.pop_front();
+      start_pim_stage(std::move(t));
+    }
+  }
+
+  // Start the GPU-server stage of a task: prefill / gpu_only decode run to
+  // completion here; a pim-route decode runs its FC here and then hands off to
+  // the PIM stage. Pipeline only.
+  void start_gpu_stage(ActiveTask task) {
+    const double start_ms = now_ms();
+    task.start_ms = start_ms;
+
+    // Mark every request in this task as occupying a slot so the scheduler does
+    // not re-pick it while the other slot is also live. Cleared in
+    // Scheduler::complete_task once the whole step finishes (after the PIM
+    // stage for pim-route decodes).
+    for (const int idx : task.request_indices) {
+      m_scheduler.mutable_requests()[idx].in_flight = true;
+    }
+    if (task.phase == "prefill") {
+      for (const int idx : task.request_indices) {
+        auto& req = m_scheduler.mutable_requests()[idx];
+        if (req.prefill_start_ms < 0.0) req.prefill_start_ms = start_ms;
+      }
+    }
+
+    // GPU-stage duration: prefill uses its end-to-end time; decode uses the FC
+    // (gpu_ms) component only (the attention component runs on the PIM slot).
+    const double dur = (task.phase == "prefill") ? task.e2e_ms : task.gpu_ms;
+    m_gpu_task_end_ms = std::max(m_gpu_free_ms, start_ms) + dur;
+    m_gpu_free_ms     = m_gpu_task_end_ms;
+
+    if (m_debug_log.is_open()) {
+      std::string reqs_str;
+      for (int idx : task.request_indices) {
+        if (!reqs_str.empty()) reqs_str += ',';
+        reqs_str += std::to_string(m_scheduler.requests()[idx].id);
+      }
+      dlog(sfmt("[%10.3fms] GPU_START   phase=%-7s  route=%-20s  reqs=[%s]"
+                "  ctx=%5d  bs=%d  gpu_ms=%6.2f  end_ms=%.3f",
+                start_ms, task.phase.c_str(), task.route.c_str(), reqs_str.c_str(),
+                task.context_tokens, task.batch_size, dur, m_gpu_task_end_ms));
+    }
+    m_gpu_task = std::move(task);
+  }
+
+  // Complete the GPU-server slot if its stage has elapsed. Pipeline only.
+  void complete_gpu_slot_if_ready() {
+    if (!m_gpu_task.has_value()) return;
+    const double now = now_ms();
+    if (now < m_gpu_task_end_ms) return;
+
+    if (m_debug_log.is_open()) {
+      dlog(sfmt("[%10.3fms] GPU_DONE    phase=%-7s  route=%-20s  duration_ms=%.3f",
+                now, m_gpu_task->phase.c_str(), m_gpu_task->route.c_str(),
+                now - m_gpu_task->start_ms));
+    }
+
+    const bool needs_pim = (m_gpu_task->phase == "decode"
+                            && m_gpu_task->route == m_cfg.pim_route_name);
+    if (needs_pim) {
+      // FC done — hand off to the PIM attention stage. in_flight stays true.
+      m_pim_ready_queue.push_back(std::move(*m_gpu_task));
+    } else {
+      // Prefill or gpu_only decode: the whole step finished on the GPU.
+      m_scheduler.complete_task(*m_gpu_task, now);
+    }
+    m_gpu_task.reset();
+  }
+
+  // Start a stage on the dedicated GPU2 lane (m_cfg.num_gpus>=2). Mirrors
+  // start_gpu_stage but always runs the whole gpu_only step to completion
+  // (prefill e2e or gpu_only decode gpu_ms) — there is no PIM handoff, since
+  // GPU2 only ever holds gpu_only-route tasks. Pipeline + 2-GPU only.
+  void start_gpu2_stage(ActiveTask task) {
+    const double start_ms = now_ms();
+    task.start_ms = start_ms;
+
+    for (const int idx : task.request_indices) {
+      m_scheduler.mutable_requests()[idx].in_flight = true;
+    }
+    if (task.phase == "prefill") {
+      for (const int idx : task.request_indices) {
+        auto& req = m_scheduler.mutable_requests()[idx];
+        if (req.prefill_start_ms < 0.0) req.prefill_start_ms = start_ms;
+      }
+    }
+
+    const double dur = (task.phase == "prefill") ? task.e2e_ms : task.gpu_ms;
+    m_gpu2_task_end_ms = std::max(m_gpu2_free_ms, start_ms) + dur;
+    m_gpu2_free_ms     = m_gpu2_task_end_ms;
+
+    if (m_debug_log.is_open()) {
+      std::string reqs_str;
+      for (int idx : task.request_indices) {
+        if (!reqs_str.empty()) reqs_str += ',';
+        reqs_str += std::to_string(m_scheduler.requests()[idx].id);
+      }
+      dlog(sfmt("[%10.3fms] GPU2_START  phase=%-7s  route=%-20s  reqs=[%s]"
+                "  ctx=%5d  bs=%d  gpu_ms=%6.2f  end_ms=%.3f",
+                start_ms, task.phase.c_str(), task.route.c_str(), reqs_str.c_str(),
+                task.context_tokens, task.batch_size, dur, m_gpu2_task_end_ms));
+    }
+    m_gpu2_task = std::move(task);
+  }
+
+  // Complete the GPU2 slot if its stage has elapsed. The gpu_only step (prefill
+  // or decode) always finishes here — no PIM handoff. Pipeline + 2-GPU only.
+  void complete_gpu2_slot_if_ready() {
+    if (!m_gpu2_task.has_value()) return;
+    const double now = now_ms();
+    if (now < m_gpu2_task_end_ms) return;
+
+    if (m_debug_log.is_open()) {
+      dlog(sfmt("[%10.3fms] GPU2_DONE   phase=%-7s  route=%-20s  duration_ms=%.3f",
+                now, m_gpu2_task->phase.c_str(), m_gpu2_task->route.c_str(),
+                now - m_gpu2_task->start_ms));
+    }
+    m_scheduler.complete_task(*m_gpu2_task, now);
+    m_gpu2_task.reset();
+  }
+
+  // Start the PIM-server attention stage of a pim-route decode whose FC has
+  // finished. Reuses the existing PIM machinery in start_task (cache lookup /
+  // command generation / drain). gpu_ms is zeroed (the FC was already charged
+  // on the GPU slot) and e2e_ms is set to the attention-only duration so the
+  // stage occupies the PIM server for the attention time alone. Pipeline only.
+  void start_pim_stage(ActiveTask task) {
+    task.gpu_ms = 0.0;            // FC already accounted on the GPU slot
+    task.e2e_ms = task.pim_ms;    // PIM-stage wall time = attention only
+    start_task(std::move(task));
+  }
+
   // ── State ──────────────────────────────────────────────────────────────────
 
   Logger_t       m_logger;
@@ -1277,12 +1596,30 @@ class Runtime {
   double m_gpu_free_ms     = 0.0;
   double m_pim_free_ms     = 0.0;
 
+  // exec_model="serial": m_active_task is the single in-flight task.
+  // exec_model="pipeline": m_active_task is the PIM server slot (pim-route
+  // decode attention stages only); the GPU server slot is m_gpu_task and
+  // m_pim_ready_queue holds pim-route tasks whose FC stage finished on the GPU
+  // and are waiting for the PIM slot.
   std::optional<ActiveTask>  m_active_task;
   std::vector<Request>       m_pending_pim_requests;
   size_t m_next_pim_request          = 0;
   size_t m_pim_outstanding           = 0;
   size_t m_completed_callback_events = 0;
   bool   m_issue_done                = true;
+
+  // Pipeline GPU server slot (analytic: prefill, gpu_only decode, pim-route FC).
+  std::optional<ActiveTask>  m_gpu_task;
+  double                     m_gpu_task_end_ms = 0.0;
+  // Pipeline handoff: pim-route decode tasks with FC done, awaiting the PIM slot.
+  std::deque<ActiveTask>     m_pim_ready_queue;
+
+  // Pipeline 2-GPU mode (m_cfg.num_gpus>=2): dedicated GPU2 server slot that
+  // runs gpu_only-route tasks (prefill + decode) to completion, independent of
+  // GPU1 (m_gpu_task) and PIM. Unused when num_gpus<2.
+  std::optional<ActiveTask>  m_gpu2_task;
+  double                     m_gpu2_free_ms     = 0.0;
+  double                     m_gpu2_task_end_ms = 0.0;
 
   // Debug log (null stream when disabled).
   std::ofstream m_debug_log;
@@ -1436,6 +1773,15 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
     // PIM command stream complexity: "realistic" (default) or "simple".
     cfg.pim_command_mode = param<std::string>("pim_command_mode").default_val("realistic");
 
+    // Execution model: "serial" (default, one task in flight) or "pipeline"
+    // (1 GPU + 1 PIM server, GPU-FC overlaps PIM-attention across tasks).
+    cfg.exec_model = param<std::string>("exec_model").default_val("serial");
+
+    // Number of GPUs. >=2 enables a dedicated gpu_only lane on the 2nd GPU
+    // (the hybrid pim+gpu route stays on GPU1+PIM). Effective only under
+    // exec_model="pipeline"; validated below.
+    cfg.num_gpus = param<int>("num_gpus").default_val(1);
+
     // Per-shape PIM-decode cycle cache (Lever 1). True = skip Ramulator on
     // repeated (route, ctx_bucket, batch_size) shapes.
     cfg.pim_cache_enabled = param<bool>("pim_cache_enabled").default_val(true);
@@ -1467,6 +1813,20 @@ class ServingOnlineFrontend : public IFrontEnd, public Implementation {
       throw ConfigurationError(
           "ServingOnlineFrontend: pim_command_mode must be one of "
           "'realistic', 'simple', 'attacc_qbroadcast', 'bank_stripe'");
+    }
+    // Validate exec_model.
+    if (cfg.exec_model != "serial" && cfg.exec_model != "pipeline") {
+      throw ConfigurationError(
+          "ServingOnlineFrontend: exec_model must be 'serial' or 'pipeline'");
+    }
+    // Validate num_gpus.
+    if (cfg.num_gpus < 1) {
+      throw ConfigurationError(
+          "ServingOnlineFrontend: num_gpus must be >= 1");
+    }
+    if (cfg.num_gpus >= 2 && cfg.exec_model != "pipeline") {
+      throw ConfigurationError(
+          "ServingOnlineFrontend: num_gpus>=2 requires exec_model='pipeline'");
     }
     // Validate kv_scheduler_policy.
     if (cfg.kv_scheduler_policy != "guaranteed_no_evict" &&
